@@ -15,7 +15,9 @@
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pip install --quiet \"sb3-contrib>=2.0.0\"; Write-Output \"=== sb3-contrib installed ===\"; .\\\\.venv\\\\Scripts\\\\python.exe -c \"import sb3_contrib; from sb3_contrib import MaskablePPO; from sb3_contrib.common.wrappers import ActionMasker; print\\('sb3-contrib', sb3_contrib.__version__, 'MaskablePPO OK'\\)\")",
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -u train_rl.py)",
       "Bash(Get-Content -Path \"C:\\\\Users\\\\jayde\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-jayde-Desktop-Coding-Projects-Project\\\\fd4c0356-7b1e-49b6-bcd5-913f93e0d042\\\\tasks\\\\bajjqtydb.output\" -Wait -Tail 0)",
-      "Bash(Select-String -Pattern \"win rate|Evaluating|Training|Saved|Result|Traceback|Error|Exception|ep_rew_mean|total_timesteps\")"
+      "Bash(Select-String -Pattern \"win rate|Evaluating|Training|Saved|Result|Traceback|Error|Exception|ep_rew_mean|total_timesteps\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pip install --quiet tensorboard; Write-Output \"=== tensorboard installed ===\"; .\\\\.venv\\\\Scripts\\\\python.exe -c \"import tensorboard; print\\('tensorboard', tensorboard.__version__\\)\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m tensorboard.main --logdir tb_logs --port 6006)"
     ]
   }
 }

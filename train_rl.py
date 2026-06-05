@@ -8,21 +8,23 @@ Then:
 
 What this does:
   1. Builds the RL environment with an opponent to learn against.
-  2. Measures the *untrained* agent's win rate (a baseline).
-  3. Trains it with MaskablePPO for TRAIN_STEPS turns of experience.
-  4. Measures the *trained* agent's win rate.
-  5. Saves the trained model to ppo_showdown.zip.
+  2. Loads the saved model if one exists (to CONTINUE training), else starts fresh.
+  3. Measures the current win rate (a baseline for this session).
+  4. Trains with MaskablePPO for TRAIN_STEPS more turns of experience.
+  5. Measures the win rate again, and saves the model back to disk.
 
-If training worked, the win rate should go UP between steps 2 and 4.
+Progress is logged to ./tb_logs for live graphs. In another terminal run:
+    tensorboard --logdir tb_logs
+and open http://localhost:6006 to watch the reward climb in real time.
 
 Why MaskablePPO (and not plain PPO)? At every turn only some of the 26 possible
-actions are legal (you can't use a move a Pokemon doesn't have, etc.). poke-env
-gives us an "action mask" of the legal choices each turn. MaskablePPO uses that
-mask so the agent ONLY ever picks legal actions -- which makes learning much
-faster and avoids the agent flailing at illegal moves.
+actions are legal. poke-env gives us an "action mask" of the legal choices, and
+MaskablePPO uses it so the agent ONLY ever picks legal actions -- which makes
+learning much faster and avoids it flailing at illegal moves.
 """
 
 import logging
+import os
 
 import numpy as np
 from sb3_contrib import MaskablePPO
@@ -36,9 +38,10 @@ from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
 from rl_env import ShowdownSinglesEnv
 
 BATTLE_FORMAT = "gen9randombattle"
-TRAIN_STEPS = 20_000     # turns of experience to learn from (bump up for a stronger agent)
+TRAIN_STEPS = 20_000     # turns of experience to add THIS run (bump up for a stronger agent)
 EVAL_BATTLES = 50        # battles used to estimate win rate
 MODEL_PATH = "ppo_showdown.zip"
+TB_DIR = "tb_logs"       # TensorBoard logs go here
 
 
 def mask_fn(env):
@@ -89,23 +92,37 @@ def win_rate(model, env, inner, n_battles):
 def main():
     env, inner = build_env()
 
-    # MultiInputPolicy because our observation is a dict (state numbers + action mask).
-    model = MaskablePPO("MultiInputPolicy", env, verbose=1)
+    # Resume from a saved model if we have one, so each run keeps improving the
+    # SAME agent instead of starting from scratch.
+    resuming = os.path.exists(MODEL_PATH)
+    if resuming:
+        print(f"Found {MODEL_PATH} -> loading it and CONTINUING training.", flush=True)
+        model = MaskablePPO.load(MODEL_PATH, env=env, tensorboard_log=TB_DIR)
+    else:
+        print("No saved model -> starting a FRESH agent (random weights).", flush=True)
+        model = MaskablePPO("MultiInputPolicy", env, verbose=1, tensorboard_log=TB_DIR)
 
-    print("\n=== Evaluating UNTRAINED agent ===", flush=True)
+    label = "Current" if resuming else "Untrained"
+    print(f"\n=== Evaluating {label} agent ===", flush=True)
     before = win_rate(model, env, inner, EVAL_BATTLES)
-    print(f"Untrained win rate vs RandomPlayer: {before:.0%}", flush=True)
+    print(f"{label} win rate vs RandomPlayer: {before:.0%}", flush=True)
 
-    print(f"\n=== Training for {TRAIN_STEPS:,} steps ===", flush=True)
-    model.learn(total_timesteps=TRAIN_STEPS)
+    print(f"\n=== Training for {TRAIN_STEPS:,} more steps ===", flush=True)
+    # reset_num_timesteps=False when resuming so the TensorBoard x-axis (and the
+    # internal step counter) continues from where the last run left off.
+    model.learn(
+        total_timesteps=TRAIN_STEPS,
+        reset_num_timesteps=not resuming,
+        tb_log_name="ppo",
+    )
     model.save(MODEL_PATH)
-    print(f"Saved trained model to {MODEL_PATH}", flush=True)
+    print(f"Saved model to {MODEL_PATH}", flush=True)
 
-    print("\n=== Evaluating TRAINED agent ===", flush=True)
+    print("\n=== Evaluating agent after this session ===", flush=True)
     after = win_rate(model, env, inner, EVAL_BATTLES)
-    print(f"Trained win rate vs RandomPlayer:   {after:.0%}", flush=True)
+    print(f"Win rate vs RandomPlayer now:    {after:.0%}", flush=True)
 
-    print(f"\nResult: {before:.0%} -> {after:.0%} win rate after {TRAIN_STEPS:,} steps.", flush=True)
+    print(f"\nResult: {before:.0%} -> {after:.0%} win rate after {TRAIN_STEPS:,} more steps.", flush=True)
     env.close()
 
 
