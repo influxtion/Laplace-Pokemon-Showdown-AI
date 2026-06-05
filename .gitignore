@@ -1,0 +1,10 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local Pokemon Showdown server (cloned separately, not our code)
+server/
+
+# Logs / scratch
+*.log

@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "PowerShell(npm *)",
+      "PowerShell(git init *)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"from poke_env.environment import Pokemon, Move; print\\('Pokemon.damage_multiplier:', hasattr\\(Pokemon, 'damage_multiplier'\\)\\); print\\('Move has base_power/type:', hasattr\\(Move, 'base_power'\\), hasattr\\(Move, 'type'\\)\\)\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import poke_env, pkgutil; [print\\(m.name\\) for m in pkgutil.iter_modules\\(poke_env.__path__\\)]\"; Write-Output \"--- battle/pokemon location ---\"; .\\\\.venv\\\\Scripts\\\\python.exe -c \"from poke_env.battle import Pokemon, Move; print\\('damage_multiplier:', hasattr\\(Pokemon,'damage_multiplier'\\)\\); print\\('base_power:', hasattr\\(Move,'base_power'\\)\\)\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe run_battle.py)",
+      "PowerShell(git *)"
+    ]
+  }
+}
