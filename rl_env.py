@@ -13,10 +13,11 @@ specific to *our* AI:
   * embed_battle()  -> turn the battle state into numbers (the "observation")
   * calc_reward()   -> say how good the current state is (the "reward")
 
-The observation here is deliberately rich (60 numbers). An earlier 12-number
-version plateaued against a strong opponent because it couldn't "see" things
-like stat boosts, status, hazards, or the opponent's stats. The features below
-add that missing information so the agent has enough to learn real strategy.
+The observation is deliberately detailed. An early 12-number version plateaued
+against a strong opponent because it was blind to most of the game. This version
+adds the things that actually drive decisions: stat boosts, status, the bench
+(for switching), move details, field/terrain/screens, hazards, weather, the
+opponent's revealed moves, and high-impact abilities.
 """
 
 import numpy as np
@@ -24,22 +25,44 @@ from gymnasium.spaces import Box
 
 from poke_env.environment.singles_env import SinglesEnv
 
-# --- helpers -----------------------------------------------------------------
+# --- lookup tables -----------------------------------------------------------
 
-STAT_KEYS = ["hp", "atk", "def", "spa", "spd", "spe"]   # base-stat dictionary keys
+STAT_KEYS = ["hp", "atk", "def", "spa", "spd", "spe"]   # base-stat dict keys
 BOOST_KEYS = ["atk", "def", "spa", "spd", "spe"]        # in-battle stat-stage keys
-STATUS_NAMES = ["BRN", "PAR", "SLP", "FRZ", "PSN", "TOX"]  # the status conditions we encode
+STATUS_NAMES = ["BRN", "PAR", "SLP", "FRZ", "PSN", "TOX"]  # status conditions we encode
+EFFECT_NAMES = ["SUBSTITUTE", "LEECH_SEED", "TAUNT", "CONFUSION"]  # volatile effects
 
+# High-impact abilities, grouped into strategic categories. Each category becomes one
+# flag per active Pokemon. Encoding categories (not the hundreds of raw abilities) keeps
+# this compact while capturing the abilities that actually change a decision.
+ABILITY_CATEGORIES = [
+    {"levitate"},                                      # immune to Ground
+    {"flashfire", "wellbakedbody"},                    # immune to Fire
+    {"waterabsorb", "stormdrain", "dryskin"},          # immune to Water
+    {"voltabsorb", "lightningrod", "motordrive"},      # immune to Electric
+    {"sapsipper"},                                     # immune to Grass
+    {"multiscale", "shadowshield"},                    # halves damage at full HP
+    {"intimidate"},                                    # drops attack on switch-in
+    {"regenerator"},                                   # heals on switch
+    {"magicguard"},                                    # no indirect damage
+    {"unaware"},                                       # ignores stat boosts
+    {"hugepower", "purepower"},                        # doubles attack
+    {"speedboost", "protosynthesis", "quarkdrive",     # speed enablers
+     "swiftswim", "chlorophyll", "sandrush", "unburden"},
+]
+
+
+# --- per-Pokemon feature helpers ---------------------------------------------
 
 def _base_stats(mon):
-    """6 base stats, scaled to roughly 0-1 (0 if the Pokemon is unknown)."""
+    """6 base stats scaled to roughly 0-1 (0 if the Pokemon is unknown)."""
     if mon is None:
         return [0.0] * 6
     return [mon.base_stats[k] / 200.0 for k in STAT_KEYS]
 
 
 def _boosts(mon):
-    """5 stat-stage boosts, each in -1..1 (a +6 Swords Dance reads as +1 attack)."""
+    """5 stat-stage boosts in -1..1 (a +6 Swords Dance reads as +1 attack)."""
     if mon is None:
         return [0.0] * 5
     return [mon.boosts[k] / 6.0 for k in BOOST_KEYS]
@@ -53,6 +76,28 @@ def _status_onehot(mon):
     return vec
 
 
+def _effects(mon):
+    """Flags for a few important volatile effects (substitute, leech seed, etc.)."""
+    vec = [0.0] * len(EFFECT_NAMES)
+    if mon is not None:
+        names = {e.name for e in mon.effects}
+        for i, nm in enumerate(EFFECT_NAMES):
+            if nm in names:
+                vec[i] = 1.0
+    return vec
+
+
+def _ability_flags(mon):
+    """One flag per high-impact ability category (all zeros if unknown/none)."""
+    vec = [0.0] * len(ABILITY_CATEGORIES)
+    if mon is not None and mon.ability:
+        aid = mon.ability.lower().replace(" ", "").replace("-", "")
+        for i, ids in enumerate(ABILITY_CATEGORIES):
+            if aid in ids:
+                vec[i] = 1.0
+    return vec
+
+
 def _matchup(me, opp):
     """Best type effectiveness I have into them, and they have into me (0-1 each)."""
     if me is None or opp is None:
@@ -61,6 +106,8 @@ def _matchup(me, opp):
     defense = max((me.damage_multiplier(t) for t in opp.types if t is not None), default=1.0)
     return [offense / 4.0, defense / 4.0]
 
+
+# --- battle-wide feature helpers ---------------------------------------------
 
 def _hazards(side_conditions):
     """Entry hazards on one side: [stealth rock, spikes layers, toxic spikes layers]."""
@@ -74,6 +121,44 @@ def _hazards(side_conditions):
         elif name == "TOXIC_SPIKES":
             tspikes = value / 2.0
     return [sr, spikes, tspikes]
+
+
+def _screens(side_conditions):
+    """Screen-type conditions on one side: [reflect, light screen, aurora veil, tailwind]."""
+    refl = ls = av = tw = 0.0
+    for cond in side_conditions:
+        name = cond.name
+        if name == "REFLECT":
+            refl = 1.0
+        elif name == "LIGHT_SCREEN":
+            ls = 1.0
+        elif name == "AURORA_VEIL":
+            av = 1.0
+        elif name == "TAILWIND":
+            tw = 1.0
+    return [refl, ls, av, tw]
+
+
+def _terrain(battle):
+    """One-hot of the active terrain: [electric, grassy, psychic, misty, none]."""
+    elec = grass = psy = mist = 0.0
+    for f in battle.fields:
+        name = f.name
+        if name == "ELECTRIC_TERRAIN":
+            elec = 1.0
+        elif name == "GRASSY_TERRAIN":
+            grass = 1.0
+        elif name == "PSYCHIC_TERRAIN":
+            psy = 1.0
+        elif name == "MISTY_TERRAIN":
+            mist = 1.0
+    none = 0.0 if (elec or grass or psy or mist) else 1.0
+    return [elec, grass, psy, mist, none]
+
+
+def _trick_room(battle):
+    """Whether Trick Room is active (it reverses speed order, so the 'faster' flag flips)."""
+    return [1.0 if any(f.name == "TRICK_ROOM" for f in battle.fields) else 0.0]
 
 
 def _weather(battle):
@@ -93,10 +178,34 @@ def _weather(battle):
     return [sun, rain, sand, snow, none]
 
 
-# Total length of the observation vector built by embed_battle below.
-#   moves 8 + hp 2 + team 2 + base stats 12 + boosts 10 + status 12
-#   + matchup 2 + speed 1 + hazards 6 + weather 5  =  60
-N_FEATURES = 60
+def _bench(battle):
+    """For up to 5 non-active team members: [hp fraction, offense, defense] vs opponent."""
+    opp = battle.opponent_active_pokemon
+    feats = []
+    benched = [m for m in battle.team.values() if m is not battle.active_pokemon][:5]
+    for mon in benched:
+        feats += [mon.current_hp_fraction] + _matchup(mon, opp)
+    while len(feats) < 15:
+        feats.append(0.0)
+    return feats
+
+
+def _opponent_moves(battle):
+    """Opponent's revealed moves: up to 4 base powers, plus their effectiveness on us."""
+    me = battle.active_pokemon
+    opp = battle.opponent_active_pokemon
+    power = [0.0] * 4
+    effectiveness = [0.0] * 4
+    if opp is not None:
+        for i, move in enumerate(list(opp.moves.values())[:4]):
+            power[i] = move.base_power / 100.0
+            if me is not None:
+                effectiveness[i] = me.damage_multiplier(move) / 4.0
+    return power + effectiveness
+
+
+# Total length of the observation vector (see embed_battle for the layout).
+N_FEATURES = 141
 
 
 class ShowdownSinglesEnv(SinglesEnv):
@@ -111,39 +220,46 @@ class ShowdownSinglesEnv(SinglesEnv):
         me = battle.active_pokemon
         opp = battle.opponent_active_pokemon
 
-        # Our active Pokemon's (up to 4) moves: power and type effectiveness.
+        # Our active Pokemon's (up to 4) moves.
         move_power = [0.0] * 4
         move_multiplier = [0.0] * 4
+        move_accuracy = [0.0] * 4
+        move_physical = [0.0] * 4
+        move_status = [0.0] * 4
         for i, move in enumerate(battle.available_moves[:4]):
             move_power[i] = move.base_power / 100.0
             if opp is not None:
                 move_multiplier[i] = opp.damage_multiplier(move) / 4.0
+            acc = move.accuracy
+            move_accuracy[i] = 1.0 if acc is True else float(acc)
+            category = move.category.name
+            move_physical[i] = 1.0 if category == "PHYSICAL" else 0.0
+            move_status[i] = 1.0 if category == "STATUS" else 0.0
 
-        # Current HP of whoever is out right now.
         my_hp = me.current_hp_fraction if me else 0.0
         opp_hp = opp.current_hp_fraction if opp else 0.0
-
-        # How many Pokemon each side has left.
         my_remaining = sum(1 for m in battle.team.values() if not m.fainted) / 6.0
         opp_fainted = sum(1 for m in battle.opponent_team.values() if m.fainted)
         opp_remaining = (6 - opp_fainted) / 6.0
-
-        # Is our active faster (by base speed)?
         faster = 1.0 if (me and opp and me.base_stats["spe"] > opp.base_stats["spe"]) else 0.0
 
         features = (
-            move_power                              # 4
-            + move_multiplier                       # 4
-            + [my_hp, opp_hp]                        # 2
-            + [my_remaining, opp_remaining]         # 2
-            + _base_stats(me) + _base_stats(opp)    # 12
-            + _boosts(me) + _boosts(opp)            # 10
-            + _status_onehot(me) + _status_onehot(opp)  # 12
-            + _matchup(me, opp)                     # 2
-            + [faster]                              # 1
-            + _hazards(battle.side_conditions)      # 3
-            + _hazards(battle.opponent_side_conditions)  # 3
-            + _weather(battle)                      # 5
+            move_power + move_multiplier + move_accuracy + move_physical + move_status  # 20
+            + [my_hp, opp_hp, my_remaining, opp_remaining]          # 4
+            + _base_stats(me) + _base_stats(opp)                    # 12
+            + _boosts(me) + _boosts(opp)                            # 10
+            + _status_onehot(me) + _status_onehot(opp)              # 12
+            + _matchup(me, opp) + [faster]                          # 3
+            + _effects(me) + _effects(opp)                          # 8
+            + _ability_flags(me) + _ability_flags(opp)              # 24
+            + _bench(battle)                                        # 15
+            + _opponent_moves(battle)                               # 8
+            + _hazards(battle.side_conditions)                      # 3
+            + _hazards(battle.opponent_side_conditions)             # 3
+            + _terrain(battle) + _trick_room(battle)                # 6
+            + _screens(battle.side_conditions)                      # 4
+            + _screens(battle.opponent_side_conditions)             # 4
+            + _weather(battle)                                      # 5
         )
         return np.array(features, dtype=np.float32)
 
