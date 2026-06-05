@@ -17,7 +17,8 @@
       "Bash(Get-Content -Path \"C:\\\\Users\\\\jayde\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-jayde-Desktop-Coding-Projects-Project\\\\fd4c0356-7b1e-49b6-bcd5-913f93e0d042\\\\tasks\\\\bajjqtydb.output\" -Wait -Tail 0)",
       "Bash(Select-String -Pattern \"win rate|Evaluating|Training|Saved|Result|Traceback|Error|Exception|ep_rew_mean|total_timesteps\")",
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pip install --quiet tensorboard; Write-Output \"=== tensorboard installed ===\"; .\\\\.venv\\\\Scripts\\\\python.exe -c \"import tensorboard; print\\('tensorboard', tensorboard.__version__\\)\")",
-      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m tensorboard.main --logdir tb_logs --port 6006)"
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m tensorboard.main --logdir tb_logs --port 6006)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import ast; ast.parse\\(open\\('train_rl.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\"; .\\\\.venv\\\\Scripts\\\\python.exe -c \"import train_rl; print\\('import OK; callback:', train_rl.WinRateCallback.__name__\\)\")"
     ]
   }
 }

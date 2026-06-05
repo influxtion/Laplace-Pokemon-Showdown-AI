@@ -29,19 +29,33 @@ import os
 import numpy as np
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
+from stable_baselines3.common.callbacks import BaseCallback
 
 from poke_env import AccountConfiguration
-from poke_env.player import RandomPlayer
+from poke_env.player import RandomPlayer, SimpleHeuristicsPlayer
 from poke_env.environment.singles_env import SinglesEnv
 from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
 
 from rl_env import ShowdownSinglesEnv
 
 BATTLE_FORMAT = "gen9randombattle"
-TRAIN_STEPS = 20_000     # turns of experience to add THIS run (bump up for a stronger agent)
-EVAL_BATTLES = 50        # battles used to estimate win rate
-MODEL_PATH = "ppo_showdown.zip"
+
+# Who the agent trains against AND is benchmarked against this run:
+#   "random"    -> RandomPlayer (picks random legal moves; the easy floor)
+#   "heuristic" -> SimpleHeuristicsPlayer (type matchups, speed, switching; a real test)
+OPPONENT = "heuristic"
+
+TRAIN_STEPS = 50_000     # turns of experience to add THIS run (bump up for a stronger agent)
+EVAL_BATTLES = 50        # battles used to estimate win rate (start/end of run)
 TB_DIR = "tb_logs"       # TensorBoard logs go here
+EVAL_FREQ = 10_000       # measure win rate every N steps DURING training (for the live graph)
+LIVE_EVAL_BATTLES = 30   # battles per live measurement (fewer = faster, noisier)
+
+# Each opponent gets its own saved agent so experiments don't overwrite each other.
+MODEL_PATH = f"ppo_vs_{OPPONENT}.zip"
+# If there's no agent for THIS opponent yet, warm-start from the random-trained one
+# (transfer learning): the agent that mastered random gets a head start vs the heuristic.
+WARM_START_PATH = "ppo_vs_random.zip"
 
 
 def mask_fn(env):
@@ -53,6 +67,19 @@ def mask_fn(env):
     return np.array(SinglesEnv.get_action_mask(env.env.battle1), dtype=bool)
 
 
+OPPONENT_CLASSES = {"random": RandomPlayer, "heuristic": SimpleHeuristicsPlayer}
+OPPONENT_LABEL = {"random": "RandomPlayer", "heuristic": "SimpleHeuristicsPlayer"}[OPPONENT]
+
+
+def make_opponent():
+    """Build the opponent the agent trains/benchmarks against (set by OPPONENT)."""
+    return OPPONENT_CLASSES[OPPONENT](
+        account_configuration=AccountConfiguration(f"{OPPONENT}-opp", None),
+        battle_format=BATTLE_FORMAT,
+        start_listening=False,        # used only as a "brain"; needs no own connection
+    )
+
+
 def build_env():
     """Create the masked learning environment and return it plus the inner env."""
     showdown = ShowdownSinglesEnv(
@@ -60,15 +87,7 @@ def build_env():
         strict=False,                 # safety net: illegal action -> random legal move
         log_level=logging.ERROR,      # quiet the per-turn warning spam
     )
-    # The opponent the agent learns against. A random opponent gives the clearest
-    # "is it learning?" signal first. Later, swap in our Stage 1 heuristic
-    # (MaxDamagePlayer) or poke-env's SimpleHeuristicsPlayer for a tougher teacher.
-    opponent = RandomPlayer(
-        account_configuration=AccountConfiguration("RandomOpp", None),
-        battle_format=BATTLE_FORMAT,
-        start_listening=False,        # used only as a "brain"; needs no own connection
-    )
-    wrapped = SingleAgentWrapper(showdown, opponent)
+    wrapped = SingleAgentWrapper(showdown, make_opponent())
     masked = ActionMasker(wrapped, mask_fn)
     return masked, showdown
 
@@ -89,41 +108,72 @@ def win_rate(model, env, inner, n_battles):
     return wins / n_battles
 
 
+class WinRateCallback(BaseCallback):
+    """Every `eval_freq` steps, play some battles and log the win rate to TensorBoard.
+
+    Uses a SEPARATE eval environment so measuring doesn't disturb the battles the
+    agent is currently learning from. Shows up in TensorBoard as `eval/win_rate`.
+    """
+
+    def __init__(self, eval_env, eval_inner, n_battles, eval_freq, verbose=1):
+        super().__init__(verbose)
+        self.eval_env = eval_env
+        self.eval_inner = eval_inner
+        self.n_battles = n_battles
+        self.eval_freq = eval_freq
+
+    def _on_step(self):
+        if self.n_calls % self.eval_freq == 0:
+            wr = win_rate(self.model, self.eval_env, self.eval_inner, self.n_battles)
+            self.logger.record("eval/win_rate", wr)
+            if self.verbose:
+                print(f"[eval] {self.num_timesteps:,} steps -> win rate {wr:.0%}", flush=True)
+        return True
+
+
 def main():
     env, inner = build_env()
+    eval_env, eval_inner = build_env()  # separate env just for measuring win rate
 
-    # Resume from a saved model if we have one, so each run keeps improving the
-    # SAME agent instead of starting from scratch.
+    # Decide where the agent's starting weights come from:
+    #   1. a saved agent for THIS opponent  -> continue improving it
+    #   2. else the random-trained agent     -> warm-start (transfer learning)
+    #   3. else                              -> a fresh random-weights agent
     resuming = os.path.exists(MODEL_PATH)
     if resuming:
-        print(f"Found {MODEL_PATH} -> loading it and CONTINUING training.", flush=True)
+        print(f"Found {MODEL_PATH} -> CONTINUING training vs {OPPONENT_LABEL}.", flush=True)
         model = MaskablePPO.load(MODEL_PATH, env=env, tensorboard_log=TB_DIR)
+    elif os.path.exists(WARM_START_PATH):
+        print(f"Warm-starting from {WARM_START_PATH} (the random-trained agent).", flush=True)
+        model = MaskablePPO.load(WARM_START_PATH, env=env, tensorboard_log=TB_DIR)
     else:
         print("No saved model -> starting a FRESH agent (random weights).", flush=True)
         model = MaskablePPO("MultiInputPolicy", env, verbose=1, tensorboard_log=TB_DIR)
 
-    label = "Current" if resuming else "Untrained"
-    print(f"\n=== Evaluating {label} agent ===", flush=True)
+    print(f"\n=== Win rate vs {OPPONENT_LABEL} BEFORE this run ===", flush=True)
     before = win_rate(model, env, inner, EVAL_BATTLES)
-    print(f"{label} win rate vs RandomPlayer: {before:.0%}", flush=True)
+    print(f"Before: {before:.0%}", flush=True)
 
-    print(f"\n=== Training for {TRAIN_STEPS:,} more steps ===", flush=True)
-    # reset_num_timesteps=False when resuming so the TensorBoard x-axis (and the
-    # internal step counter) continues from where the last run left off.
+    print(f"\n=== Training for {TRAIN_STEPS:,} more steps vs {OPPONENT_LABEL} ===", flush=True)
+    # reset_num_timesteps=False only when continuing the same matchup, so the
+    # TensorBoard x-axis continues; a warm-start/fresh run gets its own curve.
+    win_rate_cb = WinRateCallback(eval_env, eval_inner, LIVE_EVAL_BATTLES, EVAL_FREQ)
     model.learn(
         total_timesteps=TRAIN_STEPS,
         reset_num_timesteps=not resuming,
-        tb_log_name="ppo",
+        tb_log_name=f"ppo_vs_{OPPONENT}",
+        callback=win_rate_cb,
     )
     model.save(MODEL_PATH)
     print(f"Saved model to {MODEL_PATH}", flush=True)
 
-    print("\n=== Evaluating agent after this session ===", flush=True)
+    print(f"\n=== Win rate vs {OPPONENT_LABEL} AFTER this run ===", flush=True)
     after = win_rate(model, env, inner, EVAL_BATTLES)
-    print(f"Win rate vs RandomPlayer now:    {after:.0%}", flush=True)
+    print(f"After: {after:.0%}", flush=True)
 
-    print(f"\nResult: {before:.0%} -> {after:.0%} win rate after {TRAIN_STEPS:,} more steps.", flush=True)
+    print(f"\nResult vs {OPPONENT_LABEL}: {before:.0%} -> {after:.0%} after {TRAIN_STEPS:,} steps.", flush=True)
     env.close()
+    eval_env.close()
 
 
 if __name__ == "__main__":
