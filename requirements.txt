@@ -1,1 +1,3 @@
 poke-env==0.15.0
+stable-baselines3==2.8.0
+sb3-contrib==2.8.0
