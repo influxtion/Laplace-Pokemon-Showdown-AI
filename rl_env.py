@@ -87,14 +87,31 @@ def _effects(mon):
     return vec
 
 
-def _ability_flags(mon):
-    """One flag per high-impact ability category (all zeros if unknown/none)."""
+def _norm_ability(name):
+    return name.lower().replace(" ", "").replace("-", "")
+
+
+def _ability_flags(mon, infer_possible=False):
+    """One flag per high-impact ability category.
+
+    1.0 = the Pokemon is confirmed to have an ability in this category.
+    0.5 = the ability is unknown (opponent, not yet revealed) but the species COULD
+          have one in this category (from `possible_abilities`).
+    0.0 = none / unknown with no possibility.
+    """
     vec = [0.0] * len(ABILITY_CATEGORIES)
-    if mon is not None and mon.ability:
-        aid = mon.ability.lower().replace(" ", "").replace("-", "")
+    if mon is None:
+        return vec
+    if mon.ability:  # confirmed (always true for our own Pokemon)
+        aid = _norm_ability(mon.ability)
         for i, ids in enumerate(ABILITY_CATEGORIES):
             if aid in ids:
                 vec[i] = 1.0
+    elif infer_possible:  # opponent whose ability hasn't shown yet
+        possibles = {_norm_ability(a) for a in (mon.possible_abilities or [])}
+        for i, ids in enumerate(ABILITY_CATEGORIES):
+            if possibles & ids:
+                vec[i] = 0.5
     return vec
 
 
@@ -251,7 +268,7 @@ class ShowdownSinglesEnv(SinglesEnv):
             + _status_onehot(me) + _status_onehot(opp)              # 12
             + _matchup(me, opp) + [faster]                          # 3
             + _effects(me) + _effects(opp)                          # 8
-            + _ability_flags(me) + _ability_flags(opp)              # 24
+            + _ability_flags(me) + _ability_flags(opp, infer_possible=True)  # 24
             + _bench(battle)                                        # 15
             + _opponent_moves(battle)                               # 8
             + _hazards(battle.side_conditions)                      # 3
