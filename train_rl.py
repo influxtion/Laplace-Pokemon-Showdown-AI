@@ -36,7 +36,7 @@ from poke_env.player import RandomPlayer, SimpleHeuristicsPlayer
 from poke_env.environment.singles_env import SinglesEnv
 from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
 
-from rl_env import ShowdownSinglesEnv
+from rl_env import ShowdownSinglesEnv, N_FEATURES
 
 BATTLE_FORMAT = "gen9randombattle"
 
@@ -45,17 +45,19 @@ BATTLE_FORMAT = "gen9randombattle"
 #   "heuristic" -> SimpleHeuristicsPlayer (type matchups, speed, switching; a real test)
 OPPONENT = "heuristic"
 
-TRAIN_STEPS = 50_000     # turns of experience to add THIS run (bump up for a stronger agent)
-EVAL_BATTLES = 50        # battles used to estimate win rate (start/end of run)
+TRAIN_STEPS = 500_000     # turns of experience to add THIS run (bump up for a stronger agent)
+EVAL_BATTLES = 100        # battles used to estimate win rate (start/end of run)
 TB_DIR = "tb_logs"       # TensorBoard logs go here
 EVAL_FREQ = 10_000       # measure win rate every N steps DURING training (for the live graph)
 LIVE_EVAL_BATTLES = 30   # battles per live measurement (fewer = faster, noisier)
 
-# Each opponent gets its own saved agent so experiments don't overwrite each other.
-MODEL_PATH = f"ppo_vs_{OPPONENT}.zip"
-# If there's no agent for THIS opponent yet, warm-start from the random-trained one
-# (transfer learning): the agent that mastered random gets a head start vs the heuristic.
-WARM_START_PATH = "ppo_vs_random.zip"
+# Each opponent gets its own saved agent. The filename also includes the observation
+# size (N_FEATURES): if you change what the network "sees", the old saved weights are no
+# longer compatible, so a different filename keeps them separate instead of clobbering them.
+MODEL_PATH = f"ppo_vs_{OPPONENT}_obs{N_FEATURES}.zip"
+# If there's no agent for THIS opponent+observation yet, warm-start from the random-trained
+# one with the SAME observation, if it exists (transfer learning).
+WARM_START_PATH = f"ppo_vs_random_obs{N_FEATURES}.zip"
 
 
 def mask_fn(env):
@@ -135,20 +137,37 @@ def main():
     env, inner = build_env()
     eval_env, eval_inner = build_env()  # separate env just for measuring win rate
 
+    def fresh_model():
+        # ent_coef adds an "exploration bonus": it rewards keeping some randomness in
+        # the policy, so the agent keeps trying new strategies instead of locking into
+        # one too early (which is what made the old 12-feature agent plateau).
+        return MaskablePPO(
+            "MultiInputPolicy", env, verbose=1, tensorboard_log=TB_DIR, ent_coef=0.01
+        )
+
+    def safe_load(path):
+        # Loading fails if the saved network's input size no longer matches the current
+        # observation. If that happens, fall back to a fresh agent instead of crashing.
+        try:
+            return MaskablePPO.load(path, env=env, tensorboard_log=TB_DIR), True
+        except (ValueError, RuntimeError, KeyError) as e:
+            print(f"Could not load {path} ({type(e).__name__}); starting fresh.", flush=True)
+            return fresh_model(), False
+
     # Decide where the agent's starting weights come from:
-    #   1. a saved agent for THIS opponent  -> continue improving it
-    #   2. else the random-trained agent     -> warm-start (transfer learning)
-    #   3. else                              -> a fresh random-weights agent
+    #   1. a saved agent for THIS opponent+observation -> continue improving it
+    #   2. else the random-trained agent (same obs)     -> warm-start (transfer learning)
+    #   3. else                                         -> a fresh random-weights agent
     resuming = os.path.exists(MODEL_PATH)
     if resuming:
         print(f"Found {MODEL_PATH} -> CONTINUING training vs {OPPONENT_LABEL}.", flush=True)
-        model = MaskablePPO.load(MODEL_PATH, env=env, tensorboard_log=TB_DIR)
+        model, resuming = safe_load(MODEL_PATH)
     elif os.path.exists(WARM_START_PATH):
         print(f"Warm-starting from {WARM_START_PATH} (the random-trained agent).", flush=True)
-        model = MaskablePPO.load(WARM_START_PATH, env=env, tensorboard_log=TB_DIR)
+        model, _ = safe_load(WARM_START_PATH)
     else:
-        print("No saved model -> starting a FRESH agent (random weights).", flush=True)
-        model = MaskablePPO("MultiInputPolicy", env, verbose=1, tensorboard_log=TB_DIR)
+        print(f"No saved model for this setup -> starting a FRESH agent ({N_FEATURES} features).", flush=True)
+        model = fresh_model()
 
     print(f"\n=== Win rate vs {OPPONENT_LABEL} BEFORE this run ===", flush=True)
     before = win_rate(model, env, inner, EVAL_BATTLES)
@@ -161,7 +180,7 @@ def main():
     model.learn(
         total_timesteps=TRAIN_STEPS,
         reset_num_timesteps=not resuming,
-        tb_log_name=f"ppo_vs_{OPPONENT}",
+        tb_log_name=f"ppo_vs_{OPPONENT}_obs{N_FEATURES}",
         callback=win_rate_cb,
     )
     model.save(MODEL_PATH)

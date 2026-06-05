@@ -18,7 +18,8 @@
       "Bash(Select-String -Pattern \"win rate|Evaluating|Training|Saved|Result|Traceback|Error|Exception|ep_rew_mean|total_timesteps\")",
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pip install --quiet tensorboard; Write-Output \"=== tensorboard installed ===\"; .\\\\.venv\\\\Scripts\\\\python.exe -c \"import tensorboard; print\\('tensorboard', tensorboard.__version__\\)\")",
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m tensorboard.main --logdir tb_logs --port 6006)",
-      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import ast; ast.parse\\(open\\('train_rl.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\"; .\\\\.venv\\\\Scripts\\\\python.exe -c \"import train_rl; print\\('import OK; callback:', train_rl.WinRateCallback.__name__\\)\")"
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import ast; ast.parse\\(open\\('train_rl.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\"; .\\\\.venv\\\\Scripts\\\\python.exe -c \"import train_rl; print\\('import OK; callback:', train_rl.WinRateCallback.__name__\\)\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import importlib, train_rl; importlib.reload\\(train_rl\\); print\\('import OK'\\); print\\('features =', train_rl.N_FEATURES\\); print\\('model path =', train_rl.MODEL_PATH\\); print\\('warm-start =', train_rl.WARM_START_PATH\\); print\\('steps =', train_rl.TRAIN_STEPS\\)\")"
     ]
   }
 }
