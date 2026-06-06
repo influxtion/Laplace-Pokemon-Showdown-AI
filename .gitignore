@@ -17,3 +17,6 @@ tb_logs/
 
 # Backups / scratch
 backup_old/
+
+# Claude Code local settings (personal, machine-specific)
+.claude/settings.local.json

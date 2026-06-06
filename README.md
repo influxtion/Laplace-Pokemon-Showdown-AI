@@ -1,53 +1,63 @@
 # Pokemon Showdown Battle AI
 
-A project that builds an AI to play [Pokemon Showdown](https://pokemonshowdown.com/)
-singles battles. It is built in stages, from a simple rule-based bot up to a neural
-network trained with reinforcement learning.
+An AI that plays [Pokemon Showdown](https://pokemonshowdown.com/) singles battles. It
+starts as a simple rule-based bot and works up to a neural network trained with
+reinforcement learning.
 
-The code talks to a local copy of the Pokemon Showdown server through
-[`poke-env`](https://github.com/hsahovic/poke-env), which handles the connection and
-exposes the battle state as Python objects. Training runs locally so the agent can play
-thousands of fast battles for free.
+Everything runs against a local copy of the Showdown server, which the code talks to
+through [poke-env](https://github.com/hsahovic/poke-env). poke-env handles the connection
+and hands back the battle state as Python objects. Because it all runs locally, the agent
+can play through thousands of battles quickly and for free.
 
-## Project structure
+## How it's built
 
-The code is split into two versions:
+The project grew in stages, and the code keeps each stage around so they can be compared.
 
-- **`v1/`** - the first working agent: a flat 141-number observation fed to a standard
-  MLP, trained with MaskablePPO. Reaches ~41% win rate vs the heuristic.
-- **`v2/`** - the bigger architecture: an 854-number *structured* observation (12 Pokemon
-  "tokens" + global field state) fed to a custom **team-attention network**, with a
-  win-weighted reward. Built to push past v1's ceiling.
+**Heuristic bot** (`v1/heuristic_bot.py`). A hand-written player with no learning. It
+scores each move by base power, STAB, and type effectiveness, plays the best one, and
+switches out when the matchup is bad. It wins about 96% of games against a random opponent
+and also serves as the benchmark the learning agents are measured against.
 
-Run all commands **from the project root** (e.g. `python v2\train_v2.py`) so model files
-and `tb_logs/` land in the root.
+**Reinforcement-learning agent** (`v1/`). This is the main line of work. The battle state
+is turned into a list of numbers (the observation), fed to a network, and the network
+learns which moves and switches win games. Training uses MaskablePPO: at every turn only
+some of the actions are legal, and poke-env supplies a mask of the legal ones, so the
+agent only ever picks valid moves. That makes learning much faster than letting it flail
+at illegal actions.
 
-## Stages
+The observation has grown over time. It began as a flat 141 numbers, and the agent trained
+on that reached around 41% against the heuristic. The current version is larger (215
+numbers) and adds two things worth calling out:
 
-1. Heuristic bot (`v1/heuristic_bot.py`) - a rule-based agent, no machine learning. Scores
-   moves by base power, STAB, and type effectiveness, plays the best, switches on a bad
-   matchup. Wins ~96% vs random; also the baseline benchmark.
-2. RL agent v1 (`v1/rl_env.py` + `v1/train_rl.py`) - a network that learns by playing
-   (MaskablePPO). Flat observation + MLP. ~41% vs the heuristic.
-3. RL agent v2 (`v2/rl_env_v2.py` + `v2/team_net.py` + `v2/train_v2.py`) - structured
-   observation + team-attention network + win-weighted reward.
-4. In progress - self-play (train against copies of itself) and eventually laddering on
-   the live server for a real rating.
+- Per-Pokemon detail the early version missed: held item, Terastallization state, and move
+  priority.
+- A knowledge layer (`v1/knowledge.py`) that predicts the opponent's set. Random Battle
+  sets are drawn from a fixed, public pool, so when the agent sees a Haxorus it can look up
+  the moves that Haxorus is likely carrying and estimate how much damage they would do.
+  The prediction is probabilistic (a move in one of two possible sets reads as roughly
+  50%) and sharpens as the opponent reveals moves.
+
+**Attention experiment** (`v2/`). A larger structured observation (854 numbers laid out as
+twelve Pokemon "tokens" plus global field state) fed to a custom team-attention network,
+the idea being to let the network reason about each Pokemon on its own. In testing it
+learned worse than the simpler flat MLP: most of that observation is empty early in a game
+(the opponent's unrevealed team is all zeros), which buried the useful signal. It is kept
+here as a documented experiment rather than the path forward.
 
 ## Requirements
 
-- Python 3.12 (any recent 3.x should work)
-- Node.js 18+ (needed to run the local Showdown server)
+- Python 3.12 (any recent 3.x should be fine)
+- Node.js 18+ (to run the local Showdown server)
 - git
 
 ## One-time setup
 
-Run these once, from the project folder (`C:\Users\jayde\Desktop\Coding Projects\Project`).
+Run these once from the project root.
 
 ```powershell
 # 1. Create the Python virtual environment and install dependencies
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1          # activates the venv (prompt shows "(.venv)")
+.\.venv\Scripts\Activate.ps1          # the prompt should now show "(.venv)"
 pip install -r requirements.txt
 
 # 2. Clone and build the local Showdown server (large, takes a few minutes)
@@ -57,171 +67,129 @@ npm install
 cd ..
 ```
 
-## Important: the virtual environment
+The Python packages live in `.venv`, not in the system Python, so every command has to use
+that environment. Either activate it once per terminal with `.\.venv\Scripts\Activate.ps1`
+and then run `python ...`, or call the venv's Python directly with
+`.\.venv\Scripts\python.exe ...`. If you see `ModuleNotFoundError: No module named
+'sb3_contrib'` (or similar), the venv is not active.
 
-All Python packages for this project (poke-env, stable-baselines3, sb3-contrib,
-tensorboard) are installed inside the `.venv` folder, not in the system-wide Python.
-Every Python command for this project must use that environment, or you will get errors
-like `ModuleNotFoundError: No module named 'sb3_contrib'`.
+## Running it
 
-Two ways to make sure you are using it:
+The local server has to be running first, since every script connects to it. Use a
+separate terminal for each long-running piece.
 
-- Activate it once per terminal, then use `python` normally:
-  ```powershell
-  .\.venv\Scripts\Activate.ps1
-  python -u v2\train_v2.py
-  ```
-- Or call the venv's Python directly, without activating:
-  ```powershell
-  .\.venv\Scripts\python.exe -u v2\train_v2.py
-  ```
-
-If you see a `ModuleNotFoundError`, the venv is almost certainly not active. Activate it
-(or use the full `.\.venv\Scripts\python.exe` path) and try again.
-
-## Running things
-
-The local Showdown server must be running before any bot or training script, because the
-scripts connect to it. Use separate terminals.
-
-### Step 1 - start the local server
+### 1. Start the server
 
 ```powershell
 cd server
 node pokemon-showdown start --no-security
 ```
 
-Leave this terminal open. It is ready when it prints
-`Worker 1 now listening on 0.0.0.0:8000`. The `--no-security` flag disables login and
-rate limits so local bots can connect freely. To stop the server later, press Ctrl+C in
-this terminal.
+Leave it open. It is ready once it prints `Worker 1 now listening on 0.0.0.0:8000`. The
+`--no-security` flag turns off login and rate limits so local bots can connect freely.
+Ctrl+C stops it.
 
-### Step 2 - (optional) start TensorBoard
+### 2. Train an agent
 
-TensorBoard shows live graphs of training progress in a browser. In another terminal:
+From the project root:
+
+```powershell
+.\.venv\Scripts\python.exe -u v1\train_rl.py    # main agent: flat observation + MLP
+.\.venv\Scripts\python.exe -u v2\train_v2.py    # the attention experiment
+```
+
+A run does everything in order: load the starting weights (see Model files below), measure
+and print the win rate before training, train for `TRAIN_STEPS` steps while logging to
+`tb_logs`, save the agent, and measure the win rate again. It checkpoints periodically, so
+stopping early with Ctrl+C keeps recent progress and the next run picks up from there.
+
+The `-u` flag makes Python print output as it happens instead of buffering it, so progress
+is visible live.
+
+### 3. Watch training (optional)
+
+TensorBoard shows live graphs in the browser. In another terminal:
 
 ```powershell
 .\.venv\Scripts\python.exe -m tensorboard.main --logdir tb_logs
 ```
 
-Then open http://localhost:6006 and use the SCALARS tab. Useful graphs:
+Open http://localhost:6006 and use the SCALARS tab. The graphs worth watching:
 
-- `rollout/ep_rew_mean` - average reward per battle. Trending up means the agent is
-  winning more. This is the smooth, continuous signal.
-- `eval/win_rate` - win rate measured every 10,000 steps against the current opponent.
-  This is the "real score", but it bounces a bit because each point is only 30 battles.
-- `rollout/ep_len_mean` - average battle length. Trending down means it is winning faster.
+- `eval/win_rate` is the real score, measured against the opponent every few thousand
+  steps. Each point is only 30 battles, so it bounces around a bit.
+- `rollout/ep_rew_mean` is the average reward per battle, a smoother signal that should
+  trend up as the agent improves.
+- `train/explained_variance` says whether the value network is learning. If it sits near
+  zero the agent is not really learning, even if the reward looks busy.
 
-### Step 3 - run the heuristic bot benchmark (optional)
+### 4. Benchmark the heuristic bot (optional)
 
-This plays the rule-based bot against a random opponent and prints its win rate. No
-machine learning is involved.
+Plays the rule-based bot against a random opponent and prints its win rate. No learning
+involved.
 
 ```powershell
 .\.venv\Scripts\python.exe v1\run_battle.py
 ```
 
-### Step 4 - train a reinforcement-learning agent
+## Settings
 
-```powershell
-.\.venv\Scripts\python.exe -u v1\train_rl.py    # v1: flat observation + MLP
-.\.venv\Scripts\python.exe -u v2\train_v2.py    # v2: structured observation + attention net
-```
-
-One run does everything automatically, in order:
-
-1. Loads the agent's starting weights (see "Model files" below).
-2. Measures and prints the win rate before training ("Before:").
-3. Trains for `TRAIN_STEPS` steps. Progress prints every few seconds and is logged to
-   `tb_logs` for TensorBoard.
-4. Saves the trained agent to disk automatically. You will see
-   `Saved model to ppo_vs_<opponent>.zip` when this happens.
-5. Measures and prints the win rate after training ("After:").
-
-The model is only saved once, at the end of training. If you stop the run early with
-Ctrl+C, that run's progress is not saved and it will resume from the last saved file next
-time. Let it finish (you will see the "Saved model" line).
-
-The `-u` flag makes Python print output immediately instead of buffering it, so you can
-watch progress live.
-
-## Choosing the opponent and other settings
-
-The settings are constants at the top of `train_rl.py`:
+The knobs are constants at the top of `v1/train_rl.py`:
 
 | Setting | What it does |
 |---|---|
-| `OPPONENT` | Who the agent trains against and is measured against. `"random"` (random legal moves, the easy baseline) or `"heuristic"` (`SimpleHeuristicsPlayer`, a real strategy bot). |
-| `TRAIN_STEPS` | How many steps (turns of experience) to train this run. Larger is stronger but slower. Roughly 300 steps per second. |
+| `OPPONENT` | Who the agent trains against and is scored against: `"random"` (random legal moves, the easy baseline) or `"heuristic"` (a real strategy bot). |
+| `TRAIN_STEPS` | How many steps of experience to add this run. Larger is stronger but slower (roughly 300 steps per second). |
 | `EVAL_BATTLES` | Battles used for the before/after win-rate measurement. |
-| `EVAL_FREQ` | How often (in steps) to measure win rate for the live TensorBoard graph. |
+| `EVAL_FREQ` | How often, in steps, to measure win rate for the live graph. |
 
-A "step" is one decision (one move or switch). A full battle is roughly 40-60 steps, so
-50,000 steps is about 1,000 battles.
+A step is one decision (a move or a switch). A battle is roughly 40 to 60 steps, so 50,000
+steps is about a thousand battles.
 
 ## Model files
 
-Each opponent gets its own saved agent so experiments do not overwrite each other:
+Trained agents are saved as `ppo_vs_<opponent>_obs<N>.zip`, where `<opponent>` is who it
+trained against and `<N>` is the observation size. Putting the observation size in the name
+means that changing what the network sees will not silently load or overwrite an
+incompatible older model.
 
-- `ppo_vs_random.zip` - agent trained against the random opponent.
-- `ppo_vs_heuristic.zip` - agent trained against the heuristic opponent.
+When `train_rl.py` starts, it decides where to begin:
 
-When you run `train_rl.py`, it decides where to start from:
+1. If a saved file already exists for the current opponent and observation size, it loads
+   it and keeps training the same agent.
+2. If not, but a same-size agent trained against the random opponent exists, it warm-starts
+   from that (transfer learning) on a fresh training curve.
+3. Otherwise it starts from a brand-new random-weights network.
 
-1. If a saved file already exists for the current `OPPONENT`, it loads that and continues
-   training it (so each run keeps improving the same agent).
-2. If not, but `ppo_vs_random.zip` exists, it warm-starts from the random-trained agent
-   (transfer learning) and starts a fresh training curve.
-3. If neither exists, it starts from a brand-new random-weights network.
+To start an opponent over from scratch, delete its `.zip`.
 
-To start an opponent over from scratch, delete its `.zip` file.
+The `.zip` files, `tb_logs/`, and the `server/` clone are not committed (see
+`.gitignore`); the models and logs are regenerated by training.
 
-The `.zip` files and `tb_logs` are excluded from git (see `.gitignore`); they are
-regenerated by training.
-
-## Typical full session
-
-```powershell
-# Terminal 1: server
-cd server
-node pokemon-showdown start --no-security
-
-# Terminal 2: TensorBoard (optional)
-cd "C:\Users\jayde\Desktop\Coding Projects\Project"
-.\.venv\Scripts\python.exe -m tensorboard.main --logdir tb_logs
-
-# Terminal 3: training (re-run any time to keep improving the agent)
-cd "C:\Users\jayde\Desktop\Coding Projects\Project"
-.\.venv\Scripts\Activate.ps1
-python -u v2\train_v2.py
-```
-
-## Troubleshooting
-
-- `ModuleNotFoundError: No module named '...'` - the virtual environment is not active.
-  Activate it with `.\.venv\Scripts\Activate.ps1` or call `.\.venv\Scripts\python.exe`
-  directly.
-- The training script hangs or times out connecting - the local server is not running.
-  Start it (Step 1) and confirm it prints the "listening on 0.0.0.0:8000" line.
-- `EADDRINUSE` / port 8000 already in use - a server is already running. Either reuse it
-  or stop the old one (Ctrl+C in its terminal, or `Stop-Process -Name node`).
-- TensorBoard shows no data - make sure you point `--logdir` at `tb_logs` and that a
-  training run has started writing to it. Use the refresh icon in the browser.
-
-## Project layout
+## Repo layout
 
 | Path | Purpose |
 |---|---|
-| `v1/heuristic_bot.py` | The rule-based bot (`MaxDamagePlayer`). |
-| `v1/run_battle.py` | Plays the heuristic bot vs a random opponent and reports win rate. |
-| `v1/rl_env.py` | v1 environment: flat 141-number observation (`embed_battle`) + reward (`calc_reward`). |
-| `v1/train_rl.py` | Trains the v1 (flat-MLP) agent. |
-| `v1/smoke_test.py` | Quick check that the v1 env builds, resets, and steps. |
-| `v2/rl_env_v2.py` | v2 environment: structured 854-number observation (12 Pokemon tokens + global). |
-| `v2/team_net.py` | The team-attention network (custom feature extractor). |
-| `v2/train_v2.py` | Trains the v2 (attention) agent. |
-| `v2/smoke_v2.py` | Live end-to-end check of the v2 stack. |
+| `v1/heuristic_bot.py` | The rule-based bot. |
+| `v1/run_battle.py` | Runs the heuristic bot vs a random opponent and reports win rate. |
+| `v1/rl_env.py` | The RL environment: the 215-number observation (`embed_battle`) and the reward (`calc_reward`). |
+| `v1/knowledge.py` | Opponent set prediction (from the Random Battle set data) and damage estimation. |
+| `v1/train_rl.py` | Trains the main agent. |
+| `v1/smoke_test.py` | Quick check that the v1 environment builds, resets, and steps. |
+| `v2/rl_env_v2.py` | The experiment's structured 854-number observation. |
+| `v2/team_net.py` | The team-attention network. |
+| `v2/train_v2.py` | Trains the v2 agent. |
+| `v2/smoke_v2.py` | End-to-end check of the v2 stack against a live battle. |
 | `requirements.txt` | Python dependencies. |
-| `server/` | Local Pokemon Showdown server (cloned separately, not committed). |
-| `tb_logs/` | TensorBoard logs (generated, not committed). |
-| `ppo_*.zip` | Saved trained agents (generated, not committed). |
+| `server/` | Local Showdown server, cloned separately during setup. |
+
+## Troubleshooting
+
+- `ModuleNotFoundError` means the virtual environment is not active. Activate it or call
+  `.\.venv\Scripts\python.exe` directly.
+- A script that hangs while connecting means the server is not running. Start it and
+  confirm the `listening on 0.0.0.0:8000` line.
+- `EADDRINUSE` or "port 8000 already in use" means a server is already running. Reuse it,
+  or stop the old one (Ctrl+C in its terminal, or `Stop-Process -Name node`).
+- TensorBoard showing no data usually means `--logdir` is not pointing at `tb_logs`, or no
+  run has started writing yet. Use the refresh icon in the browser.
