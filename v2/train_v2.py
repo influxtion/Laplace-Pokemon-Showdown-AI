@@ -18,7 +18,7 @@ import os
 import numpy as np
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
-from stable_baselines3.common.callbacks import CallbackList
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 
 from poke_env import AccountConfiguration
 from poke_env.player import SimpleHeuristicsPlayer
@@ -27,7 +27,6 @@ from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
 
 from rl_env_v2 import ShowdownTeamEnv, N_FEATURES
 from team_net import TeamAttentionExtractor
-from train_rl import win_rate, WinRateCallback, SaveCallback  # generic, env-agnostic
 
 BATTLE_FORMAT = "gen9randombattle"
 TRAIN_STEPS = 300_000
@@ -57,6 +56,57 @@ def build_env():
     )
     wrapped = SingleAgentWrapper(showdown, make_opponent())
     return ActionMasker(wrapped, mask_fn), showdown
+
+
+def win_rate(model, env, inner, n_battles):
+    """Play n_battles with the model and return the fraction it won."""
+    wins = 0
+    for _ in range(n_battles):
+        obs, _ = env.reset()
+        done = False
+        while not done:
+            masks = np.asarray(obs["action_mask"], dtype=bool)
+            action, _ = model.predict(obs, action_masks=masks, deterministic=True)
+            obs, _, terminated, truncated, _ = env.step(np.int64(action))
+            done = terminated or truncated
+        if inner.battle1 is not None and inner.battle1.won:
+            wins += 1
+    return wins / n_battles
+
+
+class WinRateCallback(BaseCallback):
+    """Every eval_freq steps, play some battles and log win rate to TensorBoard."""
+
+    def __init__(self, eval_env, eval_inner, n_battles, eval_freq, verbose=1):
+        super().__init__(verbose)
+        self.eval_env = eval_env
+        self.eval_inner = eval_inner
+        self.n_battles = n_battles
+        self.eval_freq = eval_freq
+
+    def _on_step(self):
+        if self.n_calls % self.eval_freq == 0:
+            wr = win_rate(self.model, self.eval_env, self.eval_inner, self.n_battles)
+            self.logger.record("eval/win_rate", wr)
+            if self.verbose:
+                print(f"[eval] {self.num_timesteps:,} steps -> win rate {wr:.0%}", flush=True)
+        return True
+
+
+class SaveCallback(BaseCallback):
+    """Save the model every save_freq steps so an interrupt keeps progress."""
+
+    def __init__(self, path, save_freq, verbose=1):
+        super().__init__(verbose)
+        self.path = path
+        self.save_freq = save_freq
+
+    def _on_step(self):
+        if self.save_freq and self.n_calls % self.save_freq == 0:
+            self.model.save(self.path)
+            if self.verbose:
+                print(f"[checkpoint] saved {self.path} at {self.num_timesteps:,} steps", flush=True)
+        return True
 
 
 def main():

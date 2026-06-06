@@ -9,19 +9,30 @@ The code talks to a local copy of the Pokemon Showdown server through
 exposes the battle state as Python objects. Training runs locally so the agent can play
 thousands of fast battles for free.
 
+## Project structure
+
+The code is split into two versions:
+
+- **`v1/`** - the first working agent: a flat 141-number observation fed to a standard
+  MLP, trained with MaskablePPO. Reaches ~41% win rate vs the heuristic.
+- **`v2/`** - the bigger architecture: an 854-number *structured* observation (12 Pokemon
+  "tokens" + global field state) fed to a custom **team-attention network**, with a
+  win-weighted reward. Built to push past v1's ceiling.
+
+Run all commands **from the project root** (e.g. `python v2\train_v2.py`) so model files
+and `tb_logs/` land in the root.
+
 ## Stages
 
-1. Heuristic bot (`heuristic_bot.py`) - a rule-based agent. Each turn it scores the
-   available moves by base power, STAB, and type effectiveness, plays the best one, and
-   switches to the best matchup when its Pokemon faints. Wins about 96% against an
-   opponent that plays random moves. This is also the benchmark the learning agent is
-   measured against.
-2. Reinforcement-learning agent (`rl_env.py` + `train_rl.py`) - a neural network that
-   learns by playing, using MaskablePPO. There are no hand-written move rules: the battle
-   is described to the network as numbers, the network is rewarded for winning, and it is
-   adjusted over many battles so winning behaviour is reinforced.
-3. In progress - training against stronger opponents (the heuristic, then self-play),
-   richer observations, and eventually laddering on the live server for a real rating.
+1. Heuristic bot (`v1/heuristic_bot.py`) - a rule-based agent, no machine learning. Scores
+   moves by base power, STAB, and type effectiveness, plays the best, switches on a bad
+   matchup. Wins ~96% vs random; also the baseline benchmark.
+2. RL agent v1 (`v1/rl_env.py` + `v1/train_rl.py`) - a network that learns by playing
+   (MaskablePPO). Flat observation + MLP. ~41% vs the heuristic.
+3. RL agent v2 (`v2/rl_env_v2.py` + `v2/team_net.py` + `v2/train_v2.py`) - structured
+   observation + team-attention network + win-weighted reward.
+4. In progress - self-play (train against copies of itself) and eventually laddering on
+   the live server for a real rating.
 
 ## Requirements
 
@@ -58,11 +69,11 @@ Two ways to make sure you are using it:
 - Activate it once per terminal, then use `python` normally:
   ```powershell
   .\.venv\Scripts\Activate.ps1
-  python -u train_rl.py
+  python -u v2\train_v2.py
   ```
 - Or call the venv's Python directly, without activating:
   ```powershell
-  .\.venv\Scripts\python.exe -u train_rl.py
+  .\.venv\Scripts\python.exe -u v2\train_v2.py
   ```
 
 If you see a `ModuleNotFoundError`, the venv is almost certainly not active. Activate it
@@ -107,13 +118,14 @@ This plays the rule-based bot against a random opponent and prints its win rate.
 machine learning is involved.
 
 ```powershell
-.\.venv\Scripts\python.exe run_battle.py
+.\.venv\Scripts\python.exe v1\run_battle.py
 ```
 
-### Step 4 - train the reinforcement-learning agent
+### Step 4 - train a reinforcement-learning agent
 
 ```powershell
-.\.venv\Scripts\python.exe -u train_rl.py
+.\.venv\Scripts\python.exe -u v1\train_rl.py    # v1: flat observation + MLP
+.\.venv\Scripts\python.exe -u v2\train_v2.py    # v2: structured observation + attention net
 ```
 
 One run does everything automatically, in order:
@@ -181,7 +193,7 @@ cd "C:\Users\jayde\Desktop\Coding Projects\Project"
 # Terminal 3: training (re-run any time to keep improving the agent)
 cd "C:\Users\jayde\Desktop\Coding Projects\Project"
 .\.venv\Scripts\Activate.ps1
-python -u train_rl.py
+python -u v2\train_v2.py
 ```
 
 ## Troubleshooting
@@ -200,12 +212,16 @@ python -u train_rl.py
 
 | Path | Purpose |
 |---|---|
-| `heuristic_bot.py` | The rule-based bot (`MaxDamagePlayer`). |
-| `run_battle.py` | Plays the heuristic bot vs a random opponent and reports win rate. |
-| `rl_env.py` | The reinforcement-learning environment: turns a battle into numbers (`embed_battle`) and into a reward (`calc_reward`). |
-| `train_rl.py` | Trains the RL agent, logs to TensorBoard, evaluates, and saves the model. |
-| `smoke_test.py` | Quick check that the RL environment builds, resets, and steps. |
+| `v1/heuristic_bot.py` | The rule-based bot (`MaxDamagePlayer`). |
+| `v1/run_battle.py` | Plays the heuristic bot vs a random opponent and reports win rate. |
+| `v1/rl_env.py` | v1 environment: flat 141-number observation (`embed_battle`) + reward (`calc_reward`). |
+| `v1/train_rl.py` | Trains the v1 (flat-MLP) agent. |
+| `v1/smoke_test.py` | Quick check that the v1 env builds, resets, and steps. |
+| `v2/rl_env_v2.py` | v2 environment: structured 854-number observation (12 Pokemon tokens + global). |
+| `v2/team_net.py` | The team-attention network (custom feature extractor). |
+| `v2/train_v2.py` | Trains the v2 (attention) agent. |
+| `v2/smoke_v2.py` | Live end-to-end check of the v2 stack. |
 | `requirements.txt` | Python dependencies. |
 | `server/` | Local Pokemon Showdown server (cloned separately, not committed). |
 | `tb_logs/` | TensorBoard logs (generated, not committed). |
-| `ppo_vs_*.zip` | Saved trained agents (generated, not committed). |
+| `ppo_*.zip` | Saved trained agents (generated, not committed). |

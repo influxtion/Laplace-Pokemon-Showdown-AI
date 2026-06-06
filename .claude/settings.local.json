@@ -27,7 +27,12 @@
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import train_rl; print\\('import OK; SAVE_FREQ =', f'{train_rl.SAVE_FREQ:,}', '; TRAIN_STEPS =', f'{train_rl.TRAIN_STEPS:,}'\\); print\\('SaveCallback present:', hasattr\\(train_rl, 'SaveCallback'\\)\\)\")",
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import train_v2; print\\('train_v2 imports OK; MODEL_PATH =', train_v2.MODEL_PATH\\)\"; Write-Output \"--- offline integration test ---\"; .\\\\.venv\\\\Scripts\\\\python.exe _v2_offline_test.py)",
       "Bash(git add *)",
-      "Bash(git -c user.name=\"Jayden\" -c user.email=\"jaydenshin2008@gmail.com\" commit -q -m \"Phase 1 v2: structured 854-feature observation, team-attention network, win-weighted reward, train_v2 runner \\(offline-validated\\)\")"
+      "Bash(git -c user.name=\"Jayden\" -c user.email=\"jaydenshin2008@gmail.com\" commit -q -m \"Phase 1 v2: structured 854-feature observation, team-attention network, win-weighted reward, train_v2 runner \\(offline-validated\\)\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe smoke_v2.py)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import sys; sys.path.insert\\(0,'v1'\\); import heuristic_bot, rl_env, train_rl, run_battle; print\\('v1 imports OK'\\)\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import sys; sys.path.insert\\(0,'v2'\\); import rl_env_v2, team_net, train_v2; print\\('v2 imports OK'\\)\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe v2\\\\smoke_v2.py)",
+      "Bash(git -c user.name=\"Jayden\" -c user.email=\"jaydenshin2008@gmail.com\" commit -q -m \"Reorganize into v1/ and v2/ folders; make train_v2 self-contained; update README\")"
     ]
   }
 }
