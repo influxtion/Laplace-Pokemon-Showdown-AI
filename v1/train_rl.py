@@ -45,8 +45,8 @@ BATTLE_FORMAT = "gen9randombattle"
 #   "heuristic" -> SimpleHeuristicsPlayer (type matchups, speed, switching; a real test)
 OPPONENT = "heuristic"
 
-TRAIN_STEPS = 400_000     # turns of experience to add THIS run (bump up for a stronger agent)
-EVAL_BATTLES = 50        # battles used to estimate win rate (start/end of run)
+TRAIN_STEPS = 200_000     # turns of experience to add THIS run (bump up for a stronger agent)
+EVAL_BATTLES = 100        # battles used to estimate win rate (start/end of run)
 TB_DIR = "tb_logs"       # TensorBoard logs go here
 EVAL_FREQ = 10_000       # measure win rate every N steps DURING training (for the live graph)
 LIVE_EVAL_BATTLES = 30   # battles per live measurement (fewer = faster, noisier)

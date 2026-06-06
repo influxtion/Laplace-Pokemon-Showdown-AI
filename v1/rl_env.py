@@ -25,12 +25,34 @@ from gymnasium.spaces import Box
 
 from poke_env.environment.singles_env import SinglesEnv
 
+from knowledge import KNOWLEDGE, ROLE_NAMES, N_THREAT_FLAGS, estimate_damage_fraction, safe_priority
+
 # --- lookup tables -----------------------------------------------------------
 
 STAT_KEYS = ["hp", "atk", "def", "spa", "spd", "spe"]   # base-stat dict keys
 BOOST_KEYS = ["atk", "def", "spa", "spd", "spe"]        # in-battle stat-stage keys
 STATUS_NAMES = ["BRN", "PAR", "SLP", "FRZ", "PSN", "TOX"]  # status conditions we encode
 EFFECT_NAMES = ["SUBSTITUTE", "LEECH_SEED", "TAUNT", "CONFUSION"]  # volatile effects
+TYPE_NAMES = [
+    "NORMAL", "FIRE", "WATER", "ELECTRIC", "GRASS", "ICE", "FIGHTING", "POISON",
+    "GROUND", "FLYING", "PSYCHIC", "BUG", "ROCK", "GHOST", "DRAGON", "DARK", "STEEL", "FAIRY",
+]  # 18, used for the (own-side) Tera type one-hot
+
+# High-impact held items, grouped into categories (one flag each). We only read this for
+# OUR OWN active Pokemon, whose item is always known -- the opponent's is usually hidden,
+# so encoding it would just add blank features (the mistake the 854-obs experiment made).
+ITEM_CATEGORIES = [
+    {"leftovers", "blacksludge"},                  # passive healing
+    {"choiceband", "choicespecs", "choicescarf"},  # locked into one move (power/speed)
+    {"heavydutyboots"},                            # ignores entry hazards
+    {"lifeorb"},                                    # power boost + recoil
+    {"assaultvest"},                               # special bulk, no status moves
+    {"focussash"},                                 # survive a KO from full HP
+    {"rockyhelmet"},                               # punishes contact
+    {"eviolite"},                                  # bulk for not-fully-evolved
+    {"boosterenergy"},                             # triggers Proto/Quark
+    {"weaknesspolicy"},                            # boosts after a super-effective hit
+]  # 10
 
 # High-impact abilities, grouped into strategic categories. Each category becomes one
 # flag per active Pokemon. Encoding categories (not the hundreds of raw abilities) keeps
@@ -122,6 +144,50 @@ def _matchup(me, opp):
     offense = max((opp.damage_multiplier(t) for t in me.types if t is not None), default=1.0)
     defense = max((me.damage_multiplier(t) for t in opp.types if t is not None), default=1.0)
     return [offense / 4.0, defense / 4.0]
+
+
+def _eff_speed(mon):
+    """Effective speed: base speed adjusted for the stat-stage boost and paralysis.
+
+    The old `faster` flag compared *raw* base speed, which is wrong whenever there's a
+    speed boost/drop or paralysis in play. This captures those (the common cases);
+    items like Choice Scarf are still invisible (held items aren't known for the opponent).
+    """
+    if mon is None:
+        return 0.0
+    boost = mon.boosts["spe"]
+    mult = (2 + boost) / 2 if boost >= 0 else 2 / (2 - boost)
+    spe = mon.base_stats["spe"] * mult
+    if mon.status is not None and mon.status.name == "PAR":
+        spe *= 0.5
+    return spe
+
+
+def _item_flags(mon):
+    """One flag per high-impact item category for a Pokemon whose item is known."""
+    vec = [0.0] * len(ITEM_CATEGORIES)
+    if mon is None or not mon.item:
+        return vec
+    item = mon.item.lower().replace(" ", "").replace("-", "")
+    for i, ids in enumerate(ITEM_CATEGORIES):
+        if item in ids:
+            vec[i] = 1.0
+    return vec
+
+
+def _tera_features(battle, me):
+    """Our Terastallization state: can we Tera, our active's Tera type, are we Tera'd.
+
+    All known for our own side (the opponent's Tera type stays hidden until they use it,
+    so we don't encode it -- that would just be a blank).
+    """
+    can_tera = 1.0 if battle.can_tera else 0.0
+    if me is not None and me.tera_type is not None:
+        tera_type = [1.0 if name == me.tera_type.name else 0.0 for name in TYPE_NAMES]
+    else:
+        tera_type = [0.0] * len(TYPE_NAMES)
+    is_tera = 1.0 if (me is not None and me.is_terastallized) else 0.0
+    return [can_tera] + tera_type + [is_tera]
 
 
 # --- battle-wide feature helpers ---------------------------------------------
@@ -221,8 +287,32 @@ def _opponent_moves(battle):
     return power + effectiveness
 
 
+def _knowledge_features(battle, me, opp):
+    """Opponent set-prediction + damage-estimate features (see knowledge.py).
+
+    All keyed off the opponent's ACTIVE Pokemon (always known) and our own moves, so every
+    value here is populated -- no blank features (the lesson from the 854-obs experiment)."""
+    # Our moves' estimated damage to the opponent's active (a real "can I KO?" signal).
+    my_move_dmg = [0.0] * 4
+    for i, move in enumerate(battle.available_moves[:4]):
+        my_move_dmg[i] = estimate_damage_fraction(me, move, opp)
+    best_out = max(my_move_dmg) if my_move_dmg else 0.0
+    # Worst estimated damage the opponent's LIKELY (predicted) moves do to us -> switch cue.
+    worst_in = KNOWLEDGE.predicted_incoming(opp, me)
+
+    return (
+        my_move_dmg + [best_out, worst_in]      # 6  (worst_in is probability-weighted)
+        + KNOWLEDGE.predicted_coverage(opp)     # 18 (P(has attacking move of each type))
+        + KNOWLEDGE.role_flags(opp)             # 10 (P(each randbats role))
+        + KNOWLEDGE.threat_flags(opp)           # 6  (P of priority/recovery/hazard/setup/status/pivot)
+    )
+
+
 # Total length of the observation vector (see embed_battle for the layout).
-N_FEATURES = 141
+# 141 (original) + 4 move priority + 10 own-item flags + 20 Tera = 175,
+# + 40 knowledge layer (6 damage + 18 coverage + 10 roles + 6 threats) = 215.
+KNOWLEDGE_FEATURES = 6 + 18 + len(ROLE_NAMES) + N_THREAT_FLAGS  # 40
+N_FEATURES = 215
 
 
 class ShowdownSinglesEnv(SinglesEnv):
@@ -243,6 +333,7 @@ class ShowdownSinglesEnv(SinglesEnv):
         move_accuracy = [0.0] * 4
         move_physical = [0.0] * 4
         move_status = [0.0] * 4
+        move_priority = [0.0] * 4
         for i, move in enumerate(battle.available_moves[:4]):
             move_power[i] = move.base_power / 100.0
             if opp is not None:
@@ -252,16 +343,25 @@ class ShowdownSinglesEnv(SinglesEnv):
             category = move.category.name
             move_physical[i] = 1.0 if category == "PHYSICAL" else 0.0
             move_status[i] = 1.0 if category == "STATUS" else 0.0
+            # Priority decides who moves first regardless of speed (e.g. a priority KO).
+            # Clamp to [-1, 1] so a rare -7 move (e.g. Trick Room) can't blow the range.
+            # safe_priority: some live pseudo-moves (Struggle) omit the priority field.
+            move_priority[i] = max(-1.0, min(1.0, safe_priority(move) / 3.0))
 
         my_hp = me.current_hp_fraction if me else 0.0
         opp_hp = opp.current_hp_fraction if opp else 0.0
         my_remaining = sum(1 for m in battle.team.values() if not m.fainted) / 6.0
         opp_fainted = sum(1 for m in battle.opponent_team.values() if m.fainted)
         opp_remaining = (6 - opp_fainted) / 6.0
-        faster = 1.0 if (me and opp and me.base_stats["spe"] > opp.base_stats["spe"]) else 0.0
+        # Effective-speed comparison (accounts for boosts/paralysis), flipped under
+        # Trick Room, which reverses the turn order.
+        faster = 1.0 if _eff_speed(me) > _eff_speed(opp) else 0.0
+        if any(f.name == "TRICK_ROOM" for f in battle.fields):
+            faster = 1.0 - faster
 
         features = (
             move_power + move_multiplier + move_accuracy + move_physical + move_status  # 20
+            + move_priority                                        # 4
             + [my_hp, opp_hp, my_remaining, opp_remaining]          # 4
             + _base_stats(me) + _base_stats(opp)                    # 12
             + _boosts(me) + _boosts(opp)                            # 10
@@ -277,6 +377,9 @@ class ShowdownSinglesEnv(SinglesEnv):
             + _screens(battle.side_conditions)                      # 4
             + _screens(battle.opponent_side_conditions)             # 4
             + _weather(battle)                                      # 5
+            + _item_flags(me)                                       # 10 (our held item)
+            + _tera_features(battle, me)                            # 20 (Tera: can/type/active)
+            + _knowledge_features(battle, me, opp)                  # 40 (set prediction + damage)
         )
         return np.array(features, dtype=np.float32)
 
