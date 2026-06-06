@@ -283,14 +283,15 @@ class ShowdownSinglesEnv(SinglesEnv):
     def calc_reward(self, battle):
         """Reward = change in how good our position is since last turn.
 
-        Winning is worth a lot (+30). In between, the agent gets small rewards for
-        making the opponent faint / lose HP and small penalties for the reverse,
-        so it gets useful feedback long before the battle ends.
+        WINNING dominates (+100) so the agent plays to win, not just to trade evenly.
+        The HP/faint/status terms are kept small: just enough dense feedback to guide
+        early learning, but far less than a win, so favorable trades are a means to the
+        win rather than the goal themselves.
         """
         return self.reward_computing_helper(
             battle,
-            fainted_value=2.0,   # each faint swing is worth 2
-            hp_value=1.0,        # reward chipping HP
-            status_value=0.2,    # small bonus for inflicting status
-            victory_value=30.0,  # winning dominates everything else
+            fainted_value=1.0,    # KOs still matter, but less
+            hp_value=0.5,         # chip damage is a faint hint, not the objective
+            status_value=0.1,
+            victory_value=100.0,  # a win is worth ~10x any single favorable trade
         )

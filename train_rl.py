@@ -29,7 +29,7 @@ import os
 import numpy as np
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 
 from poke_env import AccountConfiguration
 from poke_env.player import RandomPlayer, SimpleHeuristicsPlayer
@@ -45,11 +45,12 @@ BATTLE_FORMAT = "gen9randombattle"
 #   "heuristic" -> SimpleHeuristicsPlayer (type matchups, speed, switching; a real test)
 OPPONENT = "heuristic"
 
-TRAIN_STEPS = 500_000     # turns of experience to add THIS run (bump up for a stronger agent)
-EVAL_BATTLES = 100        # battles used to estimate win rate (start/end of run)
+TRAIN_STEPS = 400_000     # turns of experience to add THIS run (bump up for a stronger agent)
+EVAL_BATTLES = 50        # battles used to estimate win rate (start/end of run)
 TB_DIR = "tb_logs"       # TensorBoard logs go here
 EVAL_FREQ = 10_000       # measure win rate every N steps DURING training (for the live graph)
 LIVE_EVAL_BATTLES = 30   # battles per live measurement (fewer = faster, noisier)
+SAVE_FREQ = 100_000      # auto-save the model every N steps (so an interrupt loses at most this many)
 
 # Each opponent gets its own saved agent. The filename also includes the observation
 # size (N_FEATURES): if you change what the network "sees", the old saved weights are no
@@ -133,6 +134,22 @@ class WinRateCallback(BaseCallback):
         return True
 
 
+class SaveCallback(BaseCallback):
+    """Save the model every `save_freq` steps so an interrupted run keeps its progress."""
+
+    def __init__(self, path, save_freq, verbose=1):
+        super().__init__(verbose)
+        self.path = path
+        self.save_freq = save_freq
+
+    def _on_step(self):
+        if self.save_freq and self.n_calls % self.save_freq == 0:
+            self.model.save(self.path)
+            if self.verbose:
+                print(f"[checkpoint] saved {self.path} at {self.num_timesteps:,} steps", flush=True)
+        return True
+
+
 def main():
     env, inner = build_env()
     eval_env, eval_inner = build_env()  # separate env just for measuring win rate
@@ -176,12 +193,15 @@ def main():
     print(f"\n=== Training for {TRAIN_STEPS:,} more steps vs {OPPONENT_LABEL} ===", flush=True)
     # reset_num_timesteps=False only when continuing the same matchup, so the
     # TensorBoard x-axis continues; a warm-start/fresh run gets its own curve.
-    win_rate_cb = WinRateCallback(eval_env, eval_inner, LIVE_EVAL_BATTLES, EVAL_FREQ)
+    callbacks = CallbackList([
+        WinRateCallback(eval_env, eval_inner, LIVE_EVAL_BATTLES, EVAL_FREQ),
+        SaveCallback(MODEL_PATH, SAVE_FREQ),
+    ])
     model.learn(
         total_timesteps=TRAIN_STEPS,
         reset_num_timesteps=not resuming,
         tb_log_name=f"ppo_vs_{OPPONENT}_obs{N_FEATURES}",
-        callback=win_rate_cb,
+        callback=callbacks,
     )
     model.save(MODEL_PATH)
     print(f"Saved model to {MODEL_PATH}", flush=True)

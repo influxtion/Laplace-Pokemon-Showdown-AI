@@ -19,7 +19,15 @@
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pip install --quiet tensorboard; Write-Output \"=== tensorboard installed ===\"; .\\\\.venv\\\\Scripts\\\\python.exe -c \"import tensorboard; print\\('tensorboard', tensorboard.__version__\\)\")",
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m tensorboard.main --logdir tb_logs --port 6006)",
       "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import ast; ast.parse\\(open\\('train_rl.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\"; .\\\\.venv\\\\Scripts\\\\python.exe -c \"import train_rl; print\\('import OK; callback:', train_rl.WinRateCallback.__name__\\)\")",
-      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import importlib, train_rl; importlib.reload\\(train_rl\\); print\\('import OK'\\); print\\('features =', train_rl.N_FEATURES\\); print\\('model path =', train_rl.MODEL_PATH\\); print\\('warm-start =', train_rl.WARM_START_PATH\\); print\\('steps =', train_rl.TRAIN_STEPS\\)\")"
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import importlib, train_rl; importlib.reload\\(train_rl\\); print\\('import OK'\\); print\\('features =', train_rl.N_FEATURES\\); print\\('model path =', train_rl.MODEL_PATH\\); print\\('warm-start =', train_rl.WARM_START_PATH\\); print\\('steps =', train_rl.TRAIN_STEPS\\)\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import train_rl; print\\('import OK; SAVE_FREQ =', train_rl.SAVE_FREQ, '; TRAIN_STEPS =', train_rl.TRAIN_STEPS, '; model =', train_rl.MODEL_PATH\\)\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import importlib,train_rl; importlib.reload\\(train_rl\\); print\\('import OK; TRAIN_STEPS =', train_rl.TRAIN_STEPS\\)\"; Write-Output \"--- git diff vs last commit \\(train_rl.py\\) ---\"; git diff --stat -- train_rl.py; git diff -- train_rl.py)",
+      "PowerShell(Get-CimInstance *)",
+      "PowerShell(Move-Item *)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import train_rl; print\\('import OK; SAVE_FREQ =', f'{train_rl.SAVE_FREQ:,}', '; TRAIN_STEPS =', f'{train_rl.TRAIN_STEPS:,}'\\); print\\('SaveCallback present:', hasattr\\(train_rl, 'SaveCallback'\\)\\)\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import train_v2; print\\('train_v2 imports OK; MODEL_PATH =', train_v2.MODEL_PATH\\)\"; Write-Output \"--- offline integration test ---\"; .\\\\.venv\\\\Scripts\\\\python.exe _v2_offline_test.py)",
+      "Bash(git add *)",
+      "Bash(git -c user.name=\"Jayden\" -c user.email=\"jaydenshin2008@gmail.com\" commit -q -m \"Phase 1 v2: structured 854-feature observation, team-attention network, win-weighted reward, train_v2 runner \\(offline-validated\\)\")"
     ]
   }
 }
