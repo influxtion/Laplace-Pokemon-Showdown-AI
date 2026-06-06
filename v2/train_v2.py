@@ -28,14 +28,23 @@ from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
 from rl_env_v2 import ShowdownTeamEnv, N_FEATURES
 from team_net import TeamAttentionExtractor
 
+# DIAGNOSTIC TOGGLE: when False, the 854-feature obs is fed through SB3's default
+# extractor (the exact architecture v1 used to reach 41%) instead of the team-attention
+# net. This isolates the cause of the v2 regression: if win rate / explained_variance
+# climb with this off, the attention net is the culprit; if they still stall, the 854 obs
+# itself is. Kept on a separate model file + tb run so it never clobbers the attn model.
+USE_ATTENTION = False
+
 BATTLE_FORMAT = "gen9randombattle"
-TRAIN_STEPS = 300_000
+TRAIN_STEPS = 100_000
 EVAL_BATTLES = 50
 LIVE_EVAL_BATTLES = 30
 EVAL_FREQ = 10_000
 SAVE_FREQ = 100_000
 TB_DIR = "tb_logs"
-MODEL_PATH = f"ppo_v2_attn_obs{N_FEATURES}.zip"
+TAG = "attn" if USE_ATTENTION else "mlp"
+MODEL_PATH = f"ppo_v2_{TAG}_obs{N_FEATURES}.zip"
+TB_LOG_NAME = f"ppo_v2_{TAG}"
 
 
 def mask_fn(env):
@@ -113,19 +122,25 @@ def main():
     env, inner = build_env()
     eval_env, eval_inner = build_env()
 
-    # Plug the team-attention network in as the feature extractor.
-    policy_kwargs = dict(
-        features_extractor_class=TeamAttentionExtractor,
-        features_extractor_kwargs=dict(features_dim=128),
-        net_arch=[128, 128],
-    )
+    # Plug the team-attention network in as the feature extractor -- unless we're running
+    # the diagnostic (USE_ATTENTION=False), in which case we use SB3's default extractor,
+    # i.e. v1's exact architecture on the v2 obs.
+    if USE_ATTENTION:
+        policy_kwargs = dict(
+            features_extractor_class=TeamAttentionExtractor,
+            features_extractor_kwargs=dict(features_dim=128),
+            net_arch=[128, 128],
+        )
+    else:
+        policy_kwargs = dict(net_arch=[128, 128])
 
     resuming = os.path.exists(MODEL_PATH)
     if resuming:
         print(f"Found {MODEL_PATH} -> CONTINUING.", flush=True)
         model = MaskablePPO.load(MODEL_PATH, env=env, tensorboard_log=TB_DIR)
     else:
-        print(f"Starting a FRESH v2 agent (attention net, {N_FEATURES} features).", flush=True)
+        kind = "attention net" if USE_ATTENTION else "PLAIN MLP (diagnostic)"
+        print(f"Starting a FRESH v2 agent ({kind}, {N_FEATURES} features).", flush=True)
         model = MaskablePPO(
             "MultiInputPolicy", env, verbose=1, ent_coef=0.01,
             tensorboard_log=TB_DIR, policy_kwargs=policy_kwargs,
@@ -143,7 +158,7 @@ def main():
     model.learn(
         total_timesteps=TRAIN_STEPS,
         reset_num_timesteps=not resuming,
-        tb_log_name="ppo_v2_attn",
+        tb_log_name=TB_LOG_NAME,
         callback=callbacks,
     )
     model.save(MODEL_PATH)

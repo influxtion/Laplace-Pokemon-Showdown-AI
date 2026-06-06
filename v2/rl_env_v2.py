@@ -280,7 +280,7 @@ class ShowdownTeamEnv(SinglesEnv):
         return structured_observation(battle)
 
     def calc_reward(self, battle):
-        # Win-weighted: a win (+100) dominates the small HP/faint/status shaping.
+        # High victory_value encourages winning, but too high prevents learning
         return self.reward_computing_helper(
-            battle, fainted_value=1.0, hp_value=0.5, status_value=0.1, victory_value=100.0,
+            battle, fainted_value=2.0, hp_value=1.0, status_value=0.1, victory_value=40.0,
         )
