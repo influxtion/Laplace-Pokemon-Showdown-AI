@@ -315,86 +315,88 @@ KNOWLEDGE_FEATURES = 6 + 18 + len(ROLE_NAMES) + N_THREAT_FLAGS  # 40
 N_FEATURES = 215
 
 
+def build_observation(battle):
+    """Describe the current battle to the network as N_FEATURES numbers.
+
+    Module-level so the same observation can be built outside the env -- the self-play
+    opponent (selfplay.py) runs the model on this exact vector inside its choose_move."""
+    me = battle.active_pokemon
+    opp = battle.opponent_active_pokemon
+
+    # Our active Pokemon's (up to 4) moves.
+    move_power = [0.0] * 4
+    move_multiplier = [0.0] * 4
+    move_accuracy = [0.0] * 4
+    move_physical = [0.0] * 4
+    move_status = [0.0] * 4
+    move_priority = [0.0] * 4
+    for i, move in enumerate(battle.available_moves[:4]):
+        move_power[i] = move.base_power / 100.0
+        if opp is not None:
+            move_multiplier[i] = opp.damage_multiplier(move) / 4.0
+        acc = move.accuracy
+        move_accuracy[i] = 1.0 if acc is True else float(acc)
+        category = move.category.name
+        move_physical[i] = 1.0 if category == "PHYSICAL" else 0.0
+        move_status[i] = 1.0 if category == "STATUS" else 0.0
+        # Priority decides who moves first regardless of speed (e.g. a priority KO).
+        # Clamp to [-1, 1] so a rare -7 move (e.g. Trick Room) can't blow the range.
+        # safe_priority: some live pseudo-moves (Struggle) omit the priority field.
+        move_priority[i] = max(-1.0, min(1.0, safe_priority(move) / 3.0))
+
+    my_hp = me.current_hp_fraction if me else 0.0
+    opp_hp = opp.current_hp_fraction if opp else 0.0
+    my_remaining = sum(1 for m in battle.team.values() if not m.fainted) / 6.0
+    opp_fainted = sum(1 for m in battle.opponent_team.values() if m.fainted)
+    opp_remaining = (6 - opp_fainted) / 6.0
+    # Effective-speed comparison (accounts for boosts/paralysis), flipped under
+    # Trick Room, which reverses the turn order.
+    faster = 1.0 if _eff_speed(me) > _eff_speed(opp) else 0.0
+    if any(f.name == "TRICK_ROOM" for f in battle.fields):
+        faster = 1.0 - faster
+
+    features = (
+        move_power + move_multiplier + move_accuracy + move_physical + move_status  # 20
+        + move_priority                                        # 4
+        + [my_hp, opp_hp, my_remaining, opp_remaining]          # 4
+        + _base_stats(me) + _base_stats(opp)                    # 12
+        + _boosts(me) + _boosts(opp)                            # 10
+        + _status_onehot(me) + _status_onehot(opp)              # 12
+        + _matchup(me, opp) + [faster]                          # 3
+        + _effects(me) + _effects(opp)                          # 8
+        + _ability_flags(me) + _ability_flags(opp, infer_possible=True)  # 24
+        + _bench(battle)                                        # 15
+        + _opponent_moves(battle)                               # 8
+        + _hazards(battle.side_conditions)                      # 3
+        + _hazards(battle.opponent_side_conditions)             # 3
+        + _terrain(battle) + _trick_room(battle)                # 6
+        + _screens(battle.side_conditions)                      # 4
+        + _screens(battle.opponent_side_conditions)             # 4
+        + _weather(battle)                                      # 5
+        + _item_flags(me)                                       # 10 (our held item)
+        + _tera_features(battle, me)                            # 20 (Tera: can/type/active)
+        + _knowledge_features(battle, me, opp)                  # 40 (set prediction + damage)
+    )
+    return np.array(features, dtype=np.float32)
+
+
+# Default reward weights. Winning dominates so the agent plays to win, not just to trade
+# evenly; the dense HP/faint/status terms are just enough feedback to guide early learning.
+# Self-play raises victory_value mid-curriculum (see train_selfplay.py).
+DEFAULT_REWARD = dict(fainted_value=1.0, hp_value=0.5, status_value=0.1, victory_value=100.0)
+
+
 class ShowdownSinglesEnv(SinglesEnv):
-    def __init__(self, **kwargs):
+    def __init__(self, reward_weights=None, **kwargs):
         super().__init__(**kwargs)
         # Negative low because stat boosts can be negative.
         obs_space = Box(low=-1.0, high=4.0, shape=(N_FEATURES,), dtype=np.float32)
         self.observation_spaces = {agent: obs_space for agent in self.possible_agents}
+        self.reward_weights = dict(DEFAULT_REWARD, **(reward_weights or {}))
 
     def embed_battle(self, battle):
-        """Describe the current battle to the network as N_FEATURES numbers."""
-        me = battle.active_pokemon
-        opp = battle.opponent_active_pokemon
-
-        # Our active Pokemon's (up to 4) moves.
-        move_power = [0.0] * 4
-        move_multiplier = [0.0] * 4
-        move_accuracy = [0.0] * 4
-        move_physical = [0.0] * 4
-        move_status = [0.0] * 4
-        move_priority = [0.0] * 4
-        for i, move in enumerate(battle.available_moves[:4]):
-            move_power[i] = move.base_power / 100.0
-            if opp is not None:
-                move_multiplier[i] = opp.damage_multiplier(move) / 4.0
-            acc = move.accuracy
-            move_accuracy[i] = 1.0 if acc is True else float(acc)
-            category = move.category.name
-            move_physical[i] = 1.0 if category == "PHYSICAL" else 0.0
-            move_status[i] = 1.0 if category == "STATUS" else 0.0
-            # Priority decides who moves first regardless of speed (e.g. a priority KO).
-            # Clamp to [-1, 1] so a rare -7 move (e.g. Trick Room) can't blow the range.
-            # safe_priority: some live pseudo-moves (Struggle) omit the priority field.
-            move_priority[i] = max(-1.0, min(1.0, safe_priority(move) / 3.0))
-
-        my_hp = me.current_hp_fraction if me else 0.0
-        opp_hp = opp.current_hp_fraction if opp else 0.0
-        my_remaining = sum(1 for m in battle.team.values() if not m.fainted) / 6.0
-        opp_fainted = sum(1 for m in battle.opponent_team.values() if m.fainted)
-        opp_remaining = (6 - opp_fainted) / 6.0
-        # Effective-speed comparison (accounts for boosts/paralysis), flipped under
-        # Trick Room, which reverses the turn order.
-        faster = 1.0 if _eff_speed(me) > _eff_speed(opp) else 0.0
-        if any(f.name == "TRICK_ROOM" for f in battle.fields):
-            faster = 1.0 - faster
-
-        features = (
-            move_power + move_multiplier + move_accuracy + move_physical + move_status  # 20
-            + move_priority                                        # 4
-            + [my_hp, opp_hp, my_remaining, opp_remaining]          # 4
-            + _base_stats(me) + _base_stats(opp)                    # 12
-            + _boosts(me) + _boosts(opp)                            # 10
-            + _status_onehot(me) + _status_onehot(opp)              # 12
-            + _matchup(me, opp) + [faster]                          # 3
-            + _effects(me) + _effects(opp)                          # 8
-            + _ability_flags(me) + _ability_flags(opp, infer_possible=True)  # 24
-            + _bench(battle)                                        # 15
-            + _opponent_moves(battle)                               # 8
-            + _hazards(battle.side_conditions)                      # 3
-            + _hazards(battle.opponent_side_conditions)             # 3
-            + _terrain(battle) + _trick_room(battle)                # 6
-            + _screens(battle.side_conditions)                      # 4
-            + _screens(battle.opponent_side_conditions)             # 4
-            + _weather(battle)                                      # 5
-            + _item_flags(me)                                       # 10 (our held item)
-            + _tera_features(battle, me)                            # 20 (Tera: can/type/active)
-            + _knowledge_features(battle, me, opp)                  # 40 (set prediction + damage)
-        )
-        return np.array(features, dtype=np.float32)
+        return build_observation(battle)
 
     def calc_reward(self, battle):
-        """Reward = change in how good our position is since last turn.
-
-        WINNING dominates (+100) so the agent plays to win, not just to trade evenly.
-        The HP/faint/status terms are kept small: just enough dense feedback to guide
-        early learning, but far less than a win, so favorable trades are a means to the
-        win rather than the goal themselves.
-        """
-        return self.reward_computing_helper(
-            battle,
-            fainted_value=1.0,    # KOs still matter, but less
-            hp_value=0.5,         # chip damage is a faint hint, not the objective
-            status_value=0.1,
-            victory_value=100.0,  # a win is worth ~10x any single favorable trade
-        )
+        """Reward = change in how good our position is since last turn (see DEFAULT_REWARD)."""
+        return self.reward_computing_helper(battle, **self.reward_weights)

@@ -1,0 +1,54 @@
+r"""Quick live check of the self-play loop before a long run.
+
+Builds the self-play env (agent vs a model-driven opponent), plays a few dozen real turns,
+and confirms the observation shape and that the opponent picks moves without error.
+
+Run from the project root, with the local Showdown server running:
+    python -u v1\selfplay\smoke_selfplay.py
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import numpy as np
+from sb3_contrib import MaskablePPO
+
+import train_selfplay as t
+
+
+def main():
+    opponent = t.make_self_opponent()
+    env, inner = t.build_train_env(opponent)
+
+    if os.path.exists(t.WARM_START_PATH):
+        print(f"Loading {t.WARM_START_PATH}", flush=True)
+        model = MaskablePPO.load(t.WARM_START_PATH, env=env)
+    else:
+        print("No warm-start model; using a fresh one for the smoke test.", flush=True)
+        model = MaskablePPO("MultiInputPolicy", env)
+
+    # Seed the opponent the same way training does.
+    model.save(t.SNAPSHOT_PATH)
+    opponent.model = MaskablePPO.load(t.SNAPSHOT_PATH)
+
+    obs, _ = env.reset()
+    print(f"obs shape: {obs['observation'].shape} (expected ({t.N_FEATURES},))", flush=True)
+
+    battles = 0
+    for step in range(60):
+        mask = np.asarray(obs["action_mask"], dtype=bool)
+        action, _ = model.predict(obs, action_masks=mask, deterministic=True)
+        obs, reward, terminated, truncated, _ = env.step(np.int64(action))
+        if terminated or truncated:
+            battles += 1
+            print(f"  battle {battles} ended at step {step} (won={inner.battle1.won})", flush=True)
+            obs, _ = env.reset()
+
+    print(f"Self-play smoke OK: ran 60 steps, {battles} battle(s) completed.", flush=True)
+    env.close()
+
+
+if __name__ == "__main__":
+    main()

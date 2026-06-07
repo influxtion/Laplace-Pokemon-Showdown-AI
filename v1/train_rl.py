@@ -30,6 +30,8 @@ import numpy as np
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+from stable_baselines3.common.monitor import Monitor
 
 from poke_env import AccountConfiguration
 from poke_env.player import RandomPlayer, SimpleHeuristicsPlayer
@@ -45,12 +47,27 @@ BATTLE_FORMAT = "gen9randombattle"
 #   "heuristic" -> SimpleHeuristicsPlayer (type matchups, speed, switching; a real test)
 OPPONENT = "heuristic"
 
-TRAIN_STEPS = 200_000     # turns of experience to add THIS run (bump up for a stronger agent)
-EVAL_BATTLES = 100        # battles used to estimate win rate (start/end of run)
-TB_DIR = "tb_logs"       # TensorBoard logs go here
-EVAL_FREQ = 10_000       # measure win rate every N steps DURING training (for the live graph)
-LIVE_EVAL_BATTLES = 30   # battles per live measurement (fewer = faster, noisier)
-SAVE_FREQ = 100_000      # auto-save the model every N steps (so an interrupt loses at most this many)
+# Parallel training environments. Each runs in its OWN process with its own connection to
+# the Showdown server, for a roughly N_ENVS-fold speedup. Set this near your CPU's physical
+# core count; 4 is a safe laptop default. The local server handles the extra connections.
+N_ENVS = 4
+
+TRAIN_STEPS = 100_000     # turns of experience to add THIS run (bump up for a stronger agent)
+TB_DIR = "tb_logs"        # TensorBoard logs go here
+# Measurement is deliberately heavy so the win rate is trustworthy: a 30-battle eval has
+# ~+-9% noise, 100-200 battles brings it to ~+-3-5%. Eval runs serially (it pauses
+# training), so with parallel training we eval less often than before.
+EVAL_FREQ = 25_000        # measure win rate every N timesteps during training (live graph)
+LIVE_EVAL_BATTLES = 100   # battles per live measurement
+EVAL_BATTLES = 200        # battles for the before/after headline measurement
+SAVE_FREQ = 100_000       # auto-save every N timesteps (an interrupt loses at most this many)
+
+# Win-focused reward. The old default (hp 0.5 / victory 100) made the agent trade evenly
+# but not close games: the dense per-turn shaping out-competed the rare victory bonus in the
+# gradient. Now that the agent is already competent, halve the HP shaping and raise the
+# victory bonus so WINNING is clearly the objective. (The env fills any weight left unset
+# here from rl_env.DEFAULT_REWARD, so fainted stays 1.0 and status 0.1.)
+REWARD_WEIGHTS = {"hp_value": 0.25, "victory_value": 150.0}
 
 # Each opponent gets its own saved agent. The filename also includes the observation
 # size (N_FEATURES): if you change what the network "sees", the old saved weights are no
@@ -74,25 +91,47 @@ OPPONENT_CLASSES = {"random": RandomPlayer, "heuristic": SimpleHeuristicsPlayer}
 OPPONENT_LABEL = {"random": "RandomPlayer", "heuristic": "SimpleHeuristicsPlayer"}[OPPONENT]
 
 
-def make_opponent():
-    """Build the opponent the agent trains/benchmarks against (set by OPPONENT)."""
-    return OPPONENT_CLASSES[OPPONENT](
-        account_configuration=AccountConfiguration(f"{OPPONENT}-opp", None),
-        battle_format=BATTLE_FORMAT,
-        start_listening=False,        # used only as a "brain"; needs no own connection
-    )
+def build_masked_env(agent_tag, opp_tag):
+    """Build one masked env and return it plus the inner env.
 
-
-def build_env():
-    """Create the masked learning environment and return it plus the inner env."""
+    agent_tag/opp_tag give the server accounts UNIQUE names so that parallel training envs
+    (and the separate eval env) never collide on the same connection."""
+    # rand=True appends a random 5-char suffix to each username, so accounts are unique
+    # across parallel envs AND across runs. (Fixed names collide with ghost connections
+    # left by a previous crashed run -> the challenge never completes, "Agent is not
+    # challenging". poke-env's per-process counter would also collide across subprocesses.)
     showdown = ShowdownSinglesEnv(
+        reward_weights=REWARD_WEIGHTS,
+        account_configuration1=AccountConfiguration.generate(f"{agent_tag}A", rand=True),
+        account_configuration2=AccountConfiguration.generate(f"{agent_tag}B", rand=True),
         battle_format=BATTLE_FORMAT,
         strict=False,                 # safety net: illegal action -> random legal move
         log_level=logging.ERROR,      # quiet the per-turn warning spam
     )
-    wrapped = SingleAgentWrapper(showdown, make_opponent())
-    masked = ActionMasker(wrapped, mask_fn)
-    return masked, showdown
+    opponent = OPPONENT_CLASSES[OPPONENT](
+        account_configuration=AccountConfiguration.generate(opp_tag, rand=True),
+        battle_format=BATTLE_FORMAT,
+        start_listening=False,        # used only as a "brain"; needs no own connection
+    )
+    wrapped = SingleAgentWrapper(showdown, opponent)
+    return ActionMasker(wrapped, mask_fn), showdown
+
+
+def build_env():
+    """The single masked env used for evaluation (its own dedicated accounts)."""
+    return build_masked_env("ev", "evopp")
+
+
+def make_env(rank):
+    """Factory for the training env at index `rank` (used by SubprocVecEnv).
+
+    Wrapped in Monitor so SB3 records per-episode reward/length -> rollout/ep_rew_mean and
+    ep_len_mean show up in TensorBoard. (SB3 only auto-adds Monitor when you pass a raw env;
+    a VecEnv you build yourself needs it added per sub-env.)"""
+    def _init():
+        masked, _ = build_masked_env(f"tr{rank}", f"tropp{rank}")
+        return Monitor(masked)
+    return _init
 
 
 def win_rate(model, env, inner, n_battles):
@@ -124,9 +163,14 @@ class WinRateCallback(BaseCallback):
         self.eval_inner = eval_inner
         self.n_battles = n_battles
         self.eval_freq = eval_freq
+        self._last_bucket = None      # trigger on TIMESTEP buckets, not call count
 
     def _on_step(self):
-        if self.n_calls % self.eval_freq == 0:
+        # Keyed off num_timesteps (not n_calls) so the cadence is right no matter how many
+        # parallel envs there are, and so a resumed run doesn't eval every single step.
+        bucket = self.num_timesteps // self.eval_freq
+        if bucket != self._last_bucket:
+            self._last_bucket = bucket
             wr = win_rate(self.model, self.eval_env, self.eval_inner, self.n_battles)
             self.logger.record("eval/win_rate", wr)
             if self.verbose:
@@ -141,9 +185,14 @@ class SaveCallback(BaseCallback):
         super().__init__(verbose)
         self.path = path
         self.save_freq = save_freq
+        self._last_bucket = None
 
     def _on_step(self):
-        if self.save_freq and self.n_calls % self.save_freq == 0:
+        if not self.save_freq:
+            return True
+        bucket = self.num_timesteps // self.save_freq
+        if bucket != self._last_bucket:
+            self._last_bucket = bucket
             self.model.save(self.path)
             if self.verbose:
                 print(f"[checkpoint] saved {self.path} at {self.num_timesteps:,} steps", flush=True)
@@ -151,22 +200,26 @@ class SaveCallback(BaseCallback):
 
 
 def main():
-    env, inner = build_env()
-    eval_env, eval_inner = build_env()  # separate env just for measuring win rate
+    # Training runs across N_ENVS parallel processes; evaluation uses one separate env.
+    train_env = (
+        SubprocVecEnv([make_env(i) for i in range(N_ENVS)])
+        if N_ENVS > 1 else DummyVecEnv([make_env(0)])
+    )
+    eval_env, eval_inner = build_env()
 
     def fresh_model():
         # ent_coef adds an "exploration bonus": it rewards keeping some randomness in
         # the policy, so the agent keeps trying new strategies instead of locking into
         # one too early (which is what made the old 12-feature agent plateau).
         return MaskablePPO(
-            "MultiInputPolicy", env, verbose=1, tensorboard_log=TB_DIR, ent_coef=0.01
+            "MultiInputPolicy", train_env, verbose=1, tensorboard_log=TB_DIR, ent_coef=0.01
         )
 
     def safe_load(path):
         # Loading fails if the saved network's input size no longer matches the current
         # observation. If that happens, fall back to a fresh agent instead of crashing.
         try:
-            return MaskablePPO.load(path, env=env, tensorboard_log=TB_DIR), True
+            return MaskablePPO.load(path, env=train_env, tensorboard_log=TB_DIR), True
         except (ValueError, RuntimeError, KeyError) as e:
             print(f"Could not load {path} ({type(e).__name__}); starting fresh.", flush=True)
             return fresh_model(), False
@@ -186,11 +239,11 @@ def main():
         print(f"No saved model for this setup -> starting a FRESH agent ({N_FEATURES} features).", flush=True)
         model = fresh_model()
 
-    print(f"\n=== Win rate vs {OPPONENT_LABEL} BEFORE this run ===", flush=True)
-    before = win_rate(model, env, inner, EVAL_BATTLES)
+    print(f"\n=== Win rate vs {OPPONENT_LABEL} BEFORE this run ({EVAL_BATTLES} battles) ===", flush=True)
+    before = win_rate(model, eval_env, eval_inner, EVAL_BATTLES)
     print(f"Before: {before:.0%}", flush=True)
 
-    print(f"\n=== Training for {TRAIN_STEPS:,} more steps vs {OPPONENT_LABEL} ===", flush=True)
+    print(f"\n=== Training {TRAIN_STEPS:,} steps across {N_ENVS} envs vs {OPPONENT_LABEL} ===", flush=True)
     # reset_num_timesteps=False only when continuing the same matchup, so the
     # TensorBoard x-axis continues; a warm-start/fresh run gets its own curve.
     callbacks = CallbackList([
@@ -206,12 +259,12 @@ def main():
     model.save(MODEL_PATH)
     print(f"Saved model to {MODEL_PATH}", flush=True)
 
-    print(f"\n=== Win rate vs {OPPONENT_LABEL} AFTER this run ===", flush=True)
-    after = win_rate(model, env, inner, EVAL_BATTLES)
+    print(f"\n=== Win rate vs {OPPONENT_LABEL} AFTER this run ({EVAL_BATTLES} battles) ===", flush=True)
+    after = win_rate(model, eval_env, eval_inner, EVAL_BATTLES)
     print(f"After: {after:.0%}", flush=True)
 
     print(f"\nResult vs {OPPONENT_LABEL}: {before:.0%} -> {after:.0%} after {TRAIN_STEPS:,} steps.", flush=True)
-    env.close()
+    train_env.close()
     eval_env.close()
 
 

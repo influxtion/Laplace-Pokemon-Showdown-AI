@@ -25,6 +25,9 @@ some of the actions are legal, and poke-env supplies a mask of the legal ones, s
 agent only ever picks valid moves. That makes learning much faster than letting it flail
 at illegal actions.
 
+Training runs across several environments in parallel (each its own process and server
+connection) for a large speedup, with a reward that emphasizes winning over even trades.
+
 The observation has grown over time. It began as a flat 141 numbers, and the agent trained
 on that reached around 41% against the heuristic. The current version is larger (215
 numbers) and adds two things worth calling out:
@@ -36,6 +39,22 @@ numbers) and adds two things worth calling out:
   the moves that Haxorus is likely carrying and estimate how much damage they would do.
   The prediction is probabilistic (a move in one of two possible sets reads as roughly
   50%) and sharpens as the opponent reveals moves.
+
+**Self-play** (`v1/selfplay/`). Against a single fixed opponent the agent tops out, because
+once it has solved that opponent there is nothing left to learn. Self-play replaces the
+fixed opponent with a snapshot of the agent itself, refreshed periodically, so the target
+keeps getting stronger as the agent does. It warm-starts from the heuristic-trained model
+and is still benchmarked against the heuristic so progress stays comparable.
+
+**Scaled agent and test-time search** (`v1/v3/`). A fresh agent that bundles the changes
+needing a clean start: a bigger network, a higher discount (so a win late in a game is
+still credited to the moves that set it up), the win-focused reward, and parallel training
+at scale. On top of the trained policy it adds a shallow one-turn lookahead: the policy
+proposes its few most likely moves, then the damage calculator and opponent set-prediction
+pick the one that actually KOs or avoids being KO'd. This is honest "test-time search" --
+not full game-tree MCTS, which would need a battle simulator the project doesn't have, but
+the same idea of planning one step ahead on top of a learned policy. `eval_search.py`
+benchmarks the searching agent against the raw policy to measure whether it helps.
 
 **Attention experiment** (`v2/`). A larger structured observation (854 numbers laid out as
 twelve Pokemon "tokens" plus global field state) fed to a custom team-attention network,
@@ -94,8 +113,10 @@ Ctrl+C stops it.
 From the project root:
 
 ```powershell
-.\.venv\Scripts\python.exe -u v1\train_rl.py    # main agent: flat observation + MLP
-.\.venv\Scripts\python.exe -u v2\train_v2.py    # the attention experiment
+.\.venv\Scripts\python.exe -u v1\train_rl.py                  # main agent vs random/heuristic
+.\.venv\Scripts\python.exe -u v1\v3\train_v3.py               # scaled "done-right" agent (bigger net, win reward)
+.\.venv\Scripts\python.exe -u v1\selfplay\train_selfplay.py   # self-play (warm-starts from the heuristic agent)
+.\.venv\Scripts\python.exe -u v2\train_v2.py                  # the attention experiment
 ```
 
 A run does everything in order: load the starting weights (see Model files below), measure
@@ -104,7 +125,15 @@ and print the win rate before training, train for `TRAIN_STEPS` steps while logg
 stopping early with Ctrl+C keeps recent progress and the next run picks up from there.
 
 The `-u` flag makes Python print output as it happens instead of buffering it, so progress
-is visible live.
+is visible live. The trainers run several environments in parallel (see `N_ENVS` in
+`train_rl.py`); if a run times out connecting, restart the server to clear stale
+connections, and lower `N_ENVS` if your machine or the server can't handle that many.
+
+Once an agent is trained, benchmark the test-time search against the raw policy:
+
+```powershell
+.\.venv\Scripts\python.exe -u v1\v3\eval_search.py            # raw policy vs 1-ply search, vs the heuristic
+```
 
 ### 3. Watch training (optional)
 
@@ -116,8 +145,8 @@ TensorBoard shows live graphs in the browser. In another terminal:
 
 Open http://localhost:6006 and use the SCALARS tab. The graphs worth watching:
 
-- `eval/win_rate` is the real score, measured against the opponent every few thousand
-  steps. Each point is only 30 battles, so it bounces around a bit.
+- `eval/win_rate` is the real score, measured against the opponent during training. Each
+  point is 100 battles, so it is fairly stable (set by `LIVE_EVAL_BATTLES`).
 - `rollout/ep_rew_mean` is the average reward per battle, a smoother signal that should
   trend up as the agent improves.
 - `train/explained_variance` says whether the value network is learning. If it sits near
@@ -174,8 +203,15 @@ The `.zip` files, `tb_logs/`, and the `server/` clone are not committed (see
 | `v1/run_battle.py` | Runs the heuristic bot vs a random opponent and reports win rate. |
 | `v1/rl_env.py` | The RL environment: the 215-number observation (`embed_battle`) and the reward (`calc_reward`). |
 | `v1/knowledge.py` | Opponent set prediction (from the Random Battle set data) and damage estimation. |
-| `v1/train_rl.py` | Trains the main agent. |
+| `v1/train_rl.py` | Trains the main agent (parallel envs, win-focused reward) vs random/heuristic. |
 | `v1/smoke_test.py` | Quick check that the v1 environment builds, resets, and steps. |
+| `v1/smoke_parallel.py` | Quick check that parallel (multi-process) training starts cleanly. |
+| `v1/selfplay/opponent.py` | A poke-env opponent that picks moves with a trained model. |
+| `v1/selfplay/train_selfplay.py` | Trains the agent by self-play (vs refreshed snapshots of itself). |
+| `v1/selfplay/smoke_selfplay.py` | Quick live check of the self-play loop. |
+| `v1/v3/train_v3.py` | Trains the scaled "done-right" agent (bigger net, higher gamma, win reward). |
+| `v1/v3/search.py` | Test-time 1-ply lookahead player (policy + damage-model re-ranking). |
+| `v1/v3/eval_search.py` | Benchmarks the search agent vs the raw policy, both vs the heuristic. |
 | `v2/rl_env_v2.py` | The experiment's structured 854-number observation. |
 | `v2/team_net.py` | The team-attention network. |
 | `v2/train_v2.py` | Trains the v2 agent. |
@@ -191,5 +227,9 @@ The `.zip` files, `tb_logs/`, and the `server/` clone are not committed (see
   confirm the `listening on 0.0.0.0:8000` line.
 - `EADDRINUSE` or "port 8000 already in use" means a server is already running. Reuse it,
   or stop the old one (Ctrl+C in its terminal, or `Stop-Process -Name node`).
+- `TimeoutError: Agent is not challenging` means an env could not start a battle, usually
+  because a previous crashed run left stale connections on the server. Restart the server
+  to clear them. If it persists, lower `N_ENVS` in `train_rl.py` (too many parallel
+  connections at once).
 - TensorBoard showing no data usually means `--logdir` is not pointing at `tb_logs`, or no
   run has started writing yet. Use the refresh icon in the browser.
