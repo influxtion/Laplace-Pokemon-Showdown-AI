@@ -39,6 +39,8 @@ def pick_model_path():
     # Best -> latest first: the self-play agent (stronger policy), then the plain v3 agent,
     # then the heuristic-trained fallback. Layering search on the best base measures the stack.
     candidates = (
+        f"ppo_v3_anneal_selfplay_best_obs{N_FEATURES}.zip",   # "Influxobot" (final): anneal -> self-play
+        f"ppo_v3_anneal_selfplay_obs{N_FEATURES}.zip",
         f"ppo_v3_anneal_best_obs{N_FEATURES}.zip",
         f"ppo_v3_anneal_obs{N_FEATURES}.zip",
         f"ppo_v3_selfplay_best_obs{N_FEATURES}.zip",
