@@ -387,16 +387,41 @@ DEFAULT_REWARD = dict(fainted_value=1.0, hp_value=0.5, status_value=0.1, victory
 
 
 class ShowdownSinglesEnv(SinglesEnv):
-    def __init__(self, reward_weights=None, **kwargs):
+    def __init__(self, reward_weights=None, reward_schedule=None, **kwargs):
         super().__init__(**kwargs)
         # Negative low because stat boosts can be negative.
         obs_space = Box(low=-1.0, high=4.0, shape=(N_FEATURES,), dtype=np.float32)
         self.observation_spaces = {agent: obs_space for agent in self.possible_agents}
         self.reward_weights = dict(DEFAULT_REWARD, **(reward_weights or {}))
 
+        # Optional reward ANNEAL. The agent learns to TRADE rather than WIN because the dense
+        # per-turn shaping (hp/faint) fires every turn while the victory bonus is rare -- so the
+        # consistent gradient rewards trading. Annealing linearly shifts the weights from a
+        # `start` (dense shaping, to bootstrap a competent policy) to an `end` (shaping shrunk,
+        # so the win bonus dominates and the agent plays to CLOSE games) over `horizon` reward
+        # computations. None -> static reward_weights (unchanged v1 behaviour).
+        # NOTE horizon is PER-ENV: with N parallel envs, pass total_anneal_steps / N.
+        self.reward_schedule = reward_schedule
+        if reward_schedule is not None:
+            self._anneal_start = dict(DEFAULT_REWARD, **reward_schedule["start"])
+            self._anneal_end = dict(DEFAULT_REWARD, **reward_schedule["end"])
+            self._anneal_horizon = max(1, int(reward_schedule["horizon"]))
+            self._reward_steps = 0
+
     def embed_battle(self, battle):
         return build_observation(battle)
 
+    def _current_weights(self):
+        """The reward weights for this turn: static, or the annealed interpolation if a
+        reward_schedule was given (advances one step per call)."""
+        if self.reward_schedule is None:
+            return self.reward_weights
+        frac = min(1.0, self._reward_steps / self._anneal_horizon)
+        self._reward_steps += 1
+        return {k: self._anneal_start[k] + frac * (self._anneal_end[k] - self._anneal_start[k])
+                for k in self._anneal_start}
+
     def calc_reward(self, battle):
-        """Reward = change in how good our position is since last turn (see DEFAULT_REWARD)."""
-        return self.reward_computing_helper(battle, **self.reward_weights)
+        """Reward = change in how good our position is since last turn (see DEFAULT_REWARD).
+        With a reward_schedule, the weights anneal from start to end across training."""
+        return self.reward_computing_helper(battle, **self._current_weights())

@@ -32,14 +32,24 @@ from search import SearchPlayer
 from opponent import ModelPlayer
 
 BATTLE_FORMAT = "gen9randombattle"
-N_BATTLES = 200
+N_BATTLES = 400
 
 
 def pick_model_path():
-    for path in (f"ppo_v3_obs{N_FEATURES}.zip", f"ppo_vs_heuristic_obs{N_FEATURES}.zip"):
+    # Best -> latest first: the self-play agent (stronger policy), then the plain v3 agent,
+    # then the heuristic-trained fallback. Layering search on the best base measures the stack.
+    candidates = (
+        f"ppo_v3_anneal_best_obs{N_FEATURES}.zip",
+        f"ppo_v3_anneal_obs{N_FEATURES}.zip",
+        f"ppo_v3_selfplay_best_obs{N_FEATURES}.zip",
+        f"ppo_v3_selfplay_obs{N_FEATURES}.zip",
+        f"ppo_v3_obs{N_FEATURES}.zip",
+        f"ppo_vs_heuristic_obs{N_FEATURES}.zip",
+    )
+    for path in candidates:
         if os.path.exists(path):
             return path
-    raise FileNotFoundError("No trained model found (ppo_v3 or ppo_vs_heuristic).")
+    raise FileNotFoundError("No trained model found (ppo_v3_selfplay / ppo_v3 / ppo_vs_heuristic).")
 
 
 async def bench(player, tag, n):

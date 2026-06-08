@@ -91,17 +91,24 @@ OPPONENT_CLASSES = {"random": RandomPlayer, "heuristic": SimpleHeuristicsPlayer}
 OPPONENT_LABEL = {"random": "RandomPlayer", "heuristic": "SimpleHeuristicsPlayer"}[OPPONENT]
 
 
-def build_masked_env(agent_tag, opp_tag):
+def build_masked_env(agent_tag, opp_tag, reward_weights=None, reward_schedule=None):
     """Build one masked env and return it plus the inner env.
 
     agent_tag/opp_tag give the server accounts UNIQUE names so that parallel training envs
-    (and the separate eval env) never collide on the same connection."""
+    (and the separate eval env) never collide on the same connection.
+
+    reward_weights overrides the module default (train_v3 uses this to inject its rescaled
+    reward). reward_schedule (train_v3_anneal) instead anneals the weights over training.
+    Both are threaded through as parameters rather than read from the global so they survive
+    the pickle into SubprocVecEnv workers, which re-import this module fresh and would
+    otherwise see the unmodified REWARD_WEIGHTS."""
     # rand=True appends a random 5-char suffix to each username, so accounts are unique
     # across parallel envs AND across runs. (Fixed names collide with ghost connections
     # left by a previous crashed run -> the challenge never completes, "Agent is not
     # challenging". poke-env's per-process counter would also collide across subprocesses.)
     showdown = ShowdownSinglesEnv(
-        reward_weights=REWARD_WEIGHTS,
+        reward_weights=reward_weights or REWARD_WEIGHTS,
+        reward_schedule=reward_schedule,
         account_configuration1=AccountConfiguration.generate(f"{agent_tag}A", rand=True),
         account_configuration2=AccountConfiguration.generate(f"{agent_tag}B", rand=True),
         battle_format=BATTLE_FORMAT,
@@ -117,19 +124,22 @@ def build_masked_env(agent_tag, opp_tag):
     return ActionMasker(wrapped, mask_fn), showdown
 
 
-def build_env():
+def build_env(reward_weights=None, reward_schedule=None):
     """The single masked env used for evaluation (its own dedicated accounts)."""
-    return build_masked_env("ev", "evopp")
+    return build_masked_env("ev", "evopp", reward_weights, reward_schedule)
 
 
-def make_env(rank):
+def make_env(rank, reward_weights=None, reward_schedule=None):
     """Factory for the training env at index `rank` (used by SubprocVecEnv).
 
     Wrapped in Monitor so SB3 records per-episode reward/length -> rollout/ep_rew_mean and
     ep_len_mean show up in TensorBoard. (SB3 only auto-adds Monitor when you pass a raw env;
-    a VecEnv you build yourself needs it added per sub-env.)"""
+    a VecEnv you build yourself needs it added per sub-env.)
+
+    reward_weights/reward_schedule are captured in the closure so they pickle into each
+    SubprocVecEnv worker."""
     def _init():
-        masked, _ = build_masked_env(f"tr{rank}", f"tropp{rank}")
+        masked, _ = build_masked_env(f"tr{rank}", f"tropp{rank}", reward_weights, reward_schedule)
         return Monitor(masked)
     return _init
 
@@ -157,13 +167,15 @@ class WinRateCallback(BaseCallback):
     agent is currently learning from. Shows up in TensorBoard as `eval/win_rate`.
     """
 
-    def __init__(self, eval_env, eval_inner, n_battles, eval_freq, verbose=1):
+    def __init__(self, eval_env, eval_inner, n_battles, eval_freq, best_path=None, verbose=1):
         super().__init__(verbose)
         self.eval_env = eval_env
         self.eval_inner = eval_inner
         self.n_battles = n_battles
         self.eval_freq = eval_freq
-        self._last_bucket = None      # trigger on TIMESTEP buckets, not call count
+        self.best_path = best_path     # if set, save the model whenever win rate hits a new high
+        self.best_wr = -1.0
+        self._last_bucket = None       # trigger on TIMESTEP buckets, not call count
 
     def _on_step(self):
         # Keyed off num_timesteps (not n_calls) so the cadence is right no matter how many
@@ -175,6 +187,13 @@ class WinRateCallback(BaseCallback):
             self.logger.record("eval/win_rate", wr)
             if self.verbose:
                 print(f"[eval] {self.num_timesteps:,} steps -> win rate {wr:.0%}", flush=True)
+            # Keep the PEAK model, not the latest: PPO can drift downhill late in a run, so the
+            # final weights are often worse than an earlier checkpoint (this bit us on v3).
+            if self.best_path is not None and wr > self.best_wr:
+                self.best_wr = wr
+                self.model.save(self.best_path)
+                if self.verbose:
+                    print(f"[best] new best {wr:.0%} -> saved {self.best_path}", flush=True)
         return True
 
 

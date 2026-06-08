@@ -54,7 +54,31 @@ proposes its few most likely moves, then the damage calculator and opponent set-
 pick the one that actually KOs or avoids being KO'd. This is honest "test-time search" --
 not full game-tree MCTS, which would need a battle simulator the project doesn't have, but
 the same idea of planning one step ahead on top of a learned policy. `eval_search.py`
-benchmarks the searching agent against the raw policy to measure whether it helps.
+benchmarks the searching agent against the raw policy to measure whether it helps; measured,
+the lookahead lifted the win rate from about 35% to 50%. The search score is a 1-turn exchange
+model: damage we deal minus the probability-weighted hit we take back, plus bonuses for
+securing a KO given who moves first, so it values chip damage and speed, not just guaranteed KOs.
+
+**Pushing past the plateau** (`v1/v3/train_v3_selfplay.py`). The two levers that actually move
+the win rate, stacked: self-play and test-time search. This trainer warm-starts from the v3
+agent and continues with self-play (a refreshed snapshot of itself as the opponent) to break
+the fixed-heuristic ceiling, while keeping the v3 network, discount, and reward so the value
+function stays calibrated. It also adds the training hygiene the first v3 run lacked -- which
+is why that run drifted *downhill* after its peak: `target_kl` early-stopping (v3's policy-step
+size had crept to ~0.06), a learning rate that decays to zero, and best-model checkpointing so
+the saved agent is the highest-win-rate one, not the latest. At test time, run `eval_search.py`
+to layer the lookahead on top of the self-play model and stack both gains.
+
+The win-focused reward sends a large one-off bonus (+150) on the turn a game is won, while
+the per-turn shaping is fractions of a point. With no reward normalization, the value
+network has to predict returns on that ~150 scale, and its fit (`explained_variance`) sits
+around a middling 0.4. `train_v3.py` has a `RESCALED` toggle that divides every reward term
+by ten: the win/trade ratio is identical, but the value targets are ~10x smaller, which can
+make the value loss better behaved. Because reusing the old value network at the new scale
+would mis-calibrate it by 10x, the rescaled run starts fresh and saves under a separate
+`_rescaled` filename, so it trains alongside the original and the two `explained_variance`
+curves can be compared. If rescaling doesn't lift the curve, the ceiling is the game's
+partial observability (the agent can't see the opponent's full set), not the reward scale.
 
 **Attention experiment** (`v2/`). A larger structured observation (854 numbers laid out as
 twelve Pokemon "tokens" plus global field state) fed to a custom team-attention network,
@@ -115,7 +139,8 @@ From the project root:
 ```powershell
 .\.venv\Scripts\python.exe -u v1\train_rl.py                  # main agent vs random/heuristic
 .\.venv\Scripts\python.exe -u v1\v3\train_v3.py               # scaled "done-right" agent (bigger net, win reward)
-.\.venv\Scripts\python.exe -u v1\selfplay\train_selfplay.py   # self-play (warm-starts from the heuristic agent)
+.\.venv\Scripts\python.exe -u v1\v3\train_v3_selfplay.py      # self-play on the v3 agent (warm-starts from it, keeps the best checkpoint)
+.\.venv\Scripts\python.exe -u v1\selfplay\train_selfplay.py   # earlier self-play (warm-starts from the heuristic agent)
 .\.venv\Scripts\python.exe -u v2\train_v2.py                  # the attention experiment
 ```
 
@@ -150,7 +175,9 @@ Open http://localhost:6006 and use the SCALARS tab. The graphs worth watching:
 - `rollout/ep_rew_mean` is the average reward per battle, a smoother signal that should
   trend up as the agent improves.
 - `train/explained_variance` says whether the value network is learning. If it sits near
-  zero the agent is not really learning, even if the reward looks busy.
+  zero the agent is not really learning, even if the reward looks busy. It is also the metric
+  the `RESCALED` reward toggle in `train_v3.py` is meant to move (see the v3 section above):
+  compare the `ppo_v3_obs<N>` and `ppo_v3_rescaled_obs<N>` runs here.
 
 ### 4. Benchmark the heuristic bot (optional)
 
@@ -209,7 +236,8 @@ The `.zip` files, `tb_logs/`, and the `server/` clone are not committed (see
 | `v1/selfplay/opponent.py` | A poke-env opponent that picks moves with a trained model. |
 | `v1/selfplay/train_selfplay.py` | Trains the agent by self-play (vs refreshed snapshots of itself). |
 | `v1/selfplay/smoke_selfplay.py` | Quick live check of the self-play loop. |
-| `v1/v3/train_v3.py` | Trains the scaled "done-right" agent (bigger net, higher gamma, win reward). |
+| `v1/v3/train_v3.py` | Trains the scaled "done-right" agent (bigger net, higher gamma, win reward); `RESCALED` toggle runs the reward-scale experiment under a `_rescaled` model name. |
+| `v1/v3/train_v3_selfplay.py` | Self-play on the v3 agent (warm-start + target_kl/LR-decay/best-checkpoint hygiene). |
 | `v1/v3/search.py` | Test-time 1-ply lookahead player (policy + damage-model re-ranking). |
 | `v1/v3/eval_search.py` | Benchmarks the search agent vs the raw policy, both vs the heuristic. |
 | `v2/rl_env_v2.py` | The experiment's structured 854-number observation. |

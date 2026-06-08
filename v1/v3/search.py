@@ -29,7 +29,7 @@ from poke_env.battle import Move, Pokemon
 from poke_env.environment.singles_env import SinglesEnv
 
 from rl_env import build_observation, _eff_speed
-from knowledge import KNOWLEDGE, estimate_damage_fraction
+from knowledge import KNOWLEDGE, estimate_damage_fraction, safe_priority
 
 
 class SearchPlayer(Player):
@@ -55,28 +55,43 @@ class SearchPlayer(Player):
     # --- the 1-turn lookahead score ----------------------------------------
 
     def _move_score(self, me, move, opp):
-        """Higher = better immediate exchange. KO-before-they-act is rewarded; trading into a
-        likely KO on us is penalised."""
+        """Higher = better 1-turn exchange. Models the turn as a net HP swing (damage we deal
+        minus the probability-weighted hit we take back), then adds bonuses/penalties for who
+        secures the KO given turn order. This is richer than rewarding KOs alone: it also
+        values chip damage and correctly prefers, e.g., a non-KO move that out-speeds a faster
+        threat over a KO move that lets us faint first."""
         if me is None or opp is None:
             return 0.0
-        dmg = estimate_damage_fraction(me, move, opp)        # fraction of opp's HP
-        faster = _eff_speed(me) > _eff_speed(opp)
-        incoming = KNOWLEDGE.predicted_incoming(opp, me)     # worst predicted hit to us
-        score = min(dmg, 1.0)
-        if dmg >= opp.current_hp_fraction and faster:
-            score += 1.0                                     # we KO before they move
-        elif incoming >= me.current_hp_fraction:
-            score -= 0.5                                     # we'd likely faint first
+        dmg = min(estimate_damage_fraction(me, move, opp), 1.0)   # we deal (frac of opp HP)
+        incoming = KNOWLEDGE.predicted_incoming(opp, me)          # prob-weighted hit we take
+        # Turn order: our move's priority, else raw speed. (We can't see the opponent's chosen
+        # move, so this ignores opponent priority -- an acknowledged 1-ply approximation.)
+        i_move_first = safe_priority(move) > 0 or _eff_speed(me) > _eff_speed(opp)
+        i_ko = dmg >= opp.current_hp_fraction
+        they_ko = incoming >= me.current_hp_fraction
+
+        score = dmg - incoming                               # base: net HP traded this turn
+        if i_ko and i_move_first:
+            score += 1.5                                     # clean KO, we take nothing back
+        elif i_ko:
+            score += 1.0                                     # KO, but we eat a hit first...
+            if they_ko:
+                score -= 1.0                                 # ...and might be KO'd before it lands
+        elif they_ko and not i_move_first:
+            score -= 1.0                                     # we get KO'd without securing one
         return score
 
     @staticmethod
     def _switch_score(mon, opp):
-        """Mild preference for switching into a favourable type matchup (costs a turn)."""
+        """Score a switch: reward a favourable type matchup, but subtract the hit the switch-in
+        eats on the way in and a flat tempo cost (switching gives up the turn)."""
         if mon is None or opp is None:
             return 0.0
         offense = max((opp.damage_multiplier(t) for t in mon.types if t), default=1.0)
         defense = max((mon.damage_multiplier(t) for t in opp.types if t), default=1.0)
-        return 0.3 * (offense - defense)
+        matchup = 0.3 * (offense - defense)
+        incoming = KNOWLEDGE.predicted_incoming(opp, mon)    # what the switch-in takes next turn
+        return matchup - 0.5 * incoming - 0.15               # -0.15: lost tempo
 
     def _action_score(self, action, battle, me, opp):
         order = SinglesEnv.action_to_order(np.int64(action), battle, strict=False)
