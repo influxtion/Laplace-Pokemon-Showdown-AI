@@ -58,7 +58,7 @@ TB_DIR = "tb_logs"        # TensorBoard logs go here
 # ~+-9% noise, 100-200 battles brings it to ~+-3-5%. Eval runs serially (it pauses
 # training), so with parallel training we eval less often than before.
 EVAL_FREQ = 25_000        # measure win rate every N timesteps during training (live graph)
-LIVE_EVAL_BATTLES = 100   # battles per live measurement
+LIVE_EVAL_BATTLES = 200   # battles per live measurement
 EVAL_BATTLES = 200        # battles for the before/after headline measurement
 SAVE_FREQ = 100_000       # auto-save every N timesteps (an interrupt loses at most this many)
 
@@ -91,7 +91,7 @@ OPPONENT_CLASSES = {"random": RandomPlayer, "heuristic": SimpleHeuristicsPlayer}
 OPPONENT_LABEL = {"random": "RandomPlayer", "heuristic": "SimpleHeuristicsPlayer"}[OPPONENT]
 
 
-def build_masked_env(agent_tag, opp_tag, reward_weights=None, reward_schedule=None):
+def build_masked_env(agent_tag, opp_tag, reward_weights=None, reward_schedule=None, switch_penalty=0.0):
     """Build one masked env and return it plus the inner env.
 
     agent_tag/opp_tag give the server accounts UNIQUE names so that parallel training envs
@@ -99,9 +99,10 @@ def build_masked_env(agent_tag, opp_tag, reward_weights=None, reward_schedule=No
 
     reward_weights overrides the module default (train_v3 uses this to inject its rescaled
     reward). reward_schedule (train_v3_anneal) instead anneals the weights over training.
-    Both are threaded through as parameters rather than read from the global so they survive
-    the pickle into SubprocVecEnv workers, which re-import this module fresh and would
-    otherwise see the unmodified REWARD_WEIGHTS."""
+    switch_penalty (train_v3_anneal) subtracts reward for panic switching. All three are
+    threaded through as parameters rather than read from the global so they survive the pickle
+    into SubprocVecEnv workers, which re-import this module fresh and would otherwise see the
+    unmodified REWARD_WEIGHTS."""
     # rand=True appends a random 5-char suffix to each username, so accounts are unique
     # across parallel envs AND across runs. (Fixed names collide with ghost connections
     # left by a previous crashed run -> the challenge never completes, "Agent is not
@@ -109,6 +110,7 @@ def build_masked_env(agent_tag, opp_tag, reward_weights=None, reward_schedule=No
     showdown = ShowdownSinglesEnv(
         reward_weights=reward_weights or REWARD_WEIGHTS,
         reward_schedule=reward_schedule,
+        switch_penalty=switch_penalty,
         account_configuration1=AccountConfiguration.generate(f"{agent_tag}A", rand=True),
         account_configuration2=AccountConfiguration.generate(f"{agent_tag}B", rand=True),
         battle_format=BATTLE_FORMAT,
@@ -124,22 +126,23 @@ def build_masked_env(agent_tag, opp_tag, reward_weights=None, reward_schedule=No
     return ActionMasker(wrapped, mask_fn), showdown
 
 
-def build_env(reward_weights=None, reward_schedule=None):
+def build_env(reward_weights=None, reward_schedule=None, switch_penalty=0.0):
     """The single masked env used for evaluation (its own dedicated accounts)."""
-    return build_masked_env("ev", "evopp", reward_weights, reward_schedule)
+    return build_masked_env("ev", "evopp", reward_weights, reward_schedule, switch_penalty)
 
 
-def make_env(rank, reward_weights=None, reward_schedule=None):
+def make_env(rank, reward_weights=None, reward_schedule=None, switch_penalty=0.0):
     """Factory for the training env at index `rank` (used by SubprocVecEnv).
 
     Wrapped in Monitor so SB3 records per-episode reward/length -> rollout/ep_rew_mean and
     ep_len_mean show up in TensorBoard. (SB3 only auto-adds Monitor when you pass a raw env;
     a VecEnv you build yourself needs it added per sub-env.)
 
-    reward_weights/reward_schedule are captured in the closure so they pickle into each
-    SubprocVecEnv worker."""
+    reward_weights/reward_schedule/switch_penalty are captured in the closure so they pickle
+    into each SubprocVecEnv worker."""
     def _init():
-        masked, _ = build_masked_env(f"tr{rank}", f"tropp{rank}", reward_weights, reward_schedule)
+        masked, _ = build_masked_env(
+            f"tr{rank}", f"tropp{rank}", reward_weights, reward_schedule, switch_penalty)
         return Monitor(masked)
     return _init
 

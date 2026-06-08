@@ -1,263 +1,211 @@
 # Pokemon Showdown Battle AI
 
-An AI that plays [Pokemon Showdown](https://pokemonshowdown.com/) singles battles. It
-starts as a simple rule-based bot and works up to a neural network trained with
-reinforcement learning.
+An AI that plays [Pokemon Showdown](https://pokemonshowdown.com/) singles battles
+(Gen 9 Random Battle). It is built in stages, from a hand-written rule-based bot up to a
+neural network trained with reinforcement learning.
 
-Everything runs against a local copy of the Showdown server, which the code talks to
-through [poke-env](https://github.com/hsahovic/poke-env). poke-env handles the connection
-and hands back the battle state as Python objects. Because it all runs locally, the agent
-can play through thousands of battles quickly and for free.
+## Rule-based vs. learned
 
-## How it's built
+The contrast between the two kinds of bot here is the whole point of the project.
 
-The project grew in stages, and the code keeps each stage around so they can be compared.
+A **rule-based bot** does exactly what a person tells it. The logic is written by hand --
+"play the highest-damage move, switch out on a bad matchup" -- and it follows those rules
+the same way every game. The only way to make it better is to write more rules. The
+heuristic bot here is that kind; it serves as the fixed opponent and the baseline.
 
-**Heuristic bot** (`v1/heuristic_bot.py`). A hand-written player with no learning. It
-scores each move by base power, STAB, and type effectiveness, plays the best one, and
-switches out when the matchup is bad. It wins about 96% of games against a random opponent
-and also serves as the benchmark the learning agents are measured against.
+The **reinforcement-learning agent** is given no rules about how to play. It is a neural
+network that starts out choosing at random and learns by playing. After each battle it gets
+a reward (a little for dealing damage or scoring a knockout, a lot for winning), and the
+training algorithm (PPO) adjusts the network's internal weights so the choices that led
+toward wins become more likely next time. Over thousands of games it works out its own
+strategy -- nobody writes "switch here." That is what makes it real machine learning rather
+than a script: the part choosing each move is a set of learned parameters tuned by game
+outcomes. It is *reinforcement* learning specifically because there is no answer key of
+correct moves to copy; the agent only ever sees the reward of how a game turned out and has
+to work out for itself which decisions earned it.
 
-**Reinforcement-learning agent** (`v1/`). This is the main line of work. The battle state
-is turned into a list of numbers (the observation), fed to a network, and the network
-learns which moves and switches win games. Training uses MaskablePPO: at every turn only
-some of the actions are legal, and poke-env supplies a mask of the legal ones, so the
-agent only ever picks valid moves. That makes learning much faster than letting it flail
-at illegal actions.
+## How it works
 
-Training runs across several environments in parallel (each its own process and server
-connection) for a large speedup, with a reward that emphasizes winning over even trades.
+The code talks to a local copy of the Showdown server through
+[`poke-env`](https://github.com/hsahovic/poke-env), which handles the connection and exposes
+the battle state as Python objects. Everything runs locally, so the agent can play thousands
+of fast battles for free.
 
-The observation has grown over time. It began as a flat 141 numbers, and the agent trained
-on that reached around 41% against the heuristic. The current version is larger (215
-numbers) and adds two things worth calling out:
+Each turn, the environment (`v1/rl_env.py`) turns the battle into a list of numbers (the
+*observation*) for the network, and turns the result into a *reward*. Training uses
+**MaskablePPO**: at every turn only some actions are legal, and poke-env supplies a mask of
+the legal ones so the agent only ever picks valid moves, which makes learning far faster.
+Training runs across several environments in parallel for speed.
 
-- Per-Pokemon detail the early version missed: held item, Terastallization state, and move
-  priority.
-- A knowledge layer (`v1/knowledge.py`) that predicts the opponent's set. Random Battle
-  sets are drawn from a fixed, public pool, so when the agent sees a Haxorus it can look up
-  the moves that Haxorus is likely carrying and estimate how much damage they would do.
-  The prediction is probabilistic (a move in one of two possible sets reads as roughly
-  50%) and sharpens as the opponent reveals moves.
+## The models, in order
 
-**Self-play** (`v1/selfplay/`). Against a single fixed opponent the agent tops out, because
-once it has solved that opponent there is nothing left to learn. Self-play replaces the
-fixed opponent with a snapshot of the agent itself, refreshed periodically, so the target
-keeps getting stronger as the agent does. It warm-starts from the heuristic-trained model
-and is still benchmarked against the heuristic so progress stays comparable.
+All win rates are against `SimpleHeuristicsPlayer` unless they say *random*. That heuristic
+is only a beginner-level bot, so these are a fixed yardstick for comparing versions, not
+ladder ratings. Evaluations are noisy (a 50-battle measurement swings ~8 points), so later
+runs measure over 200-400 battles.
 
-**Scaled agent and test-time search** (`v1/v3/`). A fresh agent that bundles the changes
-needing a clean start: a bigger network, a higher discount (so a win late in a game is
-still credited to the moves that set it up), the win-focused reward, and parallel training
-at scale. On top of the trained policy it adds a shallow one-turn lookahead: the policy
-proposes its few most likely moves, then the damage calculator and opponent set-prediction
-pick the one that actually KOs or avoids being KO'd. This is honest "test-time search" --
-not full game-tree MCTS, which would need a battle simulator the project doesn't have, but
-the same idea of planning one step ahead on top of a learned policy. `eval_search.py`
-benchmarks the searching agent against the raw policy to measure whether it helps; measured,
-the lookahead lifted the win rate from about 35% to 50%. The search score is a 1-turn exchange
-model: damage we deal minus the probability-weighted hit we take back, plus bonuses for
-securing a KO given who moves first, so it values chip damage and speed, not just guaranteed KOs.
+| # | Model | Win rate | What it added / what went wrong |
+|---|---|---|---|
+| 1 | **Heuristic bot** `v1/heuristic_bot.py` *(no saved model)* | ~96% vs random | Hand-written rules: score moves by power, STAB, and type effectiveness; switch on a bad matchup. The baseline and sparring partner, not a learner. |
+| 2 | **First RL agent, 12 features** `ppo_vs_random.zip`, `ppo_vs_heuristic.zip` | ~100% vs random; ~30% vs heuristic | Proved the pipeline learns. But with only 12 numbers it was blind to stats, status, hazards, and the bench, so it stalled against a real opponent. |
+| 3 | **Richer observation, 141 features** `ppo_vs_heuristic_obs141.zip` | ~41% | Added boosts, status, the bench, move details, weather, and abilities. Broke the 30% plateau; held as the baseline far longer than expected. |
+| 4 | **Attention net, 854 features** `ppo_v2_attn_obs854.zip` (+ MLP control `ppo_v2_mlp_obs854.zip`) | ~4% | The one dead end. Laid the battle out as 12 Pokemon "tokens" for a self-attention net, but most of those numbers are zero early (the opponent's team is hidden) and drowned the useful signal. Dropped. |
+| 5 | **Extended observation, 215 features** `ppo_vs_heuristic_obs215.zip` | ~34-40% | Added move priority, held item, Terastallization, and a knowledge layer that predicts the opponent's set and estimates damage. No gain: the *turning point* that proved observation was no longer the bottleneck. |
+| 6 | **Scaled v3 agent** `ppo_v3_obs215.zip` | ~45% peak, then ~30% | Bigger network, higher discount, win-focused reward, parallel training. Hit a new high but had no training hygiene, so it overtrained downhill and saved the latest (not best) weights. |
+| 7 | **Rescaled-reward experiment** `ppo_v3_rescaled_obs215.zip` | no change | Divided every reward by 10 to test if reward scale capped the value network's fit. It didn't (the metric is scale-invariant). Ruled out reward scale; pointed at partial observability. |
+| 8 | **Self-play** `ppo_selfplay_obs215.zip`, `ppo_v3_selfplay_obs215.zip` (+ `_best_`) | ~43% | Trains against refreshed snapshots of itself instead of a fixed opponent. Hygiene held this time, but it didn't transfer to the benchmark: the ceiling wasn't "the opponent is too easy." |
+| 9 | **Reward-anneal + anti-panic-switch** `ppo_v3_anneal_obs215.zip` (+ `_best_`) | ~40% (no gain) | Warm-started v3 and annealed the dense shaping toward zero while holding the win bonus, plus a penalty for switching a different Pokemon two turns in a row. Ran to completion cleanly, but the raw win rate stayed flat -- confirming reward is not the lever either; the ceiling is partial observability + a reactive 1-turn policy. |
+| 10 | **Test-time search** `v1/v3/search.py` *(wraps a trained model)* | **~57% (about +17 over the raw policy)** | Not a new model: a 1-ply evaluator that scores *every* legal action with the damage model -- it understands type matchups, switching for an offensive advantage, Terastallization, and ability immunities -- using the trained policy only as a prior. The single biggest lever, and the agent we actually ship. |
 
-**Pushing past the plateau** (`v1/v3/train_v3_selfplay.py`). The two levers that actually move
-the win rate, stacked: self-play and test-time search. This trainer warm-starts from the v3
-agent and continues with self-play (a refreshed snapshot of itself as the opponent) to break
-the fixed-heuristic ceiling, while keeping the v3 network, discount, and reward so the value
-function stays calibrated. It also adds the training hygiene the first v3 run lacked -- which
-is why that run drifted *downhill* after its peak: `target_kl` early-stopping (v3's policy-step
-size had crept to ~0.06), a learning rate that decays to zero, and best-model checkpointing so
-the saved agent is the highest-win-rate one, not the latest. At test time, run `eval_search.py`
-to layer the lookahead on top of the self-play model and stack both gains.
+## Lessons learned
 
-The win-focused reward sends a large one-off bonus (+150) on the turn a game is won, while
-the per-turn shaping is fractions of a point. With no reward normalization, the value
-network has to predict returns on that ~150 scale, and its fit (`explained_variance`) sits
-around a middling 0.4. `train_v3.py` has a `RESCALED` toggle that divides every reward term
-by ten: the win/trade ratio is identical, but the value targets are ~10x smaller, which can
-make the value loss better behaved. Because reusing the old value network at the new scale
-would mis-calibrate it by 10x, the rescaled run starts fresh and saves under a separate
-`_rescaled` filename, so it trains alongside the original and the two `explained_variance`
-curves can be compared. If rescaling doesn't lift the curve, the ceiling is the game's
-partial observability (the agent can't see the opponent's full set), not the reward scale.
+- **A plateau is usually a representation problem first.** The agent stalled at ~-15
+  `ep_rew_mean` until the observation was enriched (12 -> 141 features); more game state was
+  worth more than more training.
+- **More is not always better.** Going 141 -> 854 features *hurt* because most of the extra
+  numbers were empty, and 141 -> 215 didn't help at all. Past a point, observation stopped
+  being the bottleneck.
+- **Measure honestly.** Small evals are noisy enough to invent improvements that aren't real
+  (an apparent self-play "peak" was sampling noise), so headline numbers use 200-400 battles.
+- **Reward shape drives behaviour.** Reward climbing while win rate stays flat means the
+  agent learned to *trade*, not to *win* -- which is what the reward anneal targets.
 
-**Attention experiment** (`v2/`). A larger structured observation (854 numbers laid out as
-twelve Pokemon "tokens" plus global field state) fed to a custom team-attention network,
-the idea being to let the network reason about each Pokemon on its own. In testing it
-learned worse than the simpler flat MLP: most of that observation is empty early in a game
-(the opponent's unrevealed team is all zeros), which buried the useful signal. It is kept
-here as a documented experiment rather than the path forward.
+## Setup
 
-## Requirements
-
-- Python 3.12 (any recent 3.x should be fine)
-- Node.js 18+ (to run the local Showdown server)
-- git
-
-## One-time setup
-
-Run these once from the project root.
+Requirements: **Python 3.12** (any recent 3.x), **Node.js 18+** (for the local server), and
+**git**. Run once from the project root:
 
 ```powershell
-# 1. Create the Python virtual environment and install dependencies
+# 1. Python virtual environment + dependencies
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1          # the prompt should now show "(.venv)"
+.\.venv\Scripts\Activate.ps1          # prompt should show "(.venv)"
 pip install -r requirements.txt
 
-# 2. Clone and build the local Showdown server (large, takes a few minutes)
+# 2. Clone and build the local Showdown server (large, a few minutes)
 git clone --depth 1 https://github.com/smogon/pokemon-showdown.git server
-cd server
-npm install
-cd ..
+cd server; npm install; cd ..
 ```
 
-The Python packages live in `.venv`, not in the system Python, so every command has to use
-that environment. Either activate it once per terminal with `.\.venv\Scripts\Activate.ps1`
-and then run `python ...`, or call the venv's Python directly with
-`.\.venv\Scripts\python.exe ...`. If you see `ModuleNotFoundError: No module named
-'sb3_contrib'` (or similar), the venv is not active.
+All packages live in `.venv`, not system Python. Either activate it once per terminal
+(`.\.venv\Scripts\Activate.ps1`, then `python ...`) or call it directly
+(`.\.venv\Scripts\python.exe ...`). A `ModuleNotFoundError` almost always means the venv is
+not active.
 
 ## Running it
 
-The local server has to be running first, since every script connects to it. Use a
-separate terminal for each long-running piece.
+The server must be running first; use a separate terminal for each long-running piece.
 
-### 1. Start the server
+**1. Start the server** (leave it open; ready at `listening on 0.0.0.0:8000`):
 
 ```powershell
 cd server
 node pokemon-showdown start --no-security
 ```
 
-Leave it open. It is ready once it prints `Worker 1 now listening on 0.0.0.0:8000`. The
-`--no-security` flag turns off login and rate limits so local bots can connect freely.
-Ctrl+C stops it.
-
-### 2. Train an agent
-
-From the project root:
+**2. Train an agent** (from the project root):
 
 ```powershell
-.\.venv\Scripts\python.exe -u v1\train_rl.py                  # main agent vs random/heuristic
-.\.venv\Scripts\python.exe -u v1\v3\train_v3.py               # scaled "done-right" agent (bigger net, win reward)
-.\.venv\Scripts\python.exe -u v1\v3\train_v3_selfplay.py      # self-play on the v3 agent (warm-starts from it, keeps the best checkpoint)
-.\.venv\Scripts\python.exe -u v1\selfplay\train_selfplay.py   # earlier self-play (warm-starts from the heuristic agent)
-.\.venv\Scripts\python.exe -u v2\train_v2.py                  # the attention experiment
+.\.venv\Scripts\python.exe -u v1\train_rl.py                # main agent vs random/heuristic
+.\.venv\Scripts\python.exe -u v1\v3\train_v3.py             # scaled agent (bigger net, win reward)
+.\.venv\Scripts\python.exe -u v1\v3\train_v3_anneal.py      # reward-anneal + anti-panic-switch finetune
+.\.venv\Scripts\python.exe -u v1\v3\train_v3_selfplay.py    # self-play on the v3 agent
+.\.venv\Scripts\python.exe -u v2\train_v2.py                # the attention experiment
 ```
 
-A run does everything in order: load the starting weights (see Model files below), measure
-and print the win rate before training, train for `TRAIN_STEPS` steps while logging to
-`tb_logs`, save the agent, and measure the win rate again. It checkpoints periodically, so
-stopping early with Ctrl+C keeps recent progress and the next run picks up from there.
+A run loads its starting weights, prints the win rate before training, trains for
+`TRAIN_STEPS` while logging to `tb_logs`, checkpoints periodically, saves, and prints the
+win rate after. `-u` makes output appear live. Stopping with Ctrl+C keeps the last
+checkpoint, and the next run resumes from it.
 
-The `-u` flag makes Python print output as it happens instead of buffering it, so progress
-is visible live. The trainers run several environments in parallel (see `N_ENVS` in
-`train_rl.py`); if a run times out connecting, restart the server to clear stale
-connections, and lower `N_ENVS` if your machine or the server can't handle that many.
-
-Once an agent is trained, benchmark the test-time search against the raw policy:
+**3. Watch the agent play.** Plays a few battles (as the searching agent we'd ship) and saves
+each as a Showdown replay `.html` in `replays/` that you open in a browser to watch move by
+move:
 
 ```powershell
-.\.venv\Scripts\python.exe -u v1\v3\eval_search.py            # raw policy vs 1-ply search, vs the heuristic
+.\.venv\Scripts\python.exe -u v1\v3\play.py                 # 1 battle, search agent vs heuristic
+.\.venv\Scripts\python.exe -u v1\v3\play.py --battles 3     # more battles
+.\.venv\Scripts\python.exe -u v1\v3\play.py --raw           # bare policy, no search
+.\.venv\Scripts\python.exe -u v1\v3\play.py --opponent random
+.\.venv\Scripts\python.exe -u v1\v3\play.py --model ppo_v3_obs215.zip   # a specific model
 ```
 
-### 3. Watch training (optional)
+It prints each result and the replay path, then you open the file to watch:
 
-TensorBoard shows live graphs in the browser. In another terminal:
+```
+  Battle 1: WON  in 24 turns  ->  replays/battle-gen9randombattle-12.html
+Won 1/1 vs heuristic. Open the .html file(s) in a browser to watch.
+```
+
+The replay file has the full battle embedded; opening it loads Showdown's replay viewer
+(needs internet for that viewer script, but the battle itself is in the file). This is more
+reliable than trying to catch the bot-vs-bot game live, since it finishes in seconds.
+
+**4. Benchmark the test-time search** against the raw policy:
 
 ```powershell
-.\.venv\Scripts\python.exe -m tensorboard.main --logdir tb_logs
+.\.venv\Scripts\python.exe -u v1\v3\eval_search.py
 ```
 
-Open http://localhost:6006 and use the SCALARS tab. The graphs worth watching:
+**5. Watch training (optional)** in a browser via TensorBoard:
 
-- `eval/win_rate` is the real score, measured against the opponent during training. Each
-  point is 100 battles, so it is fairly stable (set by `LIVE_EVAL_BATTLES`).
-- `rollout/ep_rew_mean` is the average reward per battle, a smoother signal that should
-  trend up as the agent improves.
-- `train/explained_variance` says whether the value network is learning. If it sits near
-  zero the agent is not really learning, even if the reward looks busy. It is also the metric
-  the `RESCALED` reward toggle in `train_v3.py` is meant to move (see the v3 section above):
-  compare the `ppo_v3_obs<N>` and `ppo_v3_rescaled_obs<N>` runs here.
+```powershell
+.\.venv\Scripts\python.exe -m tensorboard.main --logdir tb_logs   # then open http://localhost:6006
+```
 
-### 4. Benchmark the heuristic bot (optional)
+Graphs worth watching on the SCALARS tab: `eval/win_rate` (the real score, ~100 battles per
+point), `rollout/ep_rew_mean` (smoother progress signal), and `train/explained_variance`
+(whether the value network is learning; near zero means it isn't).
 
-Plays the rule-based bot against a random opponent and prints its win rate. No learning
-involved.
+**6. Benchmark the heuristic bot (optional):**
 
 ```powershell
 .\.venv\Scripts\python.exe v1\run_battle.py
 ```
 
-## Settings
+## Settings and model files
 
-The knobs are constants at the top of `v1/train_rl.py`:
+The main knobs are constants at the top of `v1/train_rl.py`:
 
 | Setting | What it does |
 |---|---|
-| `OPPONENT` | Who the agent trains against and is scored against: `"random"` (random legal moves, the easy baseline) or `"heuristic"` (a real strategy bot). |
-| `TRAIN_STEPS` | How many steps of experience to add this run. Larger is stronger but slower (roughly 300 steps per second). |
-| `EVAL_BATTLES` | Battles used for the before/after win-rate measurement. |
-| `EVAL_FREQ` | How often, in steps, to measure win rate for the live graph. |
+| `OPPONENT` | Who the agent trains and is scored against: `"random"` or `"heuristic"`. |
+| `TRAIN_STEPS` | Steps of experience to add this run (a step is one move/switch; ~300/sec). |
+| `EVAL_BATTLES` / `EVAL_FREQ` | Battles per before/after measurement, and how often to measure for the live graph. |
+| `N_ENVS` | Parallel training environments (lower it if the machine or server can't keep up). |
 
-A step is one decision (a move or a switch). A battle is roughly 40 to 60 steps, so 50,000
-steps is about a thousand battles.
-
-## Model files
-
-Trained agents are saved as `ppo_vs_<opponent>_obs<N>.zip`, where `<opponent>` is who it
-trained against and `<N>` is the observation size. Putting the observation size in the name
-means that changing what the network sees will not silently load or overwrite an
-incompatible older model.
-
-When `train_rl.py` starts, it decides where to begin:
-
-1. If a saved file already exists for the current opponent and observation size, it loads
-   it and keeps training the same agent.
-2. If not, but a same-size agent trained against the random opponent exists, it warm-starts
-   from that (transfer learning) on a fresh training curve.
-3. Otherwise it starts from a brand-new random-weights network.
-
-To start an opponent over from scratch, delete its `.zip`.
-
-The `.zip` files, `tb_logs/`, and the `server/` clone are not committed (see
-`.gitignore`); the models and logs are regenerated by training.
+Agents are saved as `ppo_..._obs<N>.zip`, where `<N>` is the observation size; putting it in
+the name stops an incompatible older model from silently loading or being overwritten. On
+start, `train_rl.py` continues a matching saved agent if one exists, else warm-starts from a
+same-size random-trained agent, else starts fresh. Delete a `.zip` to start that setup over.
+The `.zip` files, `tb_logs/`, and `server/` are not committed (see `.gitignore`).
 
 ## Repo layout
 
 | Path | Purpose |
 |---|---|
 | `v1/heuristic_bot.py` | The rule-based bot. |
-| `v1/run_battle.py` | Runs the heuristic bot vs a random opponent and reports win rate. |
-| `v1/rl_env.py` | The RL environment: the 215-number observation (`embed_battle`) and the reward (`calc_reward`). |
-| `v1/knowledge.py` | Opponent set prediction (from the Random Battle set data) and damage estimation. |
-| `v1/train_rl.py` | Trains the main agent (parallel envs, win-focused reward) vs random/heuristic. |
-| `v1/smoke_test.py` | Quick check that the v1 environment builds, resets, and steps. |
-| `v1/smoke_parallel.py` | Quick check that parallel (multi-process) training starts cleanly. |
-| `v1/selfplay/opponent.py` | A poke-env opponent that picks moves with a trained model. |
-| `v1/selfplay/train_selfplay.py` | Trains the agent by self-play (vs refreshed snapshots of itself). |
-| `v1/selfplay/smoke_selfplay.py` | Quick live check of the self-play loop. |
-| `v1/v3/train_v3.py` | Trains the scaled "done-right" agent (bigger net, higher gamma, win reward); `RESCALED` toggle runs the reward-scale experiment under a `_rescaled` model name. |
-| `v1/v3/train_v3_selfplay.py` | Self-play on the v3 agent (warm-start + target_kl/LR-decay/best-checkpoint hygiene). |
-| `v1/v3/search.py` | Test-time 1-ply lookahead player (policy + damage-model re-ranking). |
-| `v1/v3/eval_search.py` | Benchmarks the search agent vs the raw policy, both vs the heuristic. |
-| `v2/rl_env_v2.py` | The experiment's structured 854-number observation. |
-| `v2/team_net.py` | The team-attention network. |
-| `v2/train_v2.py` | Trains the v2 agent. |
-| `v2/smoke_v2.py` | End-to-end check of the v2 stack against a live battle. |
+| `v1/run_battle.py` | Runs the heuristic bot vs random and reports win rate. |
+| `v1/rl_env.py` | The RL environment: the 215-number observation (`embed_battle`) and reward (`calc_reward`). |
+| `v1/knowledge.py` | Opponent set prediction (from Random Battle data) and damage estimation. |
+| `v1/train_rl.py` | Trains the main agent (parallel envs, win-focused reward). |
+| `v1/smoke_test.py`, `v1/smoke_parallel.py` | Quick checks that the env / parallel training start cleanly. |
+| `v1/selfplay/` | Self-play: `opponent.py` (model-driven opponent), `train_selfplay.py`, `smoke_selfplay.py`. |
+| `v1/v3/train_v3.py` | Scaled agent (bigger net, higher gamma, win reward); `RESCALED` toggle for the reward-scale experiment. |
+| `v1/v3/train_v3_anneal.py` | Reward-anneal + anti-panic-switch finetune (with KL/LR-decay/best-checkpoint hygiene). |
+| `v1/v3/train_v3_selfplay.py` | Self-play on the v3 agent. |
+| `v1/v3/search.py`, `v1/v3/eval_search.py` | Test-time 1-ply lookahead player, and its benchmark vs the raw policy. |
+| `v1/v3/play.py` | Plays a few watchable battles and saves them as browser replays (`replays/`). |
+| `v2/` | The attention experiment: `rl_env_v2.py` (854-number obs), `team_net.py` (attention net), `train_v2.py`, `smoke_v2.py`. |
 | `requirements.txt` | Python dependencies. |
-| `server/` | Local Showdown server, cloned separately during setup. |
+| `server/` | Local Showdown server (cloned during setup, not committed). |
 
 ## Troubleshooting
 
-- `ModuleNotFoundError` means the virtual environment is not active. Activate it or call
-  `.\.venv\Scripts\python.exe` directly.
-- A script that hangs while connecting means the server is not running. Start it and
-  confirm the `listening on 0.0.0.0:8000` line.
-- `EADDRINUSE` or "port 8000 already in use" means a server is already running. Reuse it,
-  or stop the old one (Ctrl+C in its terminal, or `Stop-Process -Name node`).
-- `TimeoutError: Agent is not challenging` means an env could not start a battle, usually
-  because a previous crashed run left stale connections on the server. Restart the server
-  to clear them. If it persists, lower `N_ENVS` in `train_rl.py` (too many parallel
-  connections at once).
-- TensorBoard showing no data usually means `--logdir` is not pointing at `tb_logs`, or no
-  run has started writing yet. Use the refresh icon in the browser.
+- **`ModuleNotFoundError`** -- the venv is not active. Activate it or use the full
+  `.\.venv\Scripts\python.exe` path.
+- **A script hangs while connecting** -- the server isn't running. Start it and confirm the
+  `listening on 0.0.0.0:8000` line.
+- **`EADDRINUSE` / port 8000 in use** -- a server is already running. Reuse it, or stop the
+  old one (Ctrl+C, or `Stop-Process -Name node`).
+- **`TimeoutError: Agent is not challenging`** -- a previous crashed run left stale
+  connections. Restart the server; if it persists, lower `N_ENVS`.

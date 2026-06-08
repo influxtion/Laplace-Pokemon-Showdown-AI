@@ -143,6 +143,7 @@ class RandbatsKnowledge:
                     parsed.append({
                         "moves": {to_id_str(m) for m in s.get("movepool", [])},
                         "role": s.get("role"),
+                        "abilities": {to_id_str(a) for a in s.get("abilities", [])},
                     })
                 self._sets[to_id_str(species)] = parsed
         except (OSError, ValueError) as e:
@@ -196,6 +197,33 @@ class RandbatsKnowledge:
                 probs[mid] = probs.get(mid, 0.0) + 1.0 / n
         for mid in opp.moves.keys():     # moves we've actually seen are certain
             probs[mid] = 1.0
+        return probs
+
+    def predicted_abilities(self, opp):
+        """ability_id -> probability the opponent's active has it.
+
+        1.0 on the revealed ability once known. Otherwise it's read off the still-possible
+        randbats sets (each set lists its candidate abilities), narrowed by revealed moves --
+        so an Orthworm, whose every set runs Earth Eater, reads as a CERTAIN Ground immunity
+        even before it's shown. Falls back to the dex's possible abilities (uniform) for a
+        species we have no set data for."""
+        if opp is None:
+            return {}
+        if opp.ability:                                  # revealed -> certain
+            return {to_id_str(opp.ability): 1.0}
+        sets = self._surviving_sets(opp)
+        if not sets:
+            poss = [to_id_str(a) for a in (opp.possible_abilities or [])]
+            return {a: 1.0 / len(poss) for a in poss} if poss else {}
+        n = len(sets)
+        probs = {}
+        for s in sets:
+            ab = s.get("abilities") or set()
+            if not ab:
+                continue
+            w = 1.0 / (n * len(ab))                      # split each set's mass over its candidates
+            for a in ab:
+                probs[a] = probs.get(a, 0.0) + w
         return probs
 
     def predicted_coverage(self, opp):
@@ -264,15 +292,21 @@ class RandbatsKnowledge:
                     acc[i] += 1.0 / n
         return acc
 
-    def predicted_incoming(self, opp, my_active):
+    def predicted_incoming(self, opp, my_active, immune_types=None):
         """Scariest *probability-weighted* incoming hit (HP fraction): a 50%-likely nuke
-        counts as a real-but-discounted threat, not a guaranteed one."""
+        counts as a real-but-discounted threat, not a guaranteed one.
+
+        immune_types (a set of type NAMEs) lets a caller drop move types our active is immune
+        to via its ABILITY -- e.g. a Levitate mon shouldn't fear Ground. Default None keeps the
+        original behaviour exactly, so the observation features built on this are unchanged."""
         if opp is None or my_active is None:
             return 0.0
         worst = 0.0
         for mid, p in self.move_probs(opp).items():
             mv = get_move(mid)
             if mv is not None and mv.base_power > 0:
+                if immune_types and mv.type is not None and mv.type.name in immune_types:
+                    continue
                 worst = max(worst, p * estimate_damage_fraction(opp, mv, my_active))
         return worst
 

@@ -387,12 +387,21 @@ DEFAULT_REWARD = dict(fainted_value=1.0, hp_value=0.5, status_value=0.1, victory
 
 
 class ShowdownSinglesEnv(SinglesEnv):
-    def __init__(self, reward_weights=None, reward_schedule=None, **kwargs):
+    def __init__(self, reward_weights=None, reward_schedule=None, switch_penalty=0.0, **kwargs):
         super().__init__(**kwargs)
         # Negative low because stat boosts can be negative.
         obs_space = Box(low=-1.0, high=4.0, shape=(N_FEATURES,), dtype=np.float32)
         self.observation_spaces = {agent: obs_space for agent in self.possible_agents}
         self.reward_weights = dict(DEFAULT_REWARD, **(reward_weights or {}))
+
+        # Anti-"panic switch" shaping. PokeLLMon found that switching a DIFFERENT Pokemon out
+        # on consecutive turns is a top failure mode that correlates with losing -- the agent
+        # keeps fleeing matchups instead of committing, burning turns and eating entry-hazard
+        # chip. We subtract `switch_penalty` reward whenever the agent makes a voluntary switch
+        # on the turn right after another voluntary switch. A single switch is fine (often the
+        # right play) and is never penalized; only the SECOND in a row is. 0.0 = disabled.
+        self.switch_penalty = switch_penalty
+        self._switch_state = {}  # per-battle: {"prev_mon": Pokemon|None, "prev_voluntary": bool}
 
         # Optional reward ANNEAL. The agent learns to TRADE rather than WIN because the dense
         # per-turn shaping (hp/faint) fires every turn while the victory bonus is rare -- so the
@@ -421,7 +430,29 @@ class ShowdownSinglesEnv(SinglesEnv):
         return {k: self._anneal_start[k] + frac * (self._anneal_end[k] - self._anneal_start[k])
                 for k in self._anneal_start}
 
+    def _panic_switch_penalty(self, battle):
+        """Penalty for 'panic switching' -- a voluntary switch on the turn right after another
+        voluntary switch (see __init__). Returns 0.0 unless switch_penalty is set and this turn
+        completes a two-in-a-row voluntary-switch chain.
+
+        Detection: the active Pokemon changed identity since last turn (a switch), and the
+        Pokemon we left is still alive (so we CHOSE to switch -- a fainted active forces a switch,
+        which is not a panic decision and never counts). A non-switch turn in between resets the
+        chain, so ordinary defensive switching is never punished."""
+        if not self.switch_penalty:
+            return 0.0
+        state = self._switch_state.setdefault(battle, {"prev_mon": None, "prev_voluntary": False})
+        cur, prev = battle.active_pokemon, state["prev_mon"]
+        # Same team slot keeps the same Pokemon object across turns, so identity == "same mon".
+        switched = prev is not None and cur is not None and cur is not prev
+        voluntary = switched and not prev.fainted
+        panic = voluntary and state["prev_voluntary"]
+        state["prev_mon"], state["prev_voluntary"] = cur, voluntary
+        return self.switch_penalty if panic else 0.0
+
     def calc_reward(self, battle):
-        """Reward = change in how good our position is since last turn (see DEFAULT_REWARD).
-        With a reward_schedule, the weights anneal from start to end across training."""
-        return self.reward_computing_helper(battle, **self._current_weights())
+        """Reward = change in how good our position is since last turn (see DEFAULT_REWARD),
+        minus an optional panic-switch penalty. With a reward_schedule, the shaping weights
+        anneal from start to end across training."""
+        reward = self.reward_computing_helper(battle, **self._current_weights())
+        return reward - self._panic_switch_penalty(battle)

@@ -20,6 +20,10 @@ At frac=0 the weights EXACTLY match what ppo_v3 was trained on (hp 0.25 / victor
 warm-start is continuous; by frac=1 the shaping is ~10x smaller and victory dominates. The run
 then trains at the final reward for the remaining (1 - ANNEAL_FRACTION) to settle.
 
+This run also stacks ANTI-PANIC-SWITCH shaping (SWITCH_PENALTY): a small reward penalty for
+voluntarily switching a different Pokemon out two turns in a row, a PokeLLMon-flagged losing
+pattern. It pushes the same "stop fleeing, commit and close the game" behaviour the anneal targets.
+
 Adds the same hygiene as train_v3_selfplay (target_kl, LR decay to 0, best-model checkpoint) so
 it can't overtrain itself downhill. Benchmarks vs SimpleHeuristicsPlayer so the number stays
 comparable to every earlier run; layer search.py on the saved model (eval_search.py) afterward.
@@ -42,7 +46,7 @@ from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 import train_rl as base
 from rl_env import N_FEATURES
 
-TRAIN_STEPS = 2_000_000
+TRAIN_STEPS = 1_000_000
 
 # --- the anneal -------------------------------------------------------------
 # START matches ppo_v3's training reward EXACTLY (hp 0.25 / victory 150, fainted/status from
@@ -52,13 +56,20 @@ ANNEAL_START = {"hp_value": 0.25, "fainted_value": 1.0, "status_value": 0.1, "vi
 ANNEAL_END   = {"hp_value": 0.025, "fainted_value": 0.1, "status_value": 0.0, "victory_value": 150.0}
 ANNEAL_FRACTION = 0.6      # finish the shift at 60% of the run, then train at the END reward
 
+# Anti-"panic switch" penalty (see rl_env.ShowdownSinglesEnv): subtract this much reward when
+# the agent voluntarily switches a DIFFERENT Pokemon out two turns running -- a PokeLLMon-flagged
+# losing pattern. Chosen to roughly match a fainted_value at the END reward scale (~0.1-0.2), so
+# it's a clear signal in the win-focused phase yet negligible against the START shaping (hp 0.25),
+# meaning it doesn't disturb the warm-started policy early. This is the main knob to tune. 0 = off.
+SWITCH_PENALTY = 0.2
+
 # --- hygiene (so it can't overtrain downhill the way plain v3 did) ----------
 TARGET_KL = 0.03
 LR_START = 3e-4            # decays LINEARLY to 0 across the run
 
-EVAL_FREQ = 25_000
+EVAL_FREQ = 15_000
 EVAL_BATTLES = 200
-LIVE_EVAL_BATTLES = 100
+LIVE_EVAL_BATTLES = 200
 SAVE_FREQ = 100_000
 
 WARM_START_PATH = f"ppo_v3_obs{N_FEATURES}.zip"
@@ -83,8 +94,10 @@ def make_schedule():
 def main():
     schedule = make_schedule()
     train_env = (
-        SubprocVecEnv([base.make_env(i, reward_schedule=schedule) for i in range(base.N_ENVS)])
-        if base.N_ENVS > 1 else DummyVecEnv([base.make_env(0, reward_schedule=schedule)])
+        SubprocVecEnv([base.make_env(i, reward_schedule=schedule, switch_penalty=SWITCH_PENALTY)
+                       for i in range(base.N_ENVS)])
+        if base.N_ENVS > 1 else
+        DummyVecEnv([base.make_env(0, reward_schedule=schedule, switch_penalty=SWITCH_PENALTY)])
     )
     # Eval is win-rate only (reward is ignored there), so the plain heuristic env is fine.
     eval_env, eval_inner = base.build_env()
@@ -117,6 +130,7 @@ def main():
     print(f"\n=== Reward-anneal finetune: {TRAIN_STEPS:,} steps "
           f"(shaping {ANNEAL_START['hp_value']}->{ANNEAL_END['hp_value']} hp over "
           f"{ANNEAL_FRACTION:.0%} of the run, victory {ANNEAL_END['victory_value']:g} fixed; "
+          f"panic-switch penalty {SWITCH_PENALTY:g}; "
           f"target_kl={TARGET_KL}, lr {LR_START:g}->0) ===", flush=True)
     model.learn(
         total_timesteps=TRAIN_STEPS,
