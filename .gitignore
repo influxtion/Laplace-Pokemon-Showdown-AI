@@ -23,3 +23,6 @@ backup_old/
 
 # Claude Code local settings (personal, machine-specific)
 .claude/settings.local.json
+
+# Showdown ladder credentials (never commit)
+.env
