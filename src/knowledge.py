@@ -1,26 +1,19 @@
-"""Opponent set prediction + damage estimation -- the "Pokemon understanding" layer.
+"""Opponent set prediction and damage estimation.
 
-A strong player doesn't just react to what the opponent has *revealed*; they know the
-common sets. See a Haxorus and you assume Outrage / Dragon Dance before it clicks them.
-This module gives the agent that same prior.
+A good player knows the common sets, not just what's been revealed: you see a Haxorus
+and assume Outrage / Dragon Dance before it clicks them. This gives the agent that prior.
 
-WHY THIS IS TRACTABLE (and not cheating):
-  * gen9randombattle sets are drawn from a FIXED, PUBLIC pool shipped with the Showdown
-    server (data/random-battles/gen9/sets.json). We read the same set sheet every human
-    ladder player has memorised -- a prior over the distribution, NOT the opponent's
-    actual hidden choices.
-  * The damage estimate uses only: the public gen-9 damage formula, OUR OWN known stats,
-    and ESTIMATED opponent stats (from public base stats + level + standard randbats
-    spread). poke-env never even exposes the opponent's true hidden stats, so we *can't*
-    peek. It's just a sharper version of the base_power x type_multiplier proxy the
-    observation already carries; the agent still has to learn the actual policy.
+It isn't cheating. The gen9randombattle sets come from the public pool shipped with the
+server (data/random-battles/gen9/sets.json) that any ladder player has seen, so this is a
+prior over the distribution, not the opponent's hidden choices. The damage estimate uses
+only the public gen-9 formula, our own known stats, and opponent stats estimated from
+public base stats + level + the standard randbats spread; poke-env never exposes the
+opponent's real stats anyway. It's a sharper version of the base_power x type_multiplier
+proxy the observation already carries.
 
-DESIGN NOTE -- swappable for the future OU bot:
-  Everything funnels through `MovesetPredictor.predict_moves(species, revealed)`. For
-  random battles that's a table lookup (`RandbatsKnowledge`). The planned `ppo_competitive`
-  OU bot has no premade sets, so it will provide a different predictor (priors from typing
-  / base stats / usage data) behind this same interface. The env code below doesn't care
-  which one it gets.
+Everything goes through RandbatsKnowledge, a table lookup. A future OU bot has no premade
+sets, so it can swap in a different predictor (priors from typing / base stats / usage)
+behind the same interface without touching the env.
 """
 
 import json
@@ -32,7 +25,7 @@ from poke_env.data import to_id_str
 
 GEN = 9
 
-# Fixed role vocabulary from gen9 randbats (stable order -> stable feature indices).
+# Role vocabulary from gen9 randbats. Order is fixed so feature indices stay stable.
 ROLE_NAMES = [
     "AV Pivot", "Bulky Attacker", "Bulky Setup", "Bulky Support", "Fast Attacker",
     "Fast Bulky Setup", "Fast Support", "Setup Sweeper", "Tera Blast user", "Wallbreaker",
@@ -72,10 +65,10 @@ def safe_priority(move):
 
 
 def _estimate_stat(mon, key):
-    """A stat value: the real one if known (our mons), else estimated from base+level.
+    """A stat: the real value if known (our mons), else estimated from base + level.
 
-    Estimate assumes the randbats-ish convention of 31 IVs, 85 EVs, neutral nature -- good
-    enough for a feature the network learns from (it just needs to be consistent)."""
+    The estimate assumes 31 IVs, 85 EVs, neutral nature (the randbats convention) -- it
+    just needs to be consistent, since it's only a network feature."""
     known = (mon.stats or {}).get(key) if hasattr(mon, "stats") else None
     if known:
         return known
@@ -95,10 +88,10 @@ def _max_hp(mon):
 
 def estimate_damage_fraction(attacker, move, defender):
     """Estimated damage of `move` from `attacker` into `defender`, as a fraction of the
-    defender's max HP (0 for status/immune; clamped to 1.5 for overkill).
+    defender's max HP (0 for status/immune, clamped to 1.5 for overkill).
 
-    Wrapped defensively: it runs in the hot loop on live battle moves, and a single odd
-    move's data shouldn't crash a multi-hour training run -- a missed estimate just reads 0.
+    Runs in the hot loop on live moves, so it swallows errors: one odd move's data
+    shouldn't crash a multi-hour run, and a missed estimate just reads 0.
     """
     try:
         return _estimate_damage_fraction(attacker, move, defender)
@@ -119,9 +112,9 @@ def _estimate_damage_fraction(attacker, move, defender):
 
     type_mult = defender.damage_multiplier(move)            # type chart (0 if immune)
     stab = 1.5 if move.type in [t for t in attacker.types if t] else 1.0
-    dmg = base * type_mult * stab * 0.925                   # average damage roll
+    dmg = base * type_mult * stab * 0.925                   # average roll
 
-    # A burned physical attacker hits for half (unless Guts, which we don't track here).
+    # Burn halves physical damage (we ignore Guts).
     if physical and attacker.status is not None and attacker.status.name == "BRN":
         dmg *= 0.5
 
@@ -152,9 +145,9 @@ class RandbatsKnowledge:
     # --- prediction ---------------------------------------------------------
 
     def predict_sets(self, species, revealed_ids):
-        """The sets consistent with the moves revealed so far (set-narrowing).
+        """The sets consistent with the moves revealed so far.
 
-        Once Haxorus shows Outrage, only the set containing Outrage survives -> its other
+        Once Haxorus shows Outrage, only sets containing Outrage survive, and their other
         moves become the prediction. If nothing matches (odd data), keep all sets."""
         sets = self._sets.get(to_id_str(species or ""), [])
         if not sets:
@@ -171,14 +164,13 @@ class RandbatsKnowledge:
         ids |= set(revealed_ids)  # always include what we've actually seen
         return ids
 
-    # --- feature vectors for the opponent's ACTIVE Pokemon ------------------
+    # --- feature vectors for the opponent's active Pokemon ------------------
     #
-    # These are PROBABILISTIC, not binary: a value is the fraction of the still-possible
-    # sets that have the trait. Before Haxorus reveals anything that's 0.5 for an Outrage
-    # (1 of its 2 sets) but 1.0 for Close Combat (both sets). Revealing a move narrows the
-    # surviving sets, which is exactly the Bayesian update -- P(Outrage) jumps to 1.0 once
-    # we see it, Set-B-only moves drop to 0. (We treat each set's listed movepool as its
-    # moveset; a few sets list >4 options, a second-order nuance we don't model.)
+    # These are probabilities, not flags: each value is the fraction of still-possible sets
+    # with the trait. Before Haxorus reveals anything, Outrage reads 0.5 (1 of its 2 sets)
+    # and Close Combat 1.0 (both). Revealing a move narrows the surviving sets -- the Bayesian
+    # update -- so P(Outrage) jumps to 1.0 once seen. (We treat each set's movepool as its
+    # moveset; a few list >4 options, which we don't model.)
 
     def _surviving_sets(self, opp):
         if opp is None:
@@ -195,21 +187,20 @@ class RandbatsKnowledge:
         for s in sets:
             for mid in s["moves"]:
                 probs[mid] = probs.get(mid, 0.0) + 1.0 / n
-        for mid in opp.moves.keys():     # moves we've actually seen are certain
+        for mid in opp.moves.keys():     # seen moves are certain
             probs[mid] = 1.0
         return probs
 
     def predicted_abilities(self, opp):
         """ability_id -> probability the opponent's active has it.
 
-        1.0 on the revealed ability once known. Otherwise it's read off the still-possible
-        randbats sets (each set lists its candidate abilities), narrowed by revealed moves --
-        so an Orthworm, whose every set runs Earth Eater, reads as a CERTAIN Ground immunity
-        even before it's shown. Falls back to the dex's possible abilities (uniform) for a
-        species we have no set data for."""
+        1.0 for a revealed ability. Otherwise read off the still-possible sets (each lists
+        candidate abilities) narrowed by revealed moves, so an Orthworm -- always Earth
+        Eater -- reads as a certain Ground immunity before it shows. Falls back to the dex's
+        possible abilities (uniform) for a species with no set data."""
         if opp is None:
             return {}
-        if opp.ability:                                  # revealed -> certain
+        if opp.ability:                                  # revealed, so certain
             return {to_id_str(opp.ability): 1.0}
         sets = self._surviving_sets(opp)
         if not sets:
@@ -221,7 +212,7 @@ class RandbatsKnowledge:
             ab = s.get("abilities") or set()
             if not ab:
                 continue
-            w = 1.0 / (n * len(ab))                      # split each set's mass over its candidates
+            w = 1.0 / (n * len(ab))                      # split each set's mass over its abilities
             for a in ab:
                 probs[a] = probs.get(a, 0.0) + w
         return probs
@@ -293,12 +284,12 @@ class RandbatsKnowledge:
         return acc
 
     def predicted_incoming(self, opp, my_active, immune_types=None):
-        """Scariest *probability-weighted* incoming hit (HP fraction): a 50%-likely nuke
-        counts as a real-but-discounted threat, not a guaranteed one.
+        """Scariest probability-weighted incoming hit (HP fraction): a 50%-likely nuke counts
+        as a discounted threat, not a guaranteed one.
 
-        immune_types (a set of type NAMEs) lets a caller drop move types our active is immune
-        to via its ABILITY -- e.g. a Levitate mon shouldn't fear Ground. Default None keeps the
-        original behaviour exactly, so the observation features built on this are unchanged."""
+        immune_types (type names) lets a caller drop move types our active is immune to via
+        its ability -- a Levitate mon shouldn't fear Ground. Default None preserves the old
+        behaviour, so the observation features built on this are unchanged."""
         if opp is None or my_active is None:
             return 0.0
         worst = 0.0
@@ -311,5 +302,5 @@ class RandbatsKnowledge:
         return worst
 
 
-# Singleton: load the set sheet once at import.
+# Load the set sheet once at import.
 KNOWLEDGE = RandbatsKnowledge()

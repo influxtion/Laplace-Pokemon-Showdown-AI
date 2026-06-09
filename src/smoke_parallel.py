@@ -5,7 +5,7 @@ FRESH model (it does NOT touch your saved models). If this completes, the parall
 works on your machine and the real run will too.
 
 Run from the project root, with the local Showdown server running:
-    python -u v1\smoke_parallel.py
+    python -u src\smoke_parallel.py
 """
 
 from sb3_contrib import MaskablePPO

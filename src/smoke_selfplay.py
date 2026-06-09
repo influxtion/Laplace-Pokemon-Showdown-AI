@@ -1,16 +1,13 @@
-r"""Quick live check of the self-play loop before a long run.
+r"""Quick check of the self-play loop before a long run.
 
-Builds the self-play env (agent vs a model-driven opponent), plays a few dozen real turns,
-and confirms the observation shape and that the opponent picks moves without error.
+Builds the self-play env (agent vs a model-driven opponent), plays a few dozen turns, and
+confirms the observation shape and that the opponent picks moves without error.
 
 Run from the project root, with the local Showdown server running:
-    python -u v1\selfplay\smoke_selfplay.py
+    python -u src\smoke_selfplay.py
 """
 
 import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 from sb3_contrib import MaskablePPO

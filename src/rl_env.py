@@ -1,23 +1,18 @@
-"""The reinforcement-learning environment (Stage 2).
+"""The RL environment (stage 2).
 
-This is where "training an AI" actually happens. We don't write rules for which
-move to pick (that was Stage 1). Instead we describe the battle to a neural
-network as a list of numbers, hand back a reward when things go well, and let a
-learning algorithm (PPO) figure out a good policy through trial and error.
+Instead of writing rules (stage 1), we describe the battle to a network as a vector,
+hand back a reward, and let PPO learn a policy by trial and error.
 
-poke-env does the heavy lifting: `SinglesEnv` already knows how to talk to the
-Showdown server, what actions are legal, and how to translate a chosen action
-number into an in-game move. We only have to supply the two things that are
-specific to *our* AI:
+poke-env's SinglesEnv handles the server, legal actions, and turning an action number
+into a move. We supply the two pieces specific to our agent:
 
-  * embed_battle()  -> turn the battle state into numbers (the "observation")
-  * calc_reward()   -> say how good the current state is (the "reward")
+  * embed_battle()  -> battle state as numbers (the observation)
+  * calc_reward()   -> how good the current state is (the reward)
 
-The observation is deliberately detailed. An early 12-number version plateaued
-against a strong opponent because it was blind to most of the game. This version
-adds the things that actually drive decisions: stat boosts, status, the bench
-(for switching), move details, field/terrain/screens, hazards, weather, the
-opponent's revealed moves, and high-impact abilities.
+The observation is detailed on purpose. An early 12-number version plateaued because it
+was blind to most of the game; this one adds the things that drive decisions: stat boosts,
+status, the bench, move details, field/terrain/screens, hazards, weather, the opponent's
+revealed moves, and high-impact abilities.
 """
 
 import numpy as np
@@ -38,9 +33,9 @@ TYPE_NAMES = [
     "GROUND", "FLYING", "PSYCHIC", "BUG", "ROCK", "GHOST", "DRAGON", "DARK", "STEEL", "FAIRY",
 ]  # 18, used for the (own-side) Tera type one-hot
 
-# High-impact held items, grouped into categories (one flag each). We only read this for
-# OUR OWN active Pokemon, whose item is always known -- the opponent's is usually hidden,
-# so encoding it would just add blank features (the mistake the 854-obs experiment made).
+# High-impact held items, grouped into categories (one flag each). Only read for our own
+# active, whose item is known; the opponent's is usually hidden, so encoding it would just
+# add blank features.
 ITEM_CATEGORIES = [
     {"leftovers", "blacksludge"},                  # passive healing
     {"choiceband", "choicespecs", "choicescarf"},  # locked into one move (power/speed)
@@ -54,9 +49,9 @@ ITEM_CATEGORIES = [
     {"weaknesspolicy"},                            # boosts after a super-effective hit
 ]  # 10
 
-# High-impact abilities, grouped into strategic categories. Each category becomes one
-# flag per active Pokemon. Encoding categories (not the hundreds of raw abilities) keeps
-# this compact while capturing the abilities that actually change a decision.
+# High-impact abilities grouped into categories, one flag each per active Pokemon. Encoding
+# categories rather than the hundreds of raw abilities stays compact while still capturing
+# the ones that change a decision.
 ABILITY_CATEGORIES = [
     {"levitate"},                                      # immune to Ground
     {"flashfire", "wellbakedbody"},                    # immune to Fire
@@ -116,20 +111,19 @@ def _norm_ability(name):
 def _ability_flags(mon, infer_possible=False):
     """One flag per high-impact ability category.
 
-    1.0 = the Pokemon is confirmed to have an ability in this category.
-    0.5 = the ability is unknown (opponent, not yet revealed) but the species COULD
-          have one in this category (from `possible_abilities`).
-    0.0 = none / unknown with no possibility.
+    1.0 = confirmed to have an ability in this category.
+    0.5 = unrevealed (opponent), but the species could have one (`possible_abilities`).
+    0.0 = none, or unknown with no possibility.
     """
     vec = [0.0] * len(ABILITY_CATEGORIES)
     if mon is None:
         return vec
-    if mon.ability:  # confirmed (always true for our own Pokemon)
+    if mon.ability:  # confirmed (always true for our own mons)
         aid = _norm_ability(mon.ability)
         for i, ids in enumerate(ABILITY_CATEGORIES):
             if aid in ids:
                 vec[i] = 1.0
-    elif infer_possible:  # opponent whose ability hasn't shown yet
+    elif infer_possible:  # opponent, ability not yet revealed
         possibles = {_norm_ability(a) for a in (mon.possible_abilities or [])}
         for i, ids in enumerate(ABILITY_CATEGORIES):
             if possibles & ids:
@@ -149,9 +143,9 @@ def _matchup(me, opp):
 def _eff_speed(mon):
     """Effective speed: base speed adjusted for the stat-stage boost and paralysis.
 
-    The old `faster` flag compared *raw* base speed, which is wrong whenever there's a
-    speed boost/drop or paralysis in play. This captures those (the common cases);
-    items like Choice Scarf are still invisible (held items aren't known for the opponent).
+    The old `faster` flag compared raw base speed, wrong under a speed boost/drop or
+    paralysis. This catches those; Choice Scarf is still invisible (the opponent's item
+    isn't known).
     """
     if mon is None:
         return 0.0
@@ -176,10 +170,10 @@ def _item_flags(mon):
 
 
 def _tera_features(battle, me):
-    """Our Terastallization state: can we Tera, our active's Tera type, are we Tera'd.
+    """Our Tera state: can we Tera, our active's Tera type, are we already Tera'd.
 
-    All known for our own side (the opponent's Tera type stays hidden until they use it,
-    so we don't encode it -- that would just be a blank).
+    All known for our side. The opponent's Tera type stays hidden until they use it, so
+    we don't encode it.
     """
     can_tera = 1.0 if battle.can_tera else 0.0
     if me is not None and me.tera_type is not None:
@@ -288,16 +282,16 @@ def _opponent_moves(battle):
 
 
 def _knowledge_features(battle, me, opp):
-    """Opponent set-prediction + damage-estimate features (see knowledge.py).
+    """Opponent set-prediction and damage-estimate features (see knowledge.py).
 
-    All keyed off the opponent's ACTIVE Pokemon (always known) and our own moves, so every
-    value here is populated -- no blank features (the lesson from the 854-obs experiment)."""
-    # Our moves' estimated damage to the opponent's active (a real "can I KO?" signal).
+    All keyed off the opponent's active (always known) and our own moves, so every value
+    here is populated."""
+    # Our moves' estimated damage to the opponent's active (a "can I KO?" signal).
     my_move_dmg = [0.0] * 4
     for i, move in enumerate(battle.available_moves[:4]):
         my_move_dmg[i] = estimate_damage_fraction(me, move, opp)
     best_out = max(my_move_dmg) if my_move_dmg else 0.0
-    # Worst estimated damage the opponent's LIKELY (predicted) moves do to us -> switch cue.
+    # Worst hit the opponent's predicted moves do to us -> a switch cue.
     worst_in = KNOWLEDGE.predicted_incoming(opp, me)
 
     return (
@@ -318,12 +312,12 @@ N_FEATURES = 215
 def build_observation(battle):
     """Describe the current battle to the network as N_FEATURES numbers.
 
-    Module-level so the same observation can be built outside the env -- the self-play
-    opponent (selfplay.py) runs the model on this exact vector inside its choose_move."""
+    Module-level so the same observation can be built outside the env: the self-play
+    opponent runs the model on this exact vector inside choose_move."""
     me = battle.active_pokemon
     opp = battle.opponent_active_pokemon
 
-    # Our active Pokemon's (up to 4) moves.
+    # Our active's moves (up to 4).
     move_power = [0.0] * 4
     move_multiplier = [0.0] * 4
     move_accuracy = [0.0] * 4
@@ -339,9 +333,8 @@ def build_observation(battle):
         category = move.category.name
         move_physical[i] = 1.0 if category == "PHYSICAL" else 0.0
         move_status[i] = 1.0 if category == "STATUS" else 0.0
-        # Priority decides who moves first regardless of speed (e.g. a priority KO).
-        # Clamp to [-1, 1] so a rare -7 move (e.g. Trick Room) can't blow the range.
-        # safe_priority: some live pseudo-moves (Struggle) omit the priority field.
+        # Priority decides turn order regardless of speed. Clamp to [-1, 1] so a rare -7
+        # move can't blow the range. safe_priority: some pseudo-moves (Struggle) omit it.
         move_priority[i] = max(-1.0, min(1.0, safe_priority(move) / 3.0))
 
     my_hp = me.current_hp_fraction if me else 0.0
@@ -349,8 +342,7 @@ def build_observation(battle):
     my_remaining = sum(1 for m in battle.team.values() if not m.fainted) / 6.0
     opp_fainted = sum(1 for m in battle.opponent_team.values() if m.fainted)
     opp_remaining = (6 - opp_fainted) / 6.0
-    # Effective-speed comparison (accounts for boosts/paralysis), flipped under
-    # Trick Room, which reverses the turn order.
+    # Effective-speed comparison (boosts/paralysis), flipped under Trick Room.
     faster = 1.0 if _eff_speed(me) > _eff_speed(opp) else 0.0
     if any(f.name == "TRICK_ROOM" for f in battle.fields):
         faster = 1.0 - faster
@@ -380,36 +372,34 @@ def build_observation(battle):
     return np.array(features, dtype=np.float32)
 
 
-# Default reward weights. Winning dominates so the agent plays to win, not just to trade
-# evenly; the dense HP/faint/status terms are just enough feedback to guide early learning.
-# Self-play raises victory_value mid-curriculum (see train_selfplay.py).
+# Default reward weights. Winning dominates so the agent plays to win, not just to trade;
+# the dense HP/faint/status terms guide early learning. Self-play raises victory_value
+# mid-curriculum (see train_selfplay.py).
 DEFAULT_REWARD = dict(fainted_value=1.0, hp_value=0.5, status_value=0.1, victory_value=100.0)
 
 
 class ShowdownSinglesEnv(SinglesEnv):
     def __init__(self, reward_weights=None, reward_schedule=None, switch_penalty=0.0, **kwargs):
         super().__init__(**kwargs)
-        # Negative low because stat boosts can be negative.
+        # Low is negative because stat boosts can be.
         obs_space = Box(low=-1.0, high=4.0, shape=(N_FEATURES,), dtype=np.float32)
         self.observation_spaces = {agent: obs_space for agent in self.possible_agents}
         self.reward_weights = dict(DEFAULT_REWARD, **(reward_weights or {}))
 
-        # Anti-"panic switch" shaping. PokeLLMon found that switching a DIFFERENT Pokemon out
-        # on consecutive turns is a top failure mode that correlates with losing -- the agent
-        # keeps fleeing matchups instead of committing, burning turns and eating entry-hazard
-        # chip. We subtract `switch_penalty` reward whenever the agent makes a voluntary switch
-        # on the turn right after another voluntary switch. A single switch is fine (often the
-        # right play) and is never penalized; only the SECOND in a row is. 0.0 = disabled.
+        # Anti-panic-switch shaping. PokeLLMon found that switching a different Pokemon out on
+        # consecutive turns correlates with losing: the agent keeps fleeing matchups instead of
+        # committing, burning turns and eating hazard chip. We subtract `switch_penalty` for a
+        # voluntary switch on the turn right after another voluntary switch. A single switch is
+        # fine and never penalized; only the second in a row. 0.0 disables.
         self.switch_penalty = switch_penalty
         self._switch_state = {}  # per-battle: {"prev_mon": Pokemon|None, "prev_voluntary": bool}
 
-        # Optional reward ANNEAL. The agent learns to TRADE rather than WIN because the dense
-        # per-turn shaping (hp/faint) fires every turn while the victory bonus is rare -- so the
-        # consistent gradient rewards trading. Annealing linearly shifts the weights from a
-        # `start` (dense shaping, to bootstrap a competent policy) to an `end` (shaping shrunk,
-        # so the win bonus dominates and the agent plays to CLOSE games) over `horizon` reward
-        # computations. None -> static reward_weights (unchanged v1 behaviour).
-        # NOTE horizon is PER-ENV: with N parallel envs, pass total_anneal_steps / N.
+        # Optional reward anneal. The agent learns to trade rather than win: the dense per-turn
+        # shaping (hp/faint) fires every turn while the victory bonus is rare, so the consistent
+        # gradient rewards trading. Annealing linearly shifts the weights from `start` (dense
+        # shaping, to bootstrap a competent policy) to `end` (shaping shrunk, so the win bonus
+        # dominates) over `horizon` reward computations. None -> static reward_weights.
+        # horizon is per-env: with N parallel envs, pass total_anneal_steps / N.
         self.reward_schedule = reward_schedule
         if reward_schedule is not None:
             self._anneal_start = dict(DEFAULT_REWARD, **reward_schedule["start"])
@@ -431,19 +421,17 @@ class ShowdownSinglesEnv(SinglesEnv):
                 for k in self._anneal_start}
 
     def _panic_switch_penalty(self, battle):
-        """Penalty for 'panic switching' -- a voluntary switch on the turn right after another
-        voluntary switch (see __init__). Returns 0.0 unless switch_penalty is set and this turn
-        completes a two-in-a-row voluntary-switch chain.
+        """Penalty for panic switching: a voluntary switch right after another (see __init__).
+        Returns 0.0 unless switch_penalty is set and this turn completes a two-in-a-row chain.
 
-        Detection: the active Pokemon changed identity since last turn (a switch), and the
-        Pokemon we left is still alive (so we CHOSE to switch -- a fainted active forces a switch,
-        which is not a panic decision and never counts). A non-switch turn in between resets the
-        chain, so ordinary defensive switching is never punished."""
+        We detect a switch by the active changing identity, and call it voluntary if the mon we
+        left is still alive (a fainted active forces a switch, which never counts). A non-switch
+        turn resets the chain, so ordinary defensive switching is never punished."""
         if not self.switch_penalty:
             return 0.0
         state = self._switch_state.setdefault(battle, {"prev_mon": None, "prev_voluntary": False})
         cur, prev = battle.active_pokemon, state["prev_mon"]
-        # Same team slot keeps the same Pokemon object across turns, so identity == "same mon".
+        # A team slot keeps the same object across turns, so identity means "same mon".
         switched = prev is not None and cur is not None and cur is not prev
         voluntary = switched and not prev.fainted
         panic = voluntary and state["prev_voluntary"]
@@ -451,8 +439,8 @@ class ShowdownSinglesEnv(SinglesEnv):
         return self.switch_penalty if panic else 0.0
 
     def calc_reward(self, battle):
-        """Reward = change in how good our position is since last turn (see DEFAULT_REWARD),
-        minus an optional panic-switch penalty. With a reward_schedule, the shaping weights
-        anneal from start to end across training."""
+        """Reward = change in our position since last turn (see DEFAULT_REWARD), minus an
+        optional panic-switch penalty. With a reward_schedule, the shaping weights anneal
+        from start to end across training."""
         reward = self.reward_computing_helper(battle, **self._current_weights())
         return reward - self._panic_switch_penalty(battle)

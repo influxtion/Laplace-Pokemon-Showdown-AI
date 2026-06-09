@@ -1,37 +1,31 @@
 r"""Self-play on top of the reward-annealed agent -- "Influxobot", the final ladder bot.
 
-This is the one pre-ladder experiment we hadn't run: the shipped ~57% search agent sits on a
-policy (ppo_v3_anneal_best) that has ONLY ever trained against SimpleHeuristicsPlayer. Self-play
-replaces that single fixed opponent with a refreshed snapshot of the agent itself, so it trains
-against a moving, varied target. We already saw self-play not move the *heuristic* benchmark --
-but that's the wrong metric for it; the point here is OPPONENT DIVERSITY, which may generalize to
-the varied humans on the real ladder better than a policy that only ever saw one bot. The honest
-signal for this run is ladder GXE, not the heuristic number (which may stay ~flat).
+The one pre-ladder experiment we hadn't run. The shipped ~57% search agent sits on a policy
+(ppo_v3_anneal_best) that only ever trained against SimpleHeuristicsPlayer. Self-play replaces
+that single opponent with a refreshed snapshot of the agent itself, training it against a
+moving, varied target. Self-play didn't move the heuristic benchmark before, but that's the
+wrong metric here: the point is opponent diversity, which may generalize to the varied humans
+on the ladder better than a policy that only saw one bot. The real signal is ladder GXE, not
+the heuristic number (which may stay flat).
 
-Warm-starts from ppo_v3_anneal_best (the current best) and -- crucially -- continues with the
-anneal's END reward (train_v3_anneal.ANNEAL_END), NOT train_rl's larger shaping. The anneal
-finished training at that small-shaping/win-dominant reward, so reusing it keeps the warm-started
-value function calibrated; jumping back to 10x-larger shaping would destabilize it.
+Warm-starts from ppo_v3_anneal_best and continues with the anneal's END reward
+(train_v3_anneal.ANNEAL_END), not train_rl's larger shaping. The anneal finished at that
+small-shaping/win-dominant reward, so reusing it keeps the value function calibrated; jumping
+back to 10x-larger shaping would destabilize it.
 
-Saved model: ppo_v3_anneal_selfplay_obs215.zip (+ _best for the eval peak). Ladder username:
-"Influxobot" (set when you run ladder.py with real credentials -- the file name is unrelated to
-the display name). eval_search.py / play.py auto-pick this model once it exists.
+Saved as ppo_v3_anneal_selfplay_obs215.zip (+ _best for the eval peak); eval_search.py /
+play.py auto-pick it once it exists. The ladder display name "Influxobot" is set in ladder.py,
+unrelated to the file name.
 
 Reuses the self-play machinery (opponent, eval env, snapshot refresh, LR schedule) from
-train_v3_selfplay; only the warm-start source, the reward, and the saved names differ.
+train_v3_selfplay; only the warm-start source, reward, and saved names differ.
 
 Run from the project root, with the local Showdown server running:
-    python -u v1\v3\train_v3_anneal_selfplay.py
+    python -u src\train_v3_anneal_selfplay.py
 """
 
 import logging
 import os
-import sys
-
-# This file lives in v1/v3/ but reuses modules in v1/ and v1/selfplay/. Put both on the path.
-_V1 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, _V1)
-sys.path.insert(0, os.path.join(_V1, "selfplay"))
 
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
@@ -45,36 +39,36 @@ import train_rl as base
 from train_selfplay import SnapshotCallback
 # Reward-independent self-play helpers shared with the plain v3 self-play run.
 from train_v3_selfplay import make_self_opponent, build_eval_env, linear_schedule
-# The anneal's END reward -- reuse it so the warm-start from ppo_v3_anneal_best is seamless.
+# The anneal's END reward, so the warm-start from ppo_v3_anneal_best is seamless.
 from train_v3_anneal import ANNEAL_END
 
 BATTLE_FORMAT = "gen9randombattle"
 
 # --- hygiene (same as the other v3 finetunes) ---------------------------------
 TARGET_KL = 0.03
-LR_START = 3e-4            # decays LINEARLY to 0 across the run
+LR_START = 3e-4            # decays linearly to 0 across the run
 
-TRAIN_STEPS = 1_000_000
+TRAIN_STEPS = 500_000
 REFRESH_FREQ = 50_000      # how often to copy the learner's weights into the opponent
-EVAL_FREQ = 25_000
-EVAL_BATTLES = 200
+EVAL_FREQ = 15_000
+EVAL_BATTLES = 100
 LIVE_EVAL_BATTLES = 100
 SAVE_FREQ = 100_000
 
-# Warm-start from the current best (the annealed agent); fall back to the anneal latest.
+# Warm-start from the current best (annealed) agent; fall back to the anneal latest.
 WARM_START_PATHS = [
     f"ppo_v3_anneal_best_obs{N_FEATURES}.zip",
     f"ppo_v3_anneal_obs{N_FEATURES}.zip",
 ]
-MODEL_PATH = f"ppo_v3_anneal_selfplay_obs{N_FEATURES}.zip"          # latest (for resuming)
+MODEL_PATH = f"ppo_v3_anneal_selfplay_obs{N_FEATURES}.zip"          # latest, for resuming
 BEST_PATH = f"ppo_v3_anneal_selfplay_best_obs{N_FEATURES}.zip"      # highest win rate seen
 SNAPSHOT_PATH = "ppo_v3_anneal_selfplay_snapshot.zip"              # scratch file to seed opponent
 TB_LOG_NAME = f"ppo_v3_anneal_selfplay_obs{N_FEATURES}"
 
 
 def build_train_env(opponent):
-    """Agent vs a snapshot of itself, with the anneal's END reward so the warm-started value
-    function stays on the scale it finished the anneal on."""
+    """Agent vs a snapshot of itself, on the anneal's END reward so the value function stays
+    on the scale it finished the anneal on."""
     showdown = ShowdownSinglesEnv(
         reward_weights=ANNEAL_END,
         account_configuration1=AccountConfiguration.generate("v3aspA", rand=True),
@@ -100,11 +94,11 @@ def main():
         if start_path is None:
             raise FileNotFoundError(
                 f"Need {MODEL_PATH} (to resume) or one of {WARM_START_PATHS} (to warm-start). "
-                f"Run the anneal finetune first: python -u v1\\v3\\train_v3_anneal.py")
+                f"Run the anneal finetune first: python -u src\\train_v3_anneal.py")
         print(f"WARM-STARTING anneal self-play from {start_path}.", flush=True)
     model = MaskablePPO.load(start_path, env=env, tensorboard_log=base.TB_DIR)
 
-    # Loading preserves net_arch/gamma/reward scale; only override the optimizer behaviour.
+    # Loading preserves net_arch/gamma/reward scale; only override the optimizer.
     model.target_kl = TARGET_KL
     model.lr_schedule = linear_schedule(LR_START)
 

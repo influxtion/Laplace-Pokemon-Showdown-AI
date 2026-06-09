@@ -1,17 +1,14 @@
-"""Custom 'team attention' network for the v2 agent (Phase 1, the architecture half).
+"""Team-attention network for the v2 agent (the architecture half of phase 1).
 
-This replaces Stable-Baselines3's default flat MLP. It reshapes the 854-number
-observation back into the 12-Pokemon grid that `rl_env_v2` lays out, runs a shared
-encoder over each Pokemon, lets them attend to each other (ignoring unrevealed slots via
-a padding mask), pools the result over the REAL Pokemon, glues on the global field
-features, and outputs a feature vector for the policy/value heads.
+Replaces SB3's default flat MLP. Reshapes the 854-number observation back into the
+12-Pokemon grid rl_env_v2 lays out, runs a shared encoder over each Pokemon, lets them
+attend to each other (unrevealed slots masked out), pools over the real Pokemon, glues on
+the global field features, and outputs a vector for the policy/value heads.
 
-Why this beats a flat MLP: the network is *told* the team structure instead of having to
-rediscover it, and attention lets each Pokemon's representation depend on the others
-(your threat level depends on which of their Pokemon is in front of you). The padding
-mask is what makes imperfect information (unrevealed Pokemon) clean: those slots are
-excluded from attention and pooling entirely, the same way the action mask excludes
-illegal moves.
+The point: the network is told the team structure instead of rediscovering it, and attention
+lets each Pokemon's representation depend on the others (your threat level depends on what's
+in front of you). The padding mask handles imperfect information cleanly -- unrevealed slots
+are excluded from attention and pooling, the way the action mask excludes illegal moves.
 """
 
 import torch

@@ -31,7 +31,7 @@ The code talks to a local copy of the Showdown server through
 the battle state as Python objects. Everything runs locally, so the agent can play thousands
 of fast battles for free.
 
-Each turn, the environment (`v1/rl_env.py`) turns the battle into a list of numbers (the
+Each turn, the environment (`src/rl_env.py`) turns the battle into a list of numbers (the
 *observation*) for the network, and turns the result into a *reward*. Training uses
 **MaskablePPO**: at every turn only some actions are legal, and poke-env supplies a mask of
 the legal ones so the agent only ever picks valid moves, which makes learning far faster.
@@ -46,7 +46,7 @@ runs measure over 200-400 battles.
 
 | # | Model | Win rate | What it added / what went wrong |
 |---|---|---|---|
-| 1 | **Heuristic bot** `v1/heuristic_bot.py` *(no saved model)* | ~96% vs random | Hand-written rules: score moves by power, STAB, and type effectiveness; switch on a bad matchup. The baseline and sparring partner, not a learner. |
+| 1 | **Heuristic bot** `src/heuristic_bot.py` *(no saved model)* | ~96% vs random | Hand-written rules: score moves by power, STAB, and type effectiveness; switch on a bad matchup. The baseline and sparring partner, not a learner. |
 | 2 | **First RL agent, 12 features** `ppo_vs_random.zip`, `ppo_vs_heuristic.zip` | ~100% vs random; ~30% vs heuristic | Proved the pipeline learns. But with only 12 numbers it was blind to stats, status, hazards, and the bench, so it stalled against a real opponent. |
 | 3 | **Richer observation, 141 features** `ppo_vs_heuristic_obs141.zip` | ~41% | Added boosts, status, the bench, move details, weather, and abilities. Broke the 30% plateau; held as the baseline far longer than expected. |
 | 4 | **Attention net, 854 features** `ppo_v2_attn_obs854.zip` (+ MLP control `ppo_v2_mlp_obs854.zip`) | ~4% | The one dead end. Laid the battle out as 12 Pokemon "tokens" for a self-attention net, but most of those numbers are zero early (the opponent's team is hidden) and drowned the useful signal. Dropped. |
@@ -55,7 +55,7 @@ runs measure over 200-400 battles.
 | 7 | **Rescaled-reward experiment** `ppo_v3_rescaled_obs215.zip` | no change | Divided every reward by 10 to test if reward scale capped the value network's fit. It didn't (the metric is scale-invariant). Ruled out reward scale; pointed at partial observability. |
 | 8 | **Self-play** `ppo_selfplay_obs215.zip`, `ppo_v3_selfplay_obs215.zip` (+ `_best_`) | ~43% | Trains against refreshed snapshots of itself instead of a fixed opponent. Hygiene held this time, but it didn't transfer to the benchmark: the ceiling wasn't "the opponent is too easy." |
 | 9 | **Reward-anneal + anti-panic-switch** `ppo_v3_anneal_obs215.zip` (+ `_best_`) | ~40% (no gain) | Warm-started v3 and annealed the dense shaping toward zero while holding the win bonus, plus a penalty for switching a different Pokemon two turns in a row. Ran to completion cleanly, but the raw win rate stayed flat -- confirming reward is not the lever either; the ceiling is partial observability + a reactive 1-turn policy. |
-| 10 | **Test-time search** `v1/v3/search.py` *(wraps a trained model)* | **~57% (about +17 over the raw policy)** | Not a new model: a 1-ply evaluator that scores *every* legal action with the damage model -- it understands type matchups, switching for an offensive advantage, Terastallization, and ability immunities -- using the trained policy only as a prior. The single biggest lever, and the agent we actually ship. |
+| 10 | **Test-time search** `src/search.py` *(wraps a trained model)* | **~57% (about +17 over the raw policy)** | Not a new model: a 1-ply evaluator that scores *every* legal action with the damage model -- it understands type matchups, switching for an offensive advantage, Terastallization, and ability immunities -- using the trained policy only as a prior. The single biggest lever, and the agent we actually ship. |
 
 ## Lessons learned
 
@@ -105,11 +105,11 @@ node pokemon-showdown start --no-security
 **2. Train an agent** (from the project root):
 
 ```powershell
-.\.venv\Scripts\python.exe -u v1\train_rl.py                # main agent vs random/heuristic
-.\.venv\Scripts\python.exe -u v1\v3\train_v3.py             # scaled agent (bigger net, win reward)
-.\.venv\Scripts\python.exe -u v1\v3\train_v3_anneal.py      # reward-anneal + anti-panic-switch finetune
-.\.venv\Scripts\python.exe -u v1\v3\train_v3_selfplay.py    # self-play on the v3 agent
-.\.venv\Scripts\python.exe -u v2\train_v2.py                # the attention experiment
+.\.venv\Scripts\python.exe -u src\train_rl.py                          # main agent vs random/heuristic
+.\.venv\Scripts\python.exe -u src\train_v3.py                          # scaled agent (bigger net, win reward)
+.\.venv\Scripts\python.exe -u src\train_v3_anneal.py                   # reward-anneal + anti-panic-switch finetune
+.\.venv\Scripts\python.exe -u src\train_v3_anneal_selfplay.py          # "Influxobot": self-play on the annealed agent
+.\.venv\Scripts\python.exe -u experiments\v2_attention\train_v2.py     # the attention experiment
 ```
 
 A run loads its starting weights, prints the win rate before training, trains for
@@ -122,11 +122,11 @@ each as a Showdown replay `.html` in `replays/` that you open in a browser to wa
 move:
 
 ```powershell
-.\.venv\Scripts\python.exe -u v1\v3\play.py                 # 1 battle, search agent vs heuristic
-.\.venv\Scripts\python.exe -u v1\v3\play.py --battles 3     # more battles
-.\.venv\Scripts\python.exe -u v1\v3\play.py --raw           # bare policy, no search
-.\.venv\Scripts\python.exe -u v1\v3\play.py --opponent random
-.\.venv\Scripts\python.exe -u v1\v3\play.py --model ppo_v3_obs215.zip   # a specific model
+.\.venv\Scripts\python.exe -u src\play.py                 # 1 battle, search agent vs heuristic
+.\.venv\Scripts\python.exe -u src\play.py --battles 3     # more battles
+.\.venv\Scripts\python.exe -u src\play.py --raw           # bare policy, no search
+.\.venv\Scripts\python.exe -u src\play.py --opponent random
+.\.venv\Scripts\python.exe -u src\play.py --model ppo_v3_obs215.zip   # a specific model
 ```
 
 It prints each result and the replay path, then you open the file to watch:
@@ -143,7 +143,7 @@ reliable than trying to catch the bot-vs-bot game live, since it finishes in sec
 **4. Benchmark the test-time search** against the raw policy:
 
 ```powershell
-.\.venv\Scripts\python.exe -u v1\v3\eval_search.py
+.\.venv\Scripts\python.exe -u src\eval_search.py
 ```
 
 **5. Watch training (optional)** in a browser via TensorBoard:
@@ -159,12 +159,12 @@ point), `rollout/ep_rew_mean` (smoother progress signal), and `train/explained_v
 **6. Benchmark the heuristic bot (optional):**
 
 ```powershell
-.\.venv\Scripts\python.exe v1\run_battle.py
+.\.venv\Scripts\python.exe src\run_battle.py
 ```
 
 ## Settings and model files
 
-The main knobs are constants at the top of `v1/train_rl.py`:
+The main knobs are constants at the top of `src/train_rl.py`:
 
 | Setting | What it does |
 |---|---|
@@ -183,19 +183,19 @@ The `.zip` files, `tb_logs/`, and `server/` are not committed (see `.gitignore`)
 
 | Path | Purpose |
 |---|---|
-| `v1/heuristic_bot.py` | The rule-based bot. |
-| `v1/run_battle.py` | Runs the heuristic bot vs random and reports win rate. |
-| `v1/rl_env.py` | The RL environment: the 215-number observation (`embed_battle`) and reward (`calc_reward`). |
-| `v1/knowledge.py` | Opponent set prediction (from Random Battle data) and damage estimation. |
-| `v1/train_rl.py` | Trains the main agent (parallel envs, win-focused reward). |
-| `v1/smoke_test.py`, `v1/smoke_parallel.py` | Quick checks that the env / parallel training start cleanly. |
-| `v1/selfplay/` | Self-play: `opponent.py` (model-driven opponent), `train_selfplay.py`, `smoke_selfplay.py`. |
-| `v1/v3/train_v3.py` | Scaled agent (bigger net, higher gamma, win reward); `RESCALED` toggle for the reward-scale experiment. |
-| `v1/v3/train_v3_anneal.py` | Reward-anneal + anti-panic-switch finetune (with KL/LR-decay/best-checkpoint hygiene). |
-| `v1/v3/train_v3_selfplay.py` | Self-play on the v3 agent. |
-| `v1/v3/search.py`, `v1/v3/eval_search.py` | Test-time 1-ply lookahead player, and its benchmark vs the raw policy. |
-| `v1/v3/play.py` | Plays a few watchable battles and saves them as browser replays (`replays/`). |
-| `v2/` | The attention experiment: `rl_env_v2.py` (854-number obs), `team_net.py` (attention net), `train_v2.py`, `smoke_v2.py`. |
+| `src/heuristic_bot.py` | The rule-based bot. |
+| `src/run_battle.py` | Runs the heuristic bot vs random and reports win rate. |
+| `src/rl_env.py` | The RL environment: the 215-number observation (`embed_battle`) and reward (`calc_reward`). |
+| `src/knowledge.py` | Opponent set/ability prediction (from Random Battle data) and damage estimation. |
+| `src/train_rl.py` | Trains the main agent (parallel envs, win-focused reward). |
+| `src/opponent.py`, `src/train_selfplay.py` | Model-driven self-play opponent, and the earlier self-play trainer. |
+| `src/train_v3.py` | Scaled agent (bigger net, higher gamma, win reward); `RESCALED` toggle for the reward-scale experiment. |
+| `src/train_v3_anneal.py` | Reward-anneal + anti-panic-switch finetune (KL / LR-decay / best-checkpoint hygiene). |
+| `src/train_v3_selfplay.py`, `src/train_v3_anneal_selfplay.py` | Self-play on the v3 / annealed agent ("Influxobot", the ladder bot). |
+| `src/search.py`, `src/eval_search.py` | Test-time 1-ply search player, and its benchmark vs the raw policy. |
+| `src/play.py` | Plays a few watchable battles and saves them as browser replays (`replays/`). |
+| `src/smoke_test.py`, `src/smoke_parallel.py`, `src/smoke_selfplay.py` | Quick checks that the env / parallel training / self-play start cleanly. |
+| `experiments/v2_attention/` | The attention experiment (dead end): `rl_env_v2.py` (854-number obs), `team_net.py`, `train_v2.py`, `smoke_v2.py`. |
 | `requirements.txt` | Python dependencies. |
 | `server/` | Local Showdown server (cloned during setup, not committed). |
 

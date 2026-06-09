@@ -1,26 +1,18 @@
-r"""Benchmark the test-time search agent, and compare it to the raw policy.
+r"""Benchmark the test-time search agent against the raw policy.
 
-Runs the trained model two ways against SimpleHeuristicsPlayer and prints both win rates so
-we can see whether the 1-ply lookahead actually helps:
-  - raw policy        : the network's move, no search (selfplay.ModelPlayer)
-  - search (1-ply)    : policy proposes top-k, damage model picks (search.SearchPlayer)
+Runs the trained model two ways against SimpleHeuristicsPlayer and prints both win rates, to
+see whether the 1-ply lookahead helps:
+  - raw policy     : the network's move, no search (opponent.ModelPlayer)
+  - search (1-ply) : every action scored by the damage model (search.SearchPlayer)
 
-Uses poke-env's native player-vs-player (battle_against). Loads the v3 model if present,
-otherwise the heuristic-trained 215 model.
+Uses poke-env's battle_against. Loads the best available model (see pick_model_path).
 
 Run from the project root, with the local Showdown server running:
-    python -u v1\v3\eval_search.py
+    python -u src\eval_search.py
 """
 
 import asyncio
 import os
-import sys
-
-# This file lives in v1/v3/. Put v1/ on the path (for rl_env) and v1/selfplay/ on the path
-# (for the ModelPlayer used as the raw-policy baseline).
-_V1 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, _V1)
-sys.path.insert(0, os.path.join(_V1, "selfplay"))
 
 from sb3_contrib import MaskablePPO
 
@@ -36,10 +28,10 @@ N_BATTLES = 400
 
 
 def pick_model_path():
-    # Best -> latest first: the self-play agent (stronger policy), then the plain v3 agent,
-    # then the heuristic-trained fallback. Layering search on the best base measures the stack.
+    # Best first: the self-play agent, then plain v3, then the heuristic-trained fallback.
+    # Layering search on the best base measures the full stack.
     candidates = (
-        f"ppo_v3_anneal_selfplay_best_obs{N_FEATURES}.zip",   # "Influxobot" (final): anneal -> self-play
+        f"ppo_v3_anneal_selfplay_best_obs{N_FEATURES}.zip",   # Influxobot (final): anneal -> self-play
         f"ppo_v3_anneal_selfplay_obs{N_FEATURES}.zip",
         f"ppo_v3_anneal_best_obs{N_FEATURES}.zip",
         f"ppo_v3_anneal_obs{N_FEATURES}.zip",

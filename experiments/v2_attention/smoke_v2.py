@@ -1,7 +1,7 @@
 """Live smoke test for the v2 stack.
 
-Confirms the whole chain works on a REAL battle:
-    real battle -> 854-feature structured observation -> attention network -> legal action -> step
+Confirms the whole chain works on a real battle:
+    battle -> 854-feature observation -> attention network -> legal action -> step
 """
 import numpy as np
 from sb3_contrib import MaskablePPO

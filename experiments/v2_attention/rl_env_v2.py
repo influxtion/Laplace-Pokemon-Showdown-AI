@@ -1,24 +1,22 @@
-"""Phase 1 (v2): a STRUCTURED, richer observation built for a team-attention network.
+"""Phase 1 (v2): a structured, richer observation built for a team-attention network.
 
-The baseline (`rl_env.py`) flattens everything into one 141-number vector. That's fine
-for a plain MLP, but it hides the natural structure of a battle: it's really *12 Pokemon*
-(your 6 + the opponent's 6) plus some global field state. A network that respects that
-structure -- a shared encoder per Pokemon, then attention across the team -- can learn far
-better than a flat MLP that has to rediscover "these 64 numbers are one Pokemon."
+The baseline (rl_env.py) flattens everything into one 141-number vector. Fine for a plain
+MLP, but it hides the structure of a battle: really 12 Pokemon (your 6 + their 6) plus global
+field state. A network that respects that -- a shared encoder per Pokemon, then attention
+across the team -- can learn better than a flat MLP rediscovering "these 64 numbers are one
+Pokemon."
 
-So this observation is laid out as a fixed grid:
+So the observation is a fixed grid:
 
     [ mon_0 | mon_1 | ... | mon_11 | global ]
       <-- 12 tokens of PER_MON each -->  <- GLOBAL ->
 
 mon_0..5  = your team (always known)
-mon_6..11 = opponent's team (only revealed Pokemon are filled; the rest are zeros)
+mon_6..11 = opponent's team (revealed mons filled, the rest zeros)
 
-The matching network (built next) reshapes the first 12*PER_MON numbers back into a
-(12, PER_MON) grid and runs attention over it. Keeping the layout fixed and documented
-here is what makes that possible.
-
-Also carries the win-weighted reward from the baseline.
+team_net reshapes the first 12*PER_MON numbers back into a (12, PER_MON) grid and runs
+attention over it, which is why the layout is fixed and documented here. Carries the
+win-weighted reward from the baseline.
 """
 
 import numpy as np

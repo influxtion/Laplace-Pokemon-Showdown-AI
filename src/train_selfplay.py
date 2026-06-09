@@ -1,36 +1,28 @@
 r"""Phase 2: self-play. Train the agent against periodically-refreshed copies of itself.
 
-Why self-play: against a single fixed opponent (the heuristic) the agent plateaued around
-40%, because once it has figured that opponent out there's nothing left to learn. Self-play
-gives it a moving target that gets stronger as it does, which is what pushes past a fixed
-opponent's ceiling.
+Against a single fixed opponent (the heuristic) the agent plateaued near 40%: once it has the
+opponent figured out, there's nothing left to learn. Self-play gives it a moving target that
+gets stronger as it does, which pushes past a fixed opponent's ceiling.
 
-How the opponent works (opponent.ModelPlayer): it runs a snapshot of the agent's own
-network. Every REFRESH_FREQ steps we copy the learner's current weights into it, so the
-opponent lags slightly behind and stays a stable-but-rising target (training against the
-exact live policy tends to oscillate).
+The opponent (opponent.ModelPlayer) runs a snapshot of the agent's network. Every REFRESH_FREQ
+steps we copy the learner's weights in, so it lags slightly behind and stays a stable rising
+target -- training against the exact live policy tends to oscillate.
 
-THE CURRICULUM (your plan):
-  Phase A - leave VICTORY_VALUE at 100 and train self-play. Let it learn to play the mirror
-            match with the normal reward.
-  Phase B - once it has learned, raise VICTORY_VALUE (e.g. 200) and run again. The script
-            resumes the saved model, so it keeps its skills but now values closing games
-            over even trades. Only the one constant below changes between the two phases.
+Curriculum:
+  Phase A: leave VICTORY_VALUE at 100 and train. Learn the mirror match on the normal reward.
+  Phase B: raise VICTORY_VALUE (e.g. 200) and re-run. The script resumes the saved model, so
+           it keeps its skills but now values closing games over even trades. Only the one
+           constant below changes between phases.
 
-We still benchmark against SimpleHeuristicsPlayer every EVAL_FREQ steps so progress stays
-comparable to the earlier runs (the ~41% baseline).
+Still benchmarks vs SimpleHeuristicsPlayer every EVAL_FREQ steps so progress stays comparable
+to the earlier runs (~41% baseline).
 
 Run from the project root, with the local Showdown server running:
-    python -u v1\selfplay\train_selfplay.py
+    python -u src\train_selfplay.py
 """
 
 import logging
 import os
-import sys
-
-# This file lives in v1/selfplay/ but reuses v1/ modules (rl_env, train_rl). Put the parent
-# v1/ directory on the import path so those bare imports resolve.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
@@ -47,8 +39,7 @@ from train_rl import win_rate, WinRateCallback, SaveCallback, mask_fn
 
 BATTLE_FORMAT = "gen9randombattle"
 
-# === the one curriculum knob ===
-# Phase A: 100 (same as the heuristic runs). Phase B: raise it (e.g. 200) and re-run.
+# The one curriculum knob. Phase A: 100. Phase B: raise it (e.g. 200) and re-run.
 VICTORY_VALUE = 100.0
 
 TRAIN_STEPS = 100_000
@@ -59,9 +50,9 @@ LIVE_EVAL_BATTLES = 50    # battles per live benchmark point
 SAVE_FREQ = 100_000
 TB_DIR = "tb_logs"
 
-# Model/scratch files live in the project root (paths are relative to where you run from).
+# Files live in the project root (paths relative to where you run from).
 MODEL_PATH = f"ppo_selfplay_obs{N_FEATURES}.zip"
-WARM_START_PATH = f"ppo_vs_heuristic_obs{N_FEATURES}.zip"  # start from the heuristic-trained agent
+WARM_START_PATH = f"ppo_vs_heuristic_obs{N_FEATURES}.zip"  # the heuristic-trained agent
 SNAPSHOT_PATH = "ppo_selfplay_snapshot.zip"               # scratch file to seed the opponent
 
 
@@ -116,8 +107,8 @@ def main():
     env, inner = build_train_env(opponent)
     eval_env, eval_inner = build_eval_env()
 
-    # Where the learner's starting weights come from: a saved self-play agent (continue),
-    # else the heuristic-trained agent (warm start), else fresh.
+    # Starting weights: a saved self-play agent (continue), else the heuristic-trained agent
+    # (warm start), else fresh.
     resuming = os.path.exists(MODEL_PATH)
     start_path = MODEL_PATH if resuming else (WARM_START_PATH if os.path.exists(WARM_START_PATH) else None)
     if start_path:

@@ -1,12 +1,11 @@
 """Phase 1 (v2) training: structured observation + team-attention network, vs the heuristic.
 
 Ties the v2 pieces together:
-  - rl_env_v2.ShowdownTeamEnv     : the 854-feature structured observation + win-weighted reward
+  - rl_env_v2.ShowdownTeamEnv      : the 854-feature observation + win-weighted reward
   - team_net.TeamAttentionExtractor: per-Pokemon encoder + self-attention (with padding mask)
-  - MaskablePPO                    : only ever picks legal actions
+  - MaskablePPO                    : only picks legal actions
 
-Benchmarked vs SimpleHeuristicsPlayer so we compare directly against the flat-MLP
-baseline (~41%). Reuses the generic win_rate / callbacks from train_rl.
+Benchmarked vs SimpleHeuristicsPlayer to compare against the flat-MLP baseline (~41%).
 
 Prereq: local Showdown server running (see README). Then:
     python -u train_v2.py
@@ -28,11 +27,11 @@ from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
 from rl_env_v2 import ShowdownTeamEnv, N_FEATURES
 from team_net import TeamAttentionExtractor
 
-# DIAGNOSTIC TOGGLE: when False, the 854-feature obs is fed through SB3's default
-# extractor (the exact architecture v1 used to reach 41%) instead of the team-attention
-# net. This isolates the cause of the v2 regression: if win rate / explained_variance
-# climb with this off, the attention net is the culprit; if they still stall, the 854 obs
-# itself is. Kept on a separate model file + tb run so it never clobbers the attn model.
+# Diagnostic toggle. When False, the 854-feature obs goes through SB3's default extractor
+# (v1's architecture, which reached 41%) instead of the attention net, to isolate the v2
+# regression: if win rate / explained_variance climb with this off, the attention net is the
+# culprit; if they still stall, the 854 obs is. Separate model file + tb run so it never
+# clobbers the attn model.
 USE_ATTENTION = False
 
 BATTLE_FORMAT = "gen9randombattle"
@@ -122,9 +121,8 @@ def main():
     env, inner = build_env()
     eval_env, eval_inner = build_env()
 
-    # Plug the team-attention network in as the feature extractor -- unless we're running
-    # the diagnostic (USE_ATTENTION=False), in which case we use SB3's default extractor,
-    # i.e. v1's exact architecture on the v2 obs.
+    # Plug in the attention net as the feature extractor, unless the diagnostic is on
+    # (USE_ATTENTION=False), which uses SB3's default extractor -- v1's architecture on the v2 obs.
     if USE_ATTENTION:
         policy_kwargs = dict(
             features_extractor_class=TeamAttentionExtractor,

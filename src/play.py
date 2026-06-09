@@ -1,34 +1,25 @@
-r"""Watch the trained agent actually play a battle.
+r"""Watch the trained agent play a battle.
 
-eval_search.py runs hundreds of battles and prints a win-rate number; this is the opposite --
-it plays a SMALL number of battles and saves each as a Showdown replay you can open in a
-browser and watch move by move. By default it plays the agent we'd actually ship: the trained
-policy wrapped in the 1-ply test-time search (search.py). Pass --raw to watch the bare policy
-instead.
+Where eval_search.py runs hundreds of battles for a win-rate number, this plays a few and
+saves each as a Showdown replay you can open in a browser and watch move by move. By default
+it plays the agent we'd ship: the policy wrapped in the 1-ply search (search.py). Pass --raw
+for the bare policy.
 
-How "watching" works: a Showdown replay is a self-contained .html file with the full battle
-log embedded; opening it loads Showdown's replay viewer (needs internet for the viewer's
-script, but the battle itself is in the file) and plays the battle back with sprites, HP bars,
-and move animations -- exactly what you'd see on the site.
+A replay is a self-contained .html with the full battle log embedded; opening it loads
+Showdown's replay viewer (needs internet for the viewer script, but the battle is in the file)
+and plays back with sprites, HP bars, and animations.
 
 Run from the project root, with the local Showdown server running:
-    python -u v1\v3\play.py                       # 1 battle, search agent vs the heuristic
-    python -u v1\v3\play.py --battles 3           # 3 battles
-    python -u v1\v3\play.py --raw                 # bare policy, no search
-    python -u v1\v3\play.py --opponent random     # vs RandomPlayer instead of the heuristic
-    python -u v1\v3\play.py --model ppo_v3_obs215.zip   # a specific model file
+    python -u src\play.py                       # 1 battle, search agent vs the heuristic
+    python -u src\play.py --battles 3           # 3 battles
+    python -u src\play.py --raw                 # bare policy, no search
+    python -u src\play.py --opponent random     # vs RandomPlayer instead of the heuristic
+    python -u src\play.py --model ppo_v3_obs215.zip   # a specific model file
 """
 
 import argparse
 import asyncio
 import os
-import sys
-
-# This file lives in v1/v3/. Put v1/ (rl_env, knowledge) and v1/selfplay/ (ModelPlayer) on the
-# path so the bare imports below resolve when run as a script.
-_V1 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, _V1)
-sys.path.insert(0, os.path.join(_V1, "selfplay"))
 
 from sb3_contrib import MaskablePPO
 
@@ -40,13 +31,13 @@ from search import SearchPlayer
 from opponent import ModelPlayer
 
 BATTLE_FORMAT = "gen9randombattle"
-REPLAY_DIR = "replays"          # where the watchable .html files are written (project root)
+REPLAY_DIR = "replays"          # where the .html replays are written (project root)
 
 OPPONENTS = {"heuristic": SimpleHeuristicsPlayer, "random": RandomPlayer}
 
 
 def build_agent(model, use_search):
-    """The agent to watch: the search wrapper (what we ship) or the bare policy (--raw)."""
+    """The agent to watch: the search wrapper (default) or the bare policy (--raw)."""
     if use_search:
         return SearchPlayer(
             model=model,
@@ -61,13 +52,13 @@ def build_agent(model, use_search):
 
 
 def save_replays(agent, opp_label):
-    """Write every battle the agent just played to a watchable .html and report each result."""
+    """Write each battle the agent just played to an .html replay and report the result."""
     os.makedirs(REPLAY_DIR, exist_ok=True)
     wins = 0
     for i, (tag, battle) in enumerate(agent.battles.items(), start=1):
         result = "WON " if battle.won else "lost"
         wins += 1 if battle.won else 0
-        # tag looks like "battle-gen9randombattle-NN"; it's already a safe filename.
+        # tag is like "battle-gen9randombattle-NN", already a safe filename.
         path = os.path.join(REPLAY_DIR, f"{tag}.html")
         agent.save_replay(tag, path)
         print(f"  Battle {i}: {result} in {battle.turn} turns  ->  {path}", flush=True)

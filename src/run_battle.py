@@ -1,12 +1,9 @@
-"""Run the heuristic bot against a baseline and report its win rate.
+"""Run the heuristic bot against a random baseline and report its win rate.
 
-Prerequisite: the local Showdown server must be running. In a separate
-terminal, from the `server/` folder, run:
-
+Prerequisite: the local Showdown server running. In a separate terminal, from `server/`:
     node pokemon-showdown start --no-security
 
-Then run this script:
-
+Then:
     python run_battle.py
 """
 
@@ -17,23 +14,20 @@ from poke_env.player import RandomPlayer
 
 from heuristic_bot import MaxDamagePlayer
 
-# How many battles to play. More = more reliable win-rate estimate.
+# More battles = more reliable win-rate estimate.
 N_BATTLES = 100
 
-# "Random battles" hand each side a random legal team, so we can test the bot
-# without building teams yet. gen9 = the current generation.
+# Random battles hand each side a random legal team, so we can test without building teams.
 BATTLE_FORMAT = "gen9randombattle"
 
 
 async def main():
-    # Our rule-based bot.
     heuristic = MaxDamagePlayer(
         account_configuration=AccountConfiguration("HeuristicBot", None),
         server_configuration=LocalhostServerConfiguration,
         battle_format=BATTLE_FORMAT,
     )
-    # The baseline: a bot that picks legal moves completely at random.
-    # If our heuristic is doing anything useful, it should crush this.
+    # Random legal moves. If the heuristic does anything useful, it should crush this.
     baseline = RandomPlayer(
         account_configuration=AccountConfiguration("RandomBot", None),
         server_configuration=LocalhostServerConfiguration,
