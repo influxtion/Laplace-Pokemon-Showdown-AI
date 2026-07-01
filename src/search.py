@@ -91,6 +91,12 @@ def _own_immune_types(mon):
     return {t} if t else None
 
 
+def _is_seeded(mon):
+    """True if Leech Seed is sapping this Pokemon. Switching out is the only cure (the seed
+    doesn't follow to the next mon)."""
+    return mon is not None and any(e.name == "LEECH_SEED" for e in mon.effects)
+
+
 class SearchPlayer(Player):
     """Scores every legal action with a 1-turn lookahead, using the policy as a prior."""
 
@@ -111,6 +117,13 @@ class SearchPlayer(Player):
     # offense -- bail on a mon whose moves are all resisted -- discounted since that damage only
     # lands next turn.
     SWITCH_OFFENSE_WEIGHT = 0.7
+    # Leech Seed drains our active ~1/8 HP a turn and heals the opponent; only switching cures
+    # it. When our active is seeded we nudge toward switching: a bonus on switches and a penalty
+    # on staying in -- unless staying lands a KO or a hit at least LEECH_SEED_STAY_DMG of max HP,
+    # where finishing the opponent beats running.
+    LEECH_SEED_SWITCH_BONUS = 0.35
+    LEECH_SEED_STAY_PENALTY = 0.35
+    LEECH_SEED_STAY_DMG = 0.5
 
     def __init__(self, model, **kwargs):
         super().__init__(**kwargs)
@@ -184,11 +197,12 @@ class SearchPlayer(Player):
 
     # --- the 1-turn lookahead score ----------------------------------------
 
-    def _move_score(self, me, move, opp, tera=False):
+    def _move_score(self, me, move, opp, tera=False, seeded=False):
         """Higher = better 1-turn exchange. Net HP swing (damage we deal minus the
         probability-weighted hit back), plus bonuses for who secures the KO given turn order, a
         penalty for self-stat-drops, and for tera actions the tera typing and a cost for
-        spending tera without a clear payoff."""
+        spending tera without a clear payoff. `seeded` penalizes staying in under Leech Seed
+        unless this move is a big hit."""
         if me is None or opp is None:
             return 0.0
         base_dmg = min(estimate_damage_fraction(me, move, opp), 1.0)
@@ -228,13 +242,18 @@ class SearchPlayer(Player):
             benefit = (dmg - base_dmg) + (base_incoming - incoming)
             if benefit <= self.TERA_MIN_BENEFIT:
                 score -= self.TERA_COST     # don't waste tera or tera into a weakness
+
+        # Seeded and this move isn't a KO or a big hit -> staying lets the seed keep draining.
+        if seeded and not (i_ko or dmg >= self.LEECH_SEED_STAY_DMG):
+            score -= self.LEECH_SEED_STAY_PENALTY
         return score
 
     @staticmethod
-    def _switch_score(mon, opp):
+    def _switch_score(mon, opp, seeded=False):
         """Score a switch by the matchup it gives us: the switch-in's best damage into the
         opponent (its moves are known, it's our bench) minus the hit it eats coming in and a flat
-        tempo cost. Lets the agent bail on a mon that can't hurt the opponent for one that can."""
+        tempo cost. Lets the agent bail on a mon that can't hurt the opponent for one that can.
+        `seeded` adds a bonus, since switching is what cures our active's Leech Seed."""
         if mon is None or opp is None:
             return 0.0
         moves = list(getattr(mon, "moves", {}).values())
@@ -249,15 +268,20 @@ class SearchPlayer(Player):
             eff = max((opp.damage_multiplier(t) for t in mon.types if t), default=1.0)
             best_offense = 0.25 * eff
         incoming = KNOWLEDGE.predicted_incoming(opp, mon, immune_types=_own_immune_types(mon))
-        return SearchPlayer.SWITCH_OFFENSE_WEIGHT * best_offense - 0.5 * incoming - 0.15
+        score = SearchPlayer.SWITCH_OFFENSE_WEIGHT * best_offense - 0.5 * incoming - 0.15
+        if seeded:
+            score += SearchPlayer.LEECH_SEED_SWITCH_BONUS   # switching clears the seed
+        return score
 
     def _action_score(self, action, battle, me, opp):
         order = SinglesEnv.action_to_order(np.int64(action), battle, strict=False)
         target = getattr(order, "order", None)
+        seeded = _is_seeded(me)
         if isinstance(target, Pokemon):
-            return self._switch_score(target, opp)
+            return self._switch_score(target, opp, seeded)
         if isinstance(target, Move):
-            return self._move_score(me, target, opp, tera=bool(getattr(order, "terastallize", False)))
+            return self._move_score(me, target, opp,
+                                    tera=bool(getattr(order, "terastallize", False)), seeded=seeded)
         return 0.0
 
     # --- decision -----------------------------------------------------------

@@ -28,6 +28,9 @@ from poke_env.player import RandomPlayer, SimpleHeuristicsPlayer
 
 from eval_search import pick_model_path
 from search import SearchPlayer
+from heuristic_search import HeuristicSearchPlayer
+from deep_search import DeepSearchPlayer
+from engine_search import EnginePlayer
 from opponent import ModelPlayer
 
 BATTLE_FORMAT = "gen9randombattle"
@@ -36,9 +39,28 @@ REPLAY_DIR = "replays"          # where the .html replays are written (project r
 OPPONENTS = {"heuristic": SimpleHeuristicsPlayer, "random": RandomPlayer}
 
 
-def build_agent(model, use_search):
-    """The agent to watch: the search wrapper (default) or the bare policy (--raw)."""
-    if use_search:
+def build_agent(model, agent, debug=False):
+    """The agent to watch: the poke-engine MCTS bot (--engine), the 1-ply searcher (default),
+    heuristic+ (--heuristic), the 2-ply deep searcher (--deep), or the bare policy (--raw)."""
+    if agent == "engine":
+        return EnginePlayer(
+            debug=debug,
+            account_configuration=AccountConfiguration.generate("enginebot", rand=True),
+            battle_format=BATTLE_FORMAT,
+        )
+    if agent == "deep":
+        return DeepSearchPlayer(
+            model=model, debug=debug,
+            account_configuration=AccountConfiguration.generate("deepbot", rand=True),
+            battle_format=BATTLE_FORMAT,
+        )
+    if agent == "heuristic":
+        return HeuristicSearchPlayer(
+            model=model, debug=debug,
+            account_configuration=AccountConfiguration.generate("heurbot", rand=True),
+            battle_format=BATTLE_FORMAT,
+        )
+    if agent == "search":
         return SearchPlayer(
             model=model,
             account_configuration=AccountConfiguration.generate("searchbot", rand=True),
@@ -73,17 +95,34 @@ async def main():
                         help="who to play against")
     parser.add_argument("--raw", action="store_true",
                         help="use the bare policy instead of the 1-ply search wrapper")
+    parser.add_argument("--heuristic", action="store_true",
+                        help="use heuristic+ (SearchPlayer + status/setup/hazard/recovery)")
+    parser.add_argument("--deep", action="store_true",
+                        help="use the 2-ply deep searcher (deep_search.py)")
+    parser.add_argument("--engine", action="store_true",
+                        help="use the poke-engine MCTS bot (engine_search.py)")
+    parser.add_argument("--debug", action="store_true",
+                        help="(engine/heuristic/deep only) print the top scored actions each turn")
     parser.add_argument("--model", default=None,
                         help="model .zip to load (default: best available, see eval_search)")
     args = parser.parse_args()
 
-    model_path = args.model or pick_model_path()
-    label = "raw policy" if args.raw else "search agent"
-    print(f"Loading {model_path} -> playing {args.battles} battle(s) as the {label} "
-          f"vs {args.opponent}.", flush=True)
-    model = MaskablePPO.load(model_path)
+    which = ("engine" if args.engine else "deep" if args.deep else "heuristic" if args.heuristic
+             else "raw" if args.raw else "search")
+    labels = {"engine": "poke-engine MCTS bot", "deep": "2-ply deep searcher",
+              "heuristic": "heuristic+ agent", "raw": "raw policy", "search": "search agent"}
+    # The engine agent is model-free; the others load a trained policy.
+    model = None
+    if which != "engine":
+        model_path = args.model or pick_model_path()
+        print(f"Loading {model_path} -> playing {args.battles} battle(s) as the {labels[which]} "
+              f"vs {args.opponent}.", flush=True)
+        model = MaskablePPO.load(model_path)
+    else:
+        print(f"Playing {args.battles} battle(s) as the {labels[which]} vs {args.opponent}.",
+              flush=True)
 
-    agent = build_agent(model, use_search=not args.raw)
+    agent = build_agent(model, which, debug=args.debug)
     opponent = OPPONENTS[args.opponent](
         account_configuration=AccountConfiguration.generate("opp", rand=True),
         battle_format=BATTLE_FORMAT,

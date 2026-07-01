@@ -55,7 +55,9 @@ runs measure over 200-400 battles.
 | 7 | **Rescaled-reward experiment** `ppo_v3_rescaled_obs215.zip` | no change | Divided every reward by 10 to test if reward scale capped the value network's fit. It didn't (the metric is scale-invariant). Ruled out reward scale; pointed at partial observability. |
 | 8 | **Self-play** `ppo_selfplay_obs215.zip`, `ppo_v3_selfplay_obs215.zip` (+ `_best_`) | ~43% | Trains against refreshed snapshots of itself instead of a fixed opponent. Hygiene held this time, but it didn't transfer to the benchmark: the ceiling wasn't "the opponent is too easy." |
 | 9 | **Reward-anneal + anti-panic-switch** `ppo_v3_anneal_obs215.zip` (+ `_best_`) | ~40% (no gain) | Warm-started v3 and annealed the dense shaping toward zero while holding the win bonus, plus a penalty for switching a different Pokemon two turns in a row. Ran to completion cleanly, but the raw win rate stayed flat -- confirming reward is not the lever either; the ceiling is partial observability + a reactive 1-turn policy. |
-| 10 | **Test-time search** `src/search.py` *(wraps a trained model)* | **~57% (about +17 over the raw policy)** | Not a new model: a 1-ply evaluator that scores *every* legal action with the damage model -- it understands type matchups, switching for an offensive advantage, Terastallization, and ability immunities -- using the trained policy only as a prior. The single biggest lever, and the agent we actually ship. |
+| 10 | **Test-time search** `src/search.py` *(wraps a trained model)* | **~55-62% (about +20 over the raw policy)** | Not a new model: a 1-ply evaluator that scores *every* legal action with the damage model -- it understands type matchups, switching for an offensive advantage, Terastallization, and ability immunities -- using the trained policy only as a prior. The biggest lever among the from-scratch agents, and the agent we shipped before the engine bot. |
+| 11 | **poke-engine MCTS** `src/engine_search.py` (+ `poke_engine_adapter.py`) | **~92% (37/40 vs heuristic)** | The strongest agent, following the Foul Play recipe. Instead of a hand-rolled simulator (the dead end in `deep_search.py`), it feeds the position into [`poke-engine`](https://github.com/pmariglia/poke-engine) -- a fast Rust battle engine with real MCTS -- and copes with the opponent's hidden set by *determinization*: sample several full opponent teams consistent with what's revealed (from the randbats sheet), search each, and pool the visit-weighted policies. Models KO probability, hazards, items, abilities, residuals, turn order and Tera correctly, and MCTS handles the simultaneous-move nature of a turn that plain minimax can't. ~0.9s/turn. Needs no trained model -- it searches the position directly. |
+| 12 | **Determinization overhaul** (same files) | **82% head-to-head vs #11** (79/96; still ~92% vs heuristic -- that yardstick is saturated) | Fixed a blind spot: 56% of randbats movepools exceed 4 moves, but the old adapter always gave the opponent the same first-4 truncation, so the search could never anticipate unrevealed moves late in the sheet order. Now each determinization *samples* a legal 4-move set around what's revealed. Added Choice-lock inference (a mon that committed to a move while holding a Choice item is locked to it; one that used 2+ moves since switching in can't hold Choice at all -- poke-engine doesn't enforce this itself, verified), correct `last_used_move` indices, and turned the real randbats item/ability/tera probabilities (`data_randbats_stats_gen9.json`) back on: with lock modeling they A/B at parity (was 39% without it), and only they let the search exploit locked opponents. |
 
 ## Lessons learned
 
@@ -84,6 +86,12 @@ pip install -r requirements.txt
 # 2. Clone and build the local Showdown server (large, a few minutes)
 git clone --depth 1 https://github.com/smogon/pokemon-showdown.git server
 cd server; npm install; cd ..
+
+# 3. Build poke-engine for Gen 9 (the engine bot's search). Needs a Rust toolchain
+#    (https://rustup.rs); on Windows without Visual Studio, install the GNU host with
+#    `rustup-init.exe --default-host x86_64-pc-windows-gnu` and have MinGW gcc on PATH.
+pip install -v --force-reinstall --no-cache-dir "poke-engine==0.0.47" \
+  --config-settings="build-args=--features poke-engine/terastallization --no-default-features"
 ```
 
 All packages live in `.venv`, not system Python. Either activate it once per terminal
@@ -143,7 +151,10 @@ reliable than trying to catch the bot-vs-bot game live, since it finishes in sec
 **4. Benchmark the test-time search** against the raw policy:
 
 ```powershell
-.\.venv\Scripts\python.exe -u src\eval_search.py
+.\.venv\Scripts\python.exe -u src\eval_search.py                  # raw / 1-ply / heuristic+ / deep
+.\.venv\Scripts\python.exe -u src\eval_engine.py                  # the poke-engine MCTS bot vs heuristic
+.\.venv\Scripts\python.exe -u src\eval_engine.py --vs-search      # engine head-to-head vs the 1-ply searcher
+.\.venv\Scripts\python.exe -u src\play.py --engine                # watch the engine bot (saves a replay)
 ```
 
 **5. Watch training (optional)** in a browser via TensorBoard:
@@ -193,6 +204,7 @@ The `.zip` files, `tb_logs/`, and `server/` are not committed (see `.gitignore`)
 | `src/train_v3_anneal.py` | Reward-anneal + anti-panic-switch finetune (KL / LR-decay / best-checkpoint hygiene). |
 | `src/train_v3_selfplay.py`, `src/train_v3_anneal_selfplay.py` | Self-play on the v3 / annealed agent ("Influxobot", the ladder bot). |
 | `src/search.py`, `src/eval_search.py` | Test-time 1-ply search player, and its benchmark vs the raw policy. |
+| `src/engine_search.py`, `src/poke_engine_adapter.py`, `src/eval_engine.py` | The strongest agent: a poke-engine MCTS bot, the poke-env→poke-engine state adapter + opponent determinization, and its benchmark. |
 | `src/play.py` | Plays a few watchable battles and saves them as browser replays (`replays/`). |
 | `src/smoke_test.py`, `src/smoke_parallel.py`, `src/smoke_selfplay.py` | Quick checks that the env / parallel training / self-play start cleanly. |
 | `experiments/v2_attention/` | The attention experiment (dead end): `rl_env_v2.py` (854-number obs), `team_net.py`, `train_v2.py`, `smoke_v2.py`. |

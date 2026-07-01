@@ -1,9 +1,12 @@
-r"""Benchmark the test-time search agent against the raw policy.
+r"""Benchmark the search agents against the raw policy.
 
-Runs the trained model two ways against SimpleHeuristicsPlayer and prints both win rates, to
-see whether the 1-ply lookahead helps:
+Runs three agents against SimpleHeuristicsPlayer over the same battle count and prints their
+win rates, to see how much search helps and which searcher is stronger:
   - raw policy     : the network's move, no search (opponent.ModelPlayer)
   - search (1-ply) : every action scored by the damage model (search.SearchPlayer)
+  - heuristic+     : SearchPlayer plus delayed-move fix and status/setup/hazard/recovery
+                     valuation (heuristic_search.HeuristicSearchPlayer)
+  - deep (2-ply)   : 2-turn search over a small forward simulator (deep_search.DeepSearchPlayer)
 
 Uses poke-env's battle_against. Loads the best available model (see pick_model_path).
 
@@ -21,10 +24,12 @@ from poke_env.player import SimpleHeuristicsPlayer
 
 from rl_env import N_FEATURES
 from search import SearchPlayer
+from heuristic_search import HeuristicSearchPlayer
+from deep_search import DeepSearchPlayer
 from opponent import ModelPlayer
 
 BATTLE_FORMAT = "gen9randombattle"
-N_BATTLES = 400
+N_BATTLES = 300
 
 
 def pick_model_path():
@@ -76,7 +81,29 @@ async def main():
     search_wr = await bench(searcher, "search", N_BATTLES)
     print(f"search (1-ply) vs heuristic: {search_wr:.0%}", flush=True)
 
-    print(f"\nlift from search: {(search_wr - raw_wr) * 100:+.0f} points", flush=True)
+    # SearchPlayer + the added heuristics. Same model/prior as SearchPlayer, so the delta is the
+    # new scoring, not a different base.
+    heur = HeuristicSearchPlayer(
+        model=model,
+        account_configuration=AccountConfiguration.generate("heurbot", rand=True),
+        battle_format=BATTLE_FORMAT,
+    )
+    heur_wr = await bench(heur, "heur", N_BATTLES)
+    print(f"heuristic+     vs heuristic: {heur_wr:.0%}", flush=True)
+
+    # 2-ply search over the forward simulator -- the depth lever.
+    deep = DeepSearchPlayer(
+        model=model,
+        account_configuration=AccountConfiguration.generate("deepbot", rand=True),
+        battle_format=BATTLE_FORMAT,
+    )
+    deep_wr = await bench(deep, "deep", N_BATTLES)
+    print(f"deep (2-ply)   vs heuristic: {deep_wr:.0%}", flush=True)
+
+    print(f"\nlift, search    vs raw:       {(search_wr - raw_wr) * 100:+.0f} points", flush=True)
+    print(f"lift, heuristic+ vs raw:      {(heur_wr - raw_wr) * 100:+.0f} points", flush=True)
+    print(f"lift, deep 2-ply vs raw:      {(deep_wr - raw_wr) * 100:+.0f} points", flush=True)
+    print(f"deep 2-ply vs search:         {(deep_wr - search_wr) * 100:+.0f} points", flush=True)
 
 
 if __name__ == "__main__":
