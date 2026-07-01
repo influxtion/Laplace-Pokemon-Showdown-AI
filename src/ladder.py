@@ -72,8 +72,10 @@ def build_agent(model, account, kind):
         # poke-engine needs no trained model; it searches the position directly. Ladder is one
         # game at a time on the official server, so we spend a generous per-turn budget (more
         # determinizations + threads than the throughput-tuned benchmark default) -- ~1-2s/turn,
-        # well within Showdown's move timer.
-        return EnginePlayer(n_determinizations=8, search_time_ms=150, threads=8, **kwargs)
+        # well within Showdown's move timer. record=True keeps per-turn decision traces, which
+        # get dumped next to the replay for post-hoc loss analysis.
+        return EnginePlayer(n_determinizations=8, search_time_ms=150, threads=8, record=True,
+                            **kwargs)
     if kind == "search":
         return SearchPlayer(model=model, **kwargs)
     return ModelPlayer(model=model, deterministic=True, **kwargs)
@@ -111,6 +113,14 @@ async def report_progress(agent, total, poll=3.0):
                     os.makedirs(os.path.join("replays", "ladder"), exist_ok=True)
                     rpath = os.path.join("replays", "ladder", f"{result.strip().lower()}-{tag}.html")
                     agent.save_replay(tag, rpath)
+                    # Per-turn decision traces (what the search considered), for loss analysis.
+                    traces = getattr(agent, "traces", {}).get(tag)
+                    if traces:
+                        import json
+                        tpath = os.path.join("replays", "ladder",
+                                             f"{result.strip().lower()}-{tag}.trace.json")
+                        with open(tpath, "w", encoding="utf-8") as f:
+                            json.dump(traces, f, indent=1)
                 except Exception:
                     pass
                 print(f"  Battle {len(finished)}/{total} {result} in {battle.turn} turns  "

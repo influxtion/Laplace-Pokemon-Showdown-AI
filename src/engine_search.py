@@ -79,8 +79,17 @@ class EnginePlayer(Player):
     # --- search -------------------------------------------------------------
 
     def _pooled_policy(self, battle):
-        """{move_choice: pooled visit share} over N determinized searches, or {} on failure."""
+        """Ranked {move_choice: score} over N determinized searches, or {} on failure.
+
+        Aggregation is a *robust vote*, not a plain average of visit shares. Averaging has a
+        known determinization pathology (observed live: Scale Shot clicked into a revealed
+        Fairy): when worlds disagree on the best move, a hedge move that is every world's
+        mediocre runner-up can top the pooled average despite being no world's best choice.
+        So a move is only eligible while some world made it the outright winner; rank
+        eligible moves by worlds won, then pooled visit share. Non-winning moves keep their
+        pooled share (scaled below every winner) purely as fallback order for legality."""
         pooled = {}
+        wins = {}
         runs = 0
         opp_used = self._opp_used_since_switch(battle)
         for _ in range(self.N_DETERMINIZATIONS):
@@ -95,12 +104,24 @@ class EnginePlayer(Player):
                 continue
             self.diag["det_runs"] += 1
             total = res.total_visits or 1
+            best = None
             for opt in res.side_one:
                 pooled[opt.move_choice] = pooled.get(opt.move_choice, 0.0) + opt.visits / total
+                if best is None or opt.visits > best.visits:
+                    best = opt
+            if best is not None:
+                wins[best.move_choice] = wins.get(best.move_choice, 0) + 1
             runs += 1
-        if runs:
-            pooled = {k: v / runs for k, v in pooled.items()}
-        return pooled
+        if not runs:
+            return {}
+        # Score: world-winners sort above everything by (wins, pooled share); the rest keep a
+        # small share-proportional score so the legality fallback still has a sane order.
+        scores = {}
+        for choice, share in pooled.items():
+            share /= runs
+            w = wins.get(choice, 0)
+            scores[choice] = (w * 10.0 + share) if w else share * 1e-3
+        return scores
 
     # --- mapping the engine's choice back to a poke-env order ----------------
 
