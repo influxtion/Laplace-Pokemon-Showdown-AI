@@ -48,7 +48,7 @@ class EnginePlayer(Player):
                  debug=False, record=False, use_stats=True, speed_inference=True,
                  value_model_path=None, value_worlds=4, value_opp_moves=2,
                  value_margin=11.0, value_on_force_switch=False, value_boost_margin=0.0,
-                 tera_min_wins=1, **kwargs):
+                 tera_min_wins=2, **kwargs):
         super().__init__(*args, **kwargs)
         if n_determinizations is not None:
             self.N_DETERMINIZATIONS = n_determinizations
@@ -94,6 +94,7 @@ class EnginePlayer(Player):
         # on mons that die within a turn in 48% of tera-losses (vs 12% of tera-wins). A
         # single world's tactical line shouldn't spend the resource: '-tera' choices need
         # this many world-wins in the robust vote (ordinary moves need one).
+        # Default 2 A/B'd at 60.0% (36/60) vs 1.
         self.tera_min_wins = tera_min_wins
         if value_model_path:
             self._load_value_model(value_model_path)
