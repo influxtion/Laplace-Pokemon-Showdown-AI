@@ -467,9 +467,9 @@ def _boosts(mon):
 
 
 # poke-env Effect name -> poke-engine volatile-status string. Curated to persistent effects that
-# change the value of a position (chip, passive heal, trap, immunity); deliberately excludes the
-# duration-tracked ones (encore/taunt/yawn/confusion) -- the engine panics if their bookkeeping
-# (e.g. encore needs a real last_used_move) is inconsistent, and we don't reconstruct it.
+# change the value of a position (chip, passive heal, trap, immunity). Taunt/Encore are handled
+# separately below because the engine also needs their duration counters (and Encore has a hard
+# consistency invariant); yawn/confusion stay excluded for now.
 _VOLATILE_MAP = {
     "SUBSTITUTE": "substitute", "LEECH_SEED": "leechseed", "SALT_CURE": "saltcure",
     "CURSE": "curse", "AQUA_RING": "aquaring", "INGRAIN": "ingrain", "MAGNET_RISE": "magnetrise",
@@ -481,6 +481,26 @@ _VOLATILE_MAP = {
 
 def _volatile_set(mon):
     return {s for e in mon.effects if (s := _VOLATILE_MAP.get(e.name))}
+
+
+def _duration_volatiles(mon, last_used):
+    """(extra volatiles, VolatileStatusDurations) for Taunt/Encore on the active mon.
+
+    poke-env keeps a turns-elapsed counter for both (end_turn increments turn-countable
+    effects), and poke-engine's durations count up the same way, expiring at 3 -- so the
+    counter passes through, clamped so a stale count can't make the engine expire it on
+    the wrong side of a turn. HARD INVARIANT (verified: the engine panics otherwise):
+    'encore' may only be set when last_used_move is a real 'move:<i>'."""
+    vols = set()
+    kw = {}
+    for e, count in mon.effects.items():
+        if e.name == "TAUNT":
+            vols.add("taunt")
+            kw["taunt"] = max(0, min(int(count), 2))
+        elif e.name == "ENCORE" and last_used.startswith("move:") and last_used != "move:none":
+            vols.add("encore")
+            kw["encore"] = max(0, min(int(count), 2))
+    return vols, VolatileStatusDurations(**kw)
 
 
 def _sub_health(mon, maxhp):
@@ -511,12 +531,14 @@ def _our_side(battle, pending=None):
     while len(pkmn) < 6:
         pkmn.append(_dummy())
     wish, fs = _delayed(pending, battle.player_role or "p1", battle.turn)
+    last_used = _last_used_str(active, active_moves)
+    dur_vols, durations = _duration_volatiles(active, last_used)
     return Side(
         pokemon=pkmn[:6], side_conditions=_side_conditions(battle.side_conditions, battle.turn),
-        active_index="0", volatile_status_durations=VolatileStatusDurations(),
-        wish=wish, future_sight=fs, volatile_statuses=_volatile_set(active),
+        active_index="0", volatile_status_durations=durations,
+        wish=wish, future_sight=fs, volatile_statuses=_volatile_set(active) | dur_vols,
         substitute_health=_sub_health(active, _maxhp(active, own=True)),
-        last_used_move=_last_used_str(active, active_moves),
+        last_used_move=last_used,
         switch_out_move_second_saved_move="none",
         force_switch=bool(getattr(battle, "force_switch", False)),
         force_trapped=bool(getattr(battle, "trapped", False)),
@@ -546,13 +568,15 @@ def _opp_side(battle, use_stats=True, opp_used_since_switch=None, opp_speed_hint
         pkmn.append(_sampled_unrevealed_pokemon(sp, use_stats))
     opp_role = "p2" if (battle.player_role or "p1") == "p1" else "p1"
     wish, fs = _delayed(pending, opp_role, battle.turn)
+    last_used = _last_used_str(active, active_pe.moves)
+    dur_vols, durations = _duration_volatiles(active, last_used)
     return Side(
         pokemon=pkmn[:6],
         side_conditions=_side_conditions(battle.opponent_side_conditions, battle.turn),
-        active_index="0", volatile_status_durations=VolatileStatusDurations(),
-        wish=wish, future_sight=fs, volatile_statuses=_volatile_set(active),
+        active_index="0", volatile_status_durations=durations,
+        wish=wish, future_sight=fs, volatile_statuses=_volatile_set(active) | dur_vols,
         substitute_health=_sub_health(active, _maxhp(active, own=False)),
-        last_used_move=_last_used_str(active, active_pe.moves),
+        last_used_move=last_used,
         switch_out_move_second_saved_move="none",
         **_boosts(active),
     )
