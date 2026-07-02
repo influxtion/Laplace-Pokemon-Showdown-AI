@@ -74,7 +74,12 @@ def build_agent(model, account, kind):
         # determinizations + threads than the throughput-tuned benchmark default) -- ~1-2s/turn,
         # well within Showdown's move timer. record=True keeps per-turn decision traces, which
         # get dumped next to the replay for post-hoc loss analysis.
+        # The learned value head re-ranks near-tied root candidates (fixes the engine eval's
+        # blindness to opponent setup / wasted turns); it ships whenever the trained net exists.
+        value_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                  "models", "value_net.pt")
         return EnginePlayer(n_determinizations=8, search_time_ms=150, threads=8, record=True,
+                            value_model_path=value_path if os.path.exists(value_path) else None,
                             **kwargs)
     if kind == "search":
         return SearchPlayer(model=model, **kwargs)

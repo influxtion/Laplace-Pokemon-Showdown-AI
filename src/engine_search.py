@@ -21,7 +21,7 @@ import numpy as np
 from poke_env.player import Player
 from poke_env.data import to_id_str
 
-from poke_engine import monte_carlo_tree_search
+from poke_engine import monte_carlo_tree_search, generate_instructions
 
 from knowledge import estimate_damage_fraction, get_move, safe_priority, _estimate_stat
 from poke_engine_adapter import build_state
@@ -45,7 +45,9 @@ class EnginePlayer(Player):
     # unrevealed Choice items and exploit locked opponents -- so it ships on. Flip to False to
     # revert to the role-based item guess.
     def __init__(self, *args, n_determinizations=None, search_time_ms=None, threads=None,
-                 debug=False, record=False, use_stats=True, speed_inference=True, **kwargs):
+                 debug=False, record=False, use_stats=True, speed_inference=True,
+                 value_model_path=None, value_worlds=4, value_opp_moves=2,
+                 value_margin=11.0, **kwargs):
         super().__init__(*args, **kwargs)
         if n_determinizations is not None:
             self.N_DETERMINIZATIONS = n_determinizations
@@ -75,6 +77,28 @@ class EnginePlayer(Player):
         # battle_tag -> pending delayed effects: '<side>_wish' -> (lands_on_turn, heal_amount),
         # '<side>_fs' -> hits_at_end_of_turn. Sides are 'p1'/'p2' as on the protocol.
         self._pending = {}
+        # Learned value head (Track A). The engine's MCTS leaf eval under-fears opponent
+        # setup (observed: a guaranteed-fail Substitute scored 0.478 vs 0.480 for the best
+        # move against a +3/+3/+3 sweeper), so near-tied root candidates are re-ranked by
+        # rolling each one ply with generate_instructions and scoring the successor states
+        # with a net trained on self-play outcomes (train_value.py / value_features.py).
+        self._value_model = None
+        self._worlds = []            # [(determinized state, MctsResult)] from the last turn
+        self.value_worlds = value_worlds
+        self.value_opp_moves = value_opp_moves
+        self.value_margin = value_margin
+        if value_model_path:
+            self._load_value_model(value_model_path)
+
+    def _load_value_model(self, path):
+        import torch
+        from train_value import ValueNet
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        net = ValueNet(ckpt["n_in"])
+        net.load_state_dict(ckpt["state_dict"])
+        net.eval()
+        torch.set_num_threads(1)     # tiny net; don't fight the engine threads
+        self._value_model = net
 
     # --- speed inference from turn order --------------------------------------
 
@@ -204,6 +228,7 @@ class EnginePlayer(Player):
         pooled = {}
         wins = {}
         runs = 0
+        self._worlds = []
         opp_used = self._opp_used_since_switch(battle)
         speed_hints = self._opp_speed.get(battle.battle_tag, {})
         for _ in range(self.N_DETERMINIZATIONS):
@@ -219,6 +244,7 @@ class EnginePlayer(Player):
                 self.diag["det_fail"] += 1
                 continue
             self.diag["det_runs"] += 1
+            self._worlds.append((state, res))
             total = res.total_visits or 1
             best = None
             for opt in res.side_one:
@@ -271,6 +297,7 @@ class EnginePlayer(Player):
                 self.diag["empty_pooled"] += 1
             ranked = sorted(pooled.items(), key=lambda kv: kv[1], reverse=True)
             ranked = self._damage_tiebreak(battle, ranked)
+            ranked = self._value_rerank(ranked)
             for choice, _share in ranked:
                 order = self._order_for_choice(choice, battle)
                 if order is not None:
@@ -288,6 +315,82 @@ class EnginePlayer(Player):
         except Exception:
             self.diag["fallback"] += 1
             return self.choose_random_move(battle)
+
+    # --- learned value re-ranking ---------------------------------------------
+
+    @staticmethod
+    def _engine_choice(choice):
+        """Root move_choice string -> the string generate_instructions accepts
+        ('switch <species>' becomes the bare species name; moves/-tera pass through)."""
+        return choice.split(" ", 1)[1] if choice.startswith("switch ") else choice
+
+    def _value_rerank(self, ranked):
+        """Re-rank near-tied world-winning candidates by learned state value.
+
+        For each candidate: roll it one ply forward in up to `value_worlds` determinized
+        worlds against the opponent's top MCTS replies (visit-weighted), featurize every
+        chance branch of the successor states, and average the value net's win
+        probabilities. The search's own ordering stands unless the value net prefers a
+        different near-tied candidate. `value_margin` is in robust-vote score units where
+        one world-win = 10 (+ up to 1 of pooled share), so the default of 11 only lets the
+        net overturn candidates within one world-win of the leader -- the search stays in
+        charge of clear decisions."""
+        if self._value_model is None or len(ranked) < 2 or not self._worlds:
+            return ranked
+        top_score = ranked[0][1]
+        if top_score < 10.0:      # top choice won no world: nothing trustworthy to rerank
+            return ranked
+        tied = [c for c, s in ranked if s >= 10.0 and top_score - s <= self.value_margin]
+        if len(tied) < 2:
+            return ranked
+        tied = tied[:3]
+        try:
+            feats, owners, weights = [], [], []
+            from value_features import featurize
+            for state, res in self._worlds[:self.value_worlds]:
+                opp = sorted(res.side_two, key=lambda o: -o.visits)[:self.value_opp_moves]
+                opp = [o for o in opp if o.visits > 0]
+                opp_total = sum(o.visits for o in opp) or 1
+                for cand_i, cand in enumerate(tied):
+                    for o in opp:
+                        try:
+                            branches = generate_instructions(
+                                state, self._engine_choice(cand),
+                                self._engine_choice(o.move_choice))
+                        except Exception:
+                            continue
+                        for si in branches:
+                            w = (o.visits / opp_total) * (si.percentage / 100.0)
+                            if w <= 0.0:
+                                continue
+                            feats.append(featurize(state.apply_instructions(si)))
+                            owners.append(cand_i)
+                            weights.append(w)
+            if not feats:
+                return ranked
+            import numpy as _np
+            import torch
+            with torch.no_grad():
+                probs = torch.sigmoid(
+                    self._value_model(torch.from_numpy(_np.stack(feats)))).numpy()
+            num = _np.zeros(len(tied))
+            den = _np.zeros(len(tied))
+            for i, w, p in zip(owners, weights, probs):
+                num[i] += w * p
+                den[i] += w
+            valued = [(c, float(num[i] / den[i])) for i, c in enumerate(tied) if den[i] > 0]
+            if not valued:
+                return ranked
+            valued.sort(key=lambda cv: cv[1], reverse=True)
+            if valued[0][0] != ranked[0][0]:
+                self.diag["value_rerank"] = self.diag.get("value_rerank", 0) + 1
+            order = [c for c, _v in valued]
+            rest = [rc for rc in ranked if rc[0] not in set(order)]
+            scores = dict(ranked)
+            return [(c, scores[c]) for c in order] + rest
+        except Exception:
+            self.diag["value_err"] = self.diag.get("value_err", 0) + 1
+            return ranked
 
     def _damage_tiebreak(self, battle, ranked, eps=0.15):
         """Among effectively-tied top choices, prefer the one that actually damages the
