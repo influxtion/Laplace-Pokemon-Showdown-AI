@@ -48,7 +48,7 @@ class EnginePlayer(Player):
                  debug=False, record=False, use_stats=True, speed_inference=True,
                  value_model_path=None, value_worlds=4, value_opp_moves=2,
                  value_margin=11.0, value_on_force_switch=False, value_boost_margin=0.0,
-                 **kwargs):
+                 tera_min_wins=1, **kwargs):
         super().__init__(*args, **kwargs)
         if n_determinizations is not None:
             self.N_DETERMINIZATIONS = n_determinizations
@@ -90,6 +90,11 @@ class EnginePlayer(Player):
         self.value_margin = value_margin
         self.value_on_force_switch = value_on_force_switch
         self.value_boost_margin = value_boost_margin
+        # Terastallizing is once-per-game and irreversible; replay mining showed it burned
+        # on mons that die within a turn in 48% of tera-losses (vs 12% of tera-wins). A
+        # single world's tactical line shouldn't spend the resource: '-tera' choices need
+        # this many world-wins in the robust vote (ordinary moves need one).
+        self.tera_min_wins = tera_min_wins
         if value_model_path:
             self._load_value_model(value_model_path)
 
@@ -262,11 +267,14 @@ class EnginePlayer(Player):
             return {}
         # Score: world-winners sort above everything by (wins, pooled share); the rest keep a
         # small share-proportional score so the legality fallback still has a sane order.
+        # '-tera' choices are held to tera_min_wins (see __init__) -- below that they score
+        # like non-winners, so the plain version of the move outranks them.
         scores = {}
         for choice, share in pooled.items():
             share /= runs
             w = wins.get(choice, 0)
-            scores[choice] = (w * 10.0 + share) if w else share * 1e-3
+            needed = self.tera_min_wins if choice.endswith("-tera") else 1
+            scores[choice] = (w * 10.0 + share) if w >= needed else share * 1e-3
         return scores
 
     # --- mapping the engine's choice back to a poke-env order ----------------

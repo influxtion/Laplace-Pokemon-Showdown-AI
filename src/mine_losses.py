@@ -11,6 +11,10 @@ search considered each turn), then run this to cluster losses into failure class
   * opp_boosted    -- the opponent's active reached a net +3 or more boost stages
                       (the setup-snowball signature: we let something set up)
   * slept_hit      -- turns we spent asleep while taking damage (Rest-loop cost)
+  * tera_wasted    -- our Terastallized mon fainted within 2 turns of tera without a
+                      single opponent faint in between (burned the once-per-game
+                      resource for nothing; 48% of tera-losses vs 12% of tera-wins
+                      when first measured, 2026-07-02)
 
 Signatures are heuristics for *where to look*, not verdicts -- open the replay/trace for
 any flagged turn before calling it a bug. Wins are mined too, as a control: a signature
@@ -48,13 +52,15 @@ def mine_game(lines, me):
     """Signature counts for one game, from the bot's (side `me`) perspective."""
     opp = "p2" if me == "p1" else "p1"
     sig = {"immune_click": [], "fail_click": [], "died_no_act": [],
-           "opp_boosted": [], "slept_hit": []}
+           "opp_boosted": [], "slept_hit": [], "tera_wasted": []}
     turn = 0
     opp_boosts = {}
     opp_boost_flagged = False
     acted_this_turn = False      # our active moved or was switched this turn
     our_last_move_line = -1
     slept_this_turn = False
+    tera_turn = tera_mon = None  # our first Terastallization
+    opp_faints_since_tera = 0
 
     def mine_prefix(s):
         return s.startswith(f"{me}a:")
@@ -99,10 +105,20 @@ def mine_game(lines, me):
             if net >= 3 and not opp_boost_flagged:
                 sig["opp_boosted"].append(turn)
                 opp_boost_flagged = True
-        elif tag == "faint" and len(p) > 2 and mine_prefix(p[2]):
-            sig.setdefault("_faints", []).append(turn)
-            if not acted_this_turn and turn > 0:
-                sig["died_no_act"].append(turn)
+        elif tag == "-terastallize" and len(p) > 2 and mine_prefix(p[2]) and tera_turn is None:
+            tera_turn = turn
+            tera_mon = p[2].split(":")[-1].strip()
+        elif tag == "faint" and len(p) > 2:
+            if opp_prefix(p[2]) and tera_turn is not None:
+                opp_faints_since_tera += 1
+            if mine_prefix(p[2]):
+                sig.setdefault("_faints", []).append(turn)
+                if not acted_this_turn and turn > 0:
+                    sig["died_no_act"].append(turn)
+                if (tera_mon is not None and p[2].split(":")[-1].strip() == tera_mon
+                        and turn - tera_turn <= 2 and opp_faints_since_tera == 0):
+                    sig["tera_wasted"].append(turn)
+                    tera_mon = None      # count once
     return sig
 
 
