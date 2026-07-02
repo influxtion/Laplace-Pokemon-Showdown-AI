@@ -311,16 +311,21 @@ def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None):
     used_since_switch: move ids this mon has used since it last switched in (active mon only) --
     2+ distinct moves rules out a Choice item, 1 move + a Choice item means it's locked."""
     species = to_id_str(mon.species)
+    # Formes that appear mid-battle (Mimikyu-Busted, Ogerpon-*-Tera, etc.) aren't keys in the
+    # randbats sheet/stats feed; fall back to the base species so we still get real sets.
+    # (Observed live: mimikyubusted missed the sheet, got the no-set fallback with a 'typeless'
+    # tera, and the engine's opponent-tera branches then erased its Ghost immunity.)
+    sheet_id = species if species in SETS.by_species else to_id_str(mon.base_species)
     revealed = list(mon.moves.keys())
     # A mon that used two different moves without leaving the field can't be Choice-locked.
     multi_moved = bool(used_since_switch) and len(used_since_switch) >= 2
-    s = SETS.sample_set(species, revealed)
+    s = SETS.sample_set(sheet_id, revealed)
     if s is not None:
         role = s.get("role", "")
-        st_item = STATS.item(species, role, exclude=_CHOICE_ITEMS if multi_moved else ()) \
+        st_item = STATS.item(sheet_id, role, exclude=_CHOICE_ITEMS if multi_moved else ()) \
             if use_stats else None
-        st_ability = STATS.ability(species, role) if use_stats else None
-        st_tera = STATS.tera(species, role) if use_stats else None
+        st_ability = STATS.ability(sheet_id, role) if use_stats else None
+        st_tera = STATS.tera(sheet_id, role) if use_stats else None
         move_ids = SETS.sample_moves(revealed, s["moves"])
         ability = (to_id_str(mon.ability) if mon.ability
                    else st_ability or (random.choice(s["abilities"]) if s["abilities"] else "none"))
@@ -331,7 +336,10 @@ def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None):
     else:
         move_ids = revealed
         ability = to_id_str(mon.ability) if mon.ability else "none"
-        tera = mon.tera_type.name.lower() if getattr(mon, "tera_type", None) else "typeless"
+        # Never guess 'typeless' tera: the engine explores opponent-tera branches, and a
+        # typeless tera strips the mon's real typing (and its immunities) in those lines.
+        tera = (mon.tera_type.name.lower() if getattr(mon, "tera_type", None)
+                else _types_tuple(mon)[0])
         item = to_id_str(mon.item) if mon.item else "heavydutyboots"
 
     # Choice lock: if this world's item is a Choice item (or the ability is Gorilla Tactics) and

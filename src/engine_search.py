@@ -23,6 +23,7 @@ from poke_env.data import to_id_str
 
 from poke_engine import monte_carlo_tree_search
 
+from knowledge import estimate_damage_fraction
 from poke_engine_adapter import build_state
 
 
@@ -153,7 +154,9 @@ class EnginePlayer(Player):
             pooled = self._pooled_policy(battle)
             if not pooled:
                 self.diag["empty_pooled"] += 1
-            for choice, _share in sorted(pooled.items(), key=lambda kv: kv[1], reverse=True):
+            ranked = sorted(pooled.items(), key=lambda kv: kv[1], reverse=True)
+            ranked = self._damage_tiebreak(battle, ranked)
+            for choice, _share in ranked:
                 order = self._order_for_choice(choice, battle)
                 if order is not None:
                     if self.debug:
@@ -170,6 +173,36 @@ class EnginePlayer(Player):
         except Exception:
             self.diag["fallback"] += 1
             return self.choose_random_move(battle)
+
+    def _damage_tiebreak(self, battle, ranked, eps=0.15):
+        """Among effectively-tied top choices, prefer the one that actually damages the
+        *revealed* current opponent. Observed live: Close Combat and Brave Bird each won 3
+        worlds with identical pooled shares vs a Ghost-type, and the coin flip landed on the
+        immune move. Determinization noise can't distinguish exact ties; a one-shot damage
+        estimate against the known opponent can. Switches in the tie keep their position
+        relative to each other but rank below any move that deals damage."""
+        if len(ranked) < 2 or ranked[0][1] - ranked[1][1] >= eps:
+            return ranked
+        me, opp = battle.active_pokemon, battle.opponent_active_pokemon
+        if me is None or opp is None:
+            return ranked
+        top = ranked[0][1]
+        tied = [rc for rc in ranked if top - rc[1] < eps]
+
+        def dmg(choice):
+            if choice.startswith("switch "):
+                return -1.0
+            move_id = choice[:-5] if choice.endswith("-tera") else choice
+            for mv in battle.available_moves:
+                if mv.id == move_id:
+                    try:
+                        return float(estimate_damage_fraction(me, mv, opp))
+                    except Exception:
+                        return 0.0
+            return -1.0
+
+        tied.sort(key=lambda rc: dmg(rc[0]), reverse=True)
+        return tied + ranked[len(tied):]
 
     def _record(self, battle, pooled, choice, fallback):
         """Append a per-turn decision snapshot for post-hoc loss analysis (record=True)."""
