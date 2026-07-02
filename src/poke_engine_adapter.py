@@ -428,11 +428,14 @@ def _remaining(start_turn, now, base, extended):
     return max(1, left)
 
 
-def _side_conditions(sc, now):
+def _side_conditions(sc, now, protect=0):
     """poke-env side_conditions dict -> engine SideConditions. Hazards carry layer counts;
     timed conditions (screens/tailwind) carry real turns-remaining derived from the start
     turn poke-env records (they used to be hard-coded as freshly set, so a Reflect about to
-    expire looked 5 turns strong)."""
+    expire looked 5 turns strong). `protect` is the active mon's consecutive-protect count
+    (poke-env mon.protect_counter): the engine halves... rather, cubes the success odds per
+    consecutive use (verified: 100%/33%/11%), but only if it's told -- it was always 0, so
+    back-to-back Protects looked guaranteed (7 failed Protects mined in one 30-game run)."""
     layers = {}
     starts = {}
     for cond, value in sc.items():
@@ -456,6 +459,7 @@ def _side_conditions(sc, now):
         aurora_veil=timed("AURORA_VEIL", 5, 8),
         safeguard=timed("SAFEGUARD", 5),
         mist=timed("MIST", 5),
+        protect=max(0, int(protect)),
     )
 
 
@@ -534,7 +538,9 @@ def _our_side(battle, pending=None):
     last_used = _last_used_str(active, active_moves)
     dur_vols, durations = _duration_volatiles(active, last_used)
     return Side(
-        pokemon=pkmn[:6], side_conditions=_side_conditions(battle.side_conditions, battle.turn),
+        pokemon=pkmn[:6],
+        side_conditions=_side_conditions(battle.side_conditions, battle.turn,
+                                         protect=getattr(active, "protect_counter", 0)),
         active_index="0", volatile_status_durations=durations,
         wish=wish, future_sight=fs, volatile_statuses=_volatile_set(active) | dur_vols,
         substitute_health=_sub_health(active, _maxhp(active, own=True)),
@@ -572,7 +578,8 @@ def _opp_side(battle, use_stats=True, opp_used_since_switch=None, opp_speed_hint
     dur_vols, durations = _duration_volatiles(active, last_used)
     return Side(
         pokemon=pkmn[:6],
-        side_conditions=_side_conditions(battle.opponent_side_conditions, battle.turn),
+        side_conditions=_side_conditions(battle.opponent_side_conditions, battle.turn,
+                                         protect=getattr(active, "protect_counter", 0)),
         active_index="0", volatile_status_durations=durations,
         wish=wish, future_sight=fs, volatile_statuses=_volatile_set(active) | dur_vols,
         substitute_health=_sub_health(active, _maxhp(active, own=False)),

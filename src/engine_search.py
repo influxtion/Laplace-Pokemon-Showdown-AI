@@ -48,7 +48,7 @@ class EnginePlayer(Player):
                  debug=False, record=False, use_stats=True, speed_inference=True,
                  value_model_path=None, value_worlds=4, value_opp_moves=2,
                  value_margin=11.0, value_on_force_switch=False, value_boost_margin=0.0,
-                 tera_min_wins=2, **kwargs):
+                 tera_min_wins=1, **kwargs):
         super().__init__(*args, **kwargs)
         if n_determinizations is not None:
             self.N_DETERMINIZATIONS = n_determinizations
@@ -94,7 +94,10 @@ class EnginePlayer(Player):
         # on mons that die within a turn in 48% of tera-losses (vs 12% of tera-wins). A
         # single world's tactical line shouldn't spend the resource: '-tera' choices need
         # this many world-wins in the robust vote (ordinary moves need one).
-        # Default 2 A/B'd at 60.0% (36/60) vs 1.
+        # HISTORY: default 2 A/B'd at 60.0%/60 in mirror but went 17W-23L (42.5%) over 40
+        # ladder games vs 64% for the pre-gate build -- humans tera aggressively and the
+        # mirror can't price the tempo lost by holding tera in tera-races. Reverted to 1
+        # (2026-07-02); the knob stays for future study at higher determinization counts.
         self.tera_min_wins = tera_min_wins
         if value_model_path:
             self._load_value_model(value_model_path)
@@ -311,6 +314,7 @@ class EnginePlayer(Player):
             ranked = sorted(pooled.items(), key=lambda kv: kv[1], reverse=True)
             ranked = self._damage_tiebreak(battle, ranked)
             ranked = self._value_rerank(ranked, battle)
+            ranked = self._noop_demote(ranked)
             for choice, _share in ranked:
                 order = self._order_for_choice(choice, battle)
                 if order is not None:
@@ -428,6 +432,58 @@ class EnginePlayer(Player):
         except Exception:
             self.diag["value_err"] = self.diag.get("value_err", 0) + 1
             return ranked
+
+    def _successor_sig(self, state, our_choice, opp_choice):
+        """Sorted (probability, state-string) branch signature of one joint move pair."""
+        sig = []
+        for b in generate_instructions(state, our_choice, opp_choice):
+            ns = state.apply_instructions(b)
+            sig.append((round(b.percentage, 1), ns.to_string()))
+        return sorted(sig)
+
+    def _noop_demote(self, ranked):
+        """Demote guaranteed-wasted-turn moves below every choice that does something.
+
+        Mined from live losses (full-HP Slack Off x5, Stealth Rock onto existing rocks x3
+        in one 30-game run): the engine models these fails correctly, but its flat eval
+        keeps clicking them, and the value net only argues on near-ties. Deterministic
+        check, no model needed: a candidate is a no-op when, against the opponent's top
+        predicted reply, every chance branch of the successor equals the branch you get by
+        doing NOTHING ('none'). Rolling against the real reply (not 'none' as the
+        candidate's partner) keeps context-dependent moves honest -- Sucker Punch vs an
+        attacker differs from passing, so it survives; vs a status click it genuinely is
+        a pass and gets demoted. Switches never match the pass-turn baseline, so they are
+        checked but effectively always kept."""
+        if len(ranked) < 2 or not self._worlds or ranked[0][1] < 10.0:
+            return ranked
+        winners = [c for c, s in ranked if s >= 10.0][:3]
+        if len(winners) < 2:
+            return ranked
+        state, res = self._worlds[0]
+        opp = max(res.side_two, key=lambda o: o.visits, default=None)
+        if opp is None:
+            return ranked
+        opp_choice = self._engine_choice(opp.move_choice)
+        try:
+            baseline = self._successor_sig(state, "none", opp_choice)
+        except Exception:
+            self.diag["noop_err"] = self.diag.get("noop_err", 0) + 1
+            return ranked
+        noops = set()
+        for c in winners:
+            try:
+                if self._successor_sig(state, self._engine_choice(c), opp_choice) == baseline:
+                    noops.add(c)
+            except Exception:
+                self.diag["noop_err"] = self.diag.get("noop_err", 0) + 1
+        if not noops or len(noops) == len(winners):
+            return ranked
+        if ranked[0][0] in noops:
+            self.diag["noop_demote"] = self.diag.get("noop_demote", 0) + 1
+        scores = dict(ranked)
+        order = [c for c in winners if c not in noops] + [c for c in winners if c in noops]
+        rest = [rc for rc in ranked if rc[0] not in set(winners)]
+        return [(c, scores[c]) for c in order] + rest
 
     def _damage_tiebreak(self, battle, ranked, eps=0.15):
         """Among effectively-tied top choices, prefer the one that actually damages the
