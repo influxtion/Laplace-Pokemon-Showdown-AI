@@ -100,6 +100,7 @@ def mine_game(lines, me):
                 sig["opp_boosted"].append(turn)
                 opp_boost_flagged = True
         elif tag == "faint" and len(p) > 2 and mine_prefix(p[2]):
+            sig.setdefault("_faints", []).append(turn)
             if not acted_this_turn and turn > 0:
                 sig["died_no_act"].append(turn)
     return sig
@@ -132,6 +133,8 @@ def main():
             continue
         counts[result] += 1
         sig = mine_game(lines, me)
+        faints = len(sig.pop("_faints", []))
+        totals[result]["_faints"] = totals[result].get("_faints", 0) + faints
         flagged = {k: v for k, v in sig.items() if v}
         for k, v in flagged.items():
             totals[result][k] = totals[result].get(k, 0) + len(v)
@@ -145,12 +148,21 @@ def main():
 
     print(f"\n=== signature rate per game (losses n={counts['lost']} "
           f"vs wins n={counts['won']}) ===")
+    lf = totals["lost"].pop("_faints", 0)
+    wf = totals["won"].pop("_faints", 0)
     keys = sorted(set(totals["lost"]) | set(totals["won"]))
     for k in keys:
         l = totals["lost"].get(k, 0) / max(counts["lost"], 1)
         w = totals["won"].get(k, 0) / max(counts["won"], 1)
         marker = "  <-- loss-correlated" if l > 2 * w and l > 0.3 else ""
         print(f"  {k:14s} losses {l:4.2f}/game   wins {w:4.2f}/game{marker}")
+    # died_no_act is confounded by faint count (losses have ~6 by definition); the per-faint
+    # rate is the honest comparison for it.
+    if lf and wf:
+        l = totals["lost"].get("died_no_act", 0) / lf
+        w = totals["won"].get("died_no_act", 0) / wf
+        print(f"  died_no_act per faint: losses {l:.2f}   wins {w:.2f}"
+              f"{'   <-- loss-correlated' if l > 1.5 * w else '   (mostly faint-count artifact)'}")
 
 
 if __name__ == "__main__":

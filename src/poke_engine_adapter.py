@@ -305,11 +305,13 @@ def _own_pokemon(mon, moves_override=None):
     )
 
 
-def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None):
+def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None, speed_hint=None):
     """Build an engine Pokemon for a revealed opponent mon, sampling its hidden set.
     use_stats toggles the real randbats item/ability/tera feed (for A/B testing it).
     used_since_switch: move ids this mon has used since it last switched in (active mon only) --
-    2+ distinct moves rules out a Choice item, 1 move + a Choice item means it's locked."""
+    2+ distinct moves rules out a Choice item, 1 move + a Choice item means it's locked.
+    speed_hint: 'scarf'/'noscarf' verdict from observed turn order (randbats speed spreads are
+    fixed, so outspeeding its known raw speed means Scarf) -- overrides item sampling."""
     species = to_id_str(mon.species)
     # Formes that appear mid-battle (Mimikyu-Busted, Ogerpon-*-Tera, etc.) aren't keys in the
     # randbats sheet/stats feed; fall back to the base species so we still get real sets.
@@ -320,10 +322,11 @@ def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None):
     # A mon that used two different moves without leaving the field can't be Choice-locked.
     multi_moved = bool(used_since_switch) and len(used_since_switch) >= 2
     s = SETS.sample_set(sheet_id, revealed)
+    item_exclude = _CHOICE_ITEMS if multi_moved else \
+        ("choicescarf",) if speed_hint == "noscarf" else ()
     if s is not None:
         role = s.get("role", "")
-        st_item = STATS.item(sheet_id, role, exclude=_CHOICE_ITEMS if multi_moved else ()) \
-            if use_stats else None
+        st_item = STATS.item(sheet_id, role, exclude=item_exclude) if use_stats else None
         st_ability = STATS.ability(sheet_id, role) if use_stats else None
         st_tera = STATS.tera(sheet_id, role) if use_stats else None
         move_ids = SETS.sample_moves(revealed, s["moves"])
@@ -341,6 +344,12 @@ def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None):
         tera = (mon.tera_type.name.lower() if getattr(mon, "tera_type", None)
                 else _types_tuple(mon)[0])
         item = to_id_str(mon.item) if mon.item else "heavydutyboots"
+
+    # Turn-order evidence: outsped its known raw speed -> model it as Scarf'd in every world
+    # (unless the item is revealed, or it used 2+ moves without switching -- then the speed came
+    # from an ability we don't model, and a Choice item is impossible anyway).
+    if speed_hint == "scarf" and not mon.item and not multi_moved:
+        item = "choicescarf"
 
     # Choice lock: if this world's item is a Choice item (or the ability is Gorilla Tactics) and
     # the mon has committed to a move since switching in, only that move is selectable.
@@ -487,11 +496,15 @@ def _our_side(battle):
     )
 
 
-def _opp_side(battle, use_stats=True, opp_used_since_switch=None):
+def _opp_side(battle, use_stats=True, opp_used_since_switch=None, opp_speed_hints=None):
+    hints = opp_speed_hints or {}
     active = battle.opponent_active_pokemon
-    active_pe = _opp_pokemon_determinized(active, use_stats, used_since_switch=opp_used_since_switch)
+    active_pe = _opp_pokemon_determinized(active, use_stats, used_since_switch=opp_used_since_switch,
+                                          speed_hint=hints.get(to_id_str(active.species)))
     bench = [m for m in battle.opponent_team.values() if m is not active]
-    pkmn = [active_pe] + [_opp_pokemon_determinized(m, use_stats) for m in bench]
+    pkmn = [active_pe] + [_opp_pokemon_determinized(m, use_stats,
+                                                    speed_hint=hints.get(to_id_str(m.species)))
+                          for m in bench]
 
     # Fill unseen bench up to 6 with sampled species (so endgame / faint-count eval is sane).
     seen = {to_id_str(active.species)} | {to_id_str(m.species) for m in bench}
@@ -529,14 +542,15 @@ def _terrain_str(battle):
     return "none"
 
 
-def build_state(battle, use_stats=True, opp_used_since_switch=None):
+def build_state(battle, use_stats=True, opp_used_since_switch=None, opp_speed_hints=None):
     """A determinized poke-engine State for the current position. Call repeatedly to get
     different opponent-set samples. use_stats toggles the real randbats item/ability/tera feed.
     opp_used_since_switch: move ids the opponent's active has used since switching in (the
-    caller tracks this across turns) -- drives Choice-lock inference."""
+    caller tracks this across turns) -- drives Choice-lock inference.
+    opp_speed_hints: {species_id: 'scarf'|'noscarf'} turn-order verdicts (see engine_search)."""
     return State(
         side_one=_our_side(battle),
-        side_two=_opp_side(battle, use_stats, opp_used_since_switch),
+        side_two=_opp_side(battle, use_stats, opp_used_since_switch, opp_speed_hints),
         weather=_weather_str(battle), weather_turns_remaining=-1,
         terrain=_terrain_str(battle), terrain_turns_remaining=0,
         trick_room=any(f.name == "TRICK_ROOM" for f in battle.fields),

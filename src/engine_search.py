@@ -23,8 +23,13 @@ from poke_env.data import to_id_str
 
 from poke_engine import monte_carlo_tree_search
 
-from knowledge import estimate_damage_fraction
+from knowledge import estimate_damage_fraction, get_move, safe_priority, _estimate_stat
 from poke_engine_adapter import build_state
+
+
+def _spe_mult(boost):
+    """Speed multiplier for a boost stage."""
+    return (2 + boost) / 2 if boost >= 0 else 2 / (2 - boost)
 
 
 class EnginePlayer(Player):
@@ -40,7 +45,7 @@ class EnginePlayer(Player):
     # unrevealed Choice items and exploit locked opponents -- so it ships on. Flip to False to
     # revert to the role-based item guess.
     def __init__(self, *args, n_determinizations=None, search_time_ms=None, threads=None,
-                 debug=False, record=False, use_stats=True, **kwargs):
+                 debug=False, record=False, use_stats=True, speed_inference=True, **kwargs):
         super().__init__(*args, **kwargs)
         if n_determinizations is not None:
             self.N_DETERMINIZATIONS = n_determinizations
@@ -50,6 +55,7 @@ class EnginePlayer(Player):
             self.THREADS = threads
         self.debug = debug
         self.use_stats = use_stats   # use the real randbats item/ability/tera feed in determinization
+        self.speed_inference = speed_inference   # infer Choice Scarf from observed turn order
         # Diagnostics: count turns and silent failures so we can tell "outplayed" from "bug".
         # det_fail = a determinization/search that raised (state too weird for poke-engine);
         # empty_pooled = a turn where *every* determinization failed -> dumb fallback move.
@@ -61,6 +67,90 @@ class EnginePlayer(Player):
         # them so the adapter can infer Choice locks (1 move + Choice item = locked) and rule
         # Choice items out (2+ distinct moves without switching = can't be Choice).
         self._opp_tracker = {}
+        # battle_tag -> {species_id: "scarf" | "noscarf"}: Choice Scarf verdicts inferred from
+        # observed turn order. Randbats spreads are fixed (85 EVs / 31 IVs / neutral), so an
+        # opponent's raw speed is essentially known; if it moved first when its raw speed says
+        # it shouldn't have, it's Scarf'd (or has a speed ability -- same modeling either way).
+        self._opp_speed = {}
+
+    # --- speed inference from turn order --------------------------------------
+
+    async def _handle_battle_message(self, split_messages):
+        await super()._handle_battle_message(split_messages)
+        if not self.speed_inference:
+            return
+        try:
+            tag = split_messages[0][0].replace(">", "").strip()
+            battle = self.battles.get(tag)
+            if battle is not None:
+                self._scan_speed_evidence(battle, split_messages)
+        except Exception:
+            self.diag["speed_scan_err"] = self.diag.get("speed_scan_err", 0) + 1
+
+    def _scan_speed_evidence(self, battle, split_messages):
+        """Collect who-moved-first evidence from a message payload. Comparisons are skipped
+        for turns 'tainted' by mid-turn switches (pivots) or in-turn speed-boost changes,
+        since the end-of-payload battle state then doesn't reflect move-order conditions."""
+        moves = []          # (side, move_id) in order within the current turn
+        tainted = False
+        for msg in split_messages:
+            if len(msg) < 2:
+                continue
+            tag = msg[1]
+            if tag == "turn":
+                moves, tainted = [], False
+            elif tag in ("switch", "drag") and moves:
+                tainted = True
+            elif tag in ("-boost", "-unboost") and len(msg) > 3 and msg[3] == "spe":
+                tainted = True
+            elif tag == "move" and len(msg) > 3:
+                moves.append((msg[2][:2], to_id_str(msg[3])))
+                if len(moves) == 2 and not tainted:
+                    self._infer_scarf(battle, moves)
+
+    def _infer_scarf(self, battle, moves):
+        """Update the Scarf verdict for the opponent's active from one same-priority
+        move pair. Conservative: 5% tolerance both ways for state-timing noise; a 'scarf'
+        verdict (they outsped their known raw speed) overrides 'noscarf', never vice versa."""
+        (s1, m1), (s2, m2) = moves
+        role = battle.player_role
+        if role not in (s1, s2) or s1 == s2:
+            return
+        mv1, mv2 = get_move(m1), get_move(m2)
+        if mv1 is None or mv2 is None or safe_priority(mv1) != safe_priority(mv2):
+            return
+        if any(f.name == "TRICK_ROOM" for f in battle.fields):
+            return
+        me, opp = battle.active_pokemon, battle.opponent_active_pokemon
+        if me is None or opp is None or me.fainted or opp.fainted:
+            return
+
+        our = float((me.stats or {}).get("spe") or _estimate_stat(me, "spe"))
+        our *= _spe_mult(me.boosts.get("spe", 0))
+        if me.status is not None and me.status.name == "PAR":
+            our *= 0.5
+        if me.item and to_id_str(me.item) == "choicescarf":
+            our *= 1.5
+        if any(c.name == "TAILWIND" for c in battle.side_conditions):
+            our *= 2
+
+        their_raw = float(_estimate_stat(opp, "spe"))
+        their_mult = _spe_mult(opp.boosts.get("spe", 0))
+        if opp.status is not None and opp.status.name == "PAR":
+            their_mult *= 0.5
+        if any(c.name == "TAILWIND" for c in battle.opponent_side_conditions):
+            their_mult *= 2
+
+        species = to_id_str(opp.species)
+        hints = self._opp_speed.setdefault(battle.battle_tag, {})
+        opp_first = s1 != role
+        if opp_first and their_raw * their_mult < our * 0.95:
+            hints[species] = "scarf"
+            self.diag["scarf_inferred"] = self.diag.get("scarf_inferred", 0) + 1
+        elif not opp_first and their_raw * their_mult * 1.5 > our * 1.05:
+            if hints.get(species) != "scarf":
+                hints[species] = "noscarf"
+                self.diag["noscarf_inferred"] = self.diag.get("noscarf_inferred", 0) + 1
 
     def _opp_used_since_switch(self, battle):
         """Update and return the set of move ids the opponent's active has used since switch-in."""
@@ -93,10 +183,12 @@ class EnginePlayer(Player):
         wins = {}
         runs = 0
         opp_used = self._opp_used_since_switch(battle)
+        speed_hints = self._opp_speed.get(battle.battle_tag, {})
         for _ in range(self.N_DETERMINIZATIONS):
             try:
                 state = build_state(battle, use_stats=self.use_stats,
-                                    opp_used_since_switch=opp_used)
+                                    opp_used_since_switch=opp_used,
+                                    opp_speed_hints=speed_hints)
                 res = monte_carlo_tree_search(state, self.SEARCH_TIME_MS, threads=self.THREADS)
             except BaseException:
                 # poke-engine can *panic* on an inconsistent state (raises PanicException, which
