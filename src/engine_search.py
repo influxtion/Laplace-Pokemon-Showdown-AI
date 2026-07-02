@@ -47,7 +47,8 @@ class EnginePlayer(Player):
     def __init__(self, *args, n_determinizations=None, search_time_ms=None, threads=None,
                  debug=False, record=False, use_stats=True, speed_inference=True,
                  value_model_path=None, value_worlds=4, value_opp_moves=2,
-                 value_margin=11.0, **kwargs):
+                 value_margin=11.0, value_on_force_switch=False, value_boost_margin=0.0,
+                 **kwargs):
         super().__init__(*args, **kwargs)
         if n_determinizations is not None:
             self.N_DETERMINIZATIONS = n_determinizations
@@ -87,6 +88,8 @@ class EnginePlayer(Player):
         self.value_worlds = value_worlds
         self.value_opp_moves = value_opp_moves
         self.value_margin = value_margin
+        self.value_on_force_switch = value_on_force_switch
+        self.value_boost_margin = value_boost_margin
         if value_model_path:
             self._load_value_model(value_model_path)
 
@@ -298,7 +301,7 @@ class EnginePlayer(Player):
                 self.diag["empty_pooled"] += 1
             ranked = sorted(pooled.items(), key=lambda kv: kv[1], reverse=True)
             ranked = self._damage_tiebreak(battle, ranked)
-            ranked = self._value_rerank(ranked)
+            ranked = self._value_rerank(ranked, battle)
             for choice, _share in ranked:
                 order = self._order_for_choice(choice, battle)
                 if order is not None:
@@ -322,10 +325,14 @@ class EnginePlayer(Player):
     @staticmethod
     def _engine_choice(choice):
         """Root move_choice string -> the string generate_instructions accepts
-        ('switch <species>' becomes the bare species name; moves/-tera pass through)."""
-        return choice.split(" ", 1)[1] if choice.startswith("switch ") else choice
+        ('switch <species>' becomes the bare species name; the MCTS result's 'No Move'
+        -- e.g. the opponent's only option while we take a post-faint free switch --
+        is spelled 'none'; moves/-tera pass through)."""
+        if choice.startswith("switch "):
+            return choice.split(" ", 1)[1]
+        return "none" if choice == "No Move" else choice
 
-    def _value_rerank(self, ranked):
+    def _value_rerank(self, ranked, battle=None):
         """Re-rank near-tied world-winning candidates by learned state value.
 
         For each candidate: roll it one ply forward in up to `value_worlds` determinized
@@ -335,16 +342,36 @@ class EnginePlayer(Player):
         different near-tied candidate. `value_margin` is in robust-vote score units where
         one world-win = 10 (+ up to 1 of pooled share), so the default of 11 only lets the
         net overturn candidates within one world-win of the leader -- the search stays in
-        charge of clear decisions."""
+        charge of clear decisions.
+
+        The net gets WIDER authority in two states where the engine's leaf eval is
+        known-bad (measured: it scores a wasted turn 0.478 vs 0.480 for the best move
+        against a +3/+3/+3 sweeper, and setup sweeps dominate ladder losses):
+        - value_on_force_switch: after a faint the replacement is a pure positional
+          choice with no tempo cost -- all switch candidates are compared by V.
+        - value_boost_margin: while the opponent's active is visibly boosted (offense/
+          speed total >= +2), the margin widens so the net can overrule chip-damage
+          autopilot."""
         if self._value_model is None or len(ranked) < 2 or not self._worlds:
             return ranked
         top_score = ranked[0][1]
         if top_score < 10.0:      # top choice won no world: nothing trustworthy to rerank
             return ranked
-        tied = [c for c, s in ranked if s >= 10.0 and top_score - s <= self.value_margin]
+        margin = self.value_margin
+        free_switch = (self.value_on_force_switch and battle is not None
+                       and bool(getattr(battle, "force_switch", False)))
+        if free_switch:
+            margin = float("inf")
+        elif self.value_boost_margin and battle is not None:
+            opp = battle.opponent_active_pokemon
+            if opp is not None:
+                b = opp.boosts
+                if b.get("atk", 0) + b.get("spa", 0) + b.get("spe", 0) >= 2:
+                    margin = self.value_boost_margin
+        tied = [c for c, s in ranked if s >= 10.0 and top_score - s <= margin]
         if len(tied) < 2:
             return ranked
-        tied = tied[:3]
+        tied = tied[:5 if free_switch else 3]
         try:
             feats, owners, weights = [], [], []
             from value_features import featurize

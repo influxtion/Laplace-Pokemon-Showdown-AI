@@ -1,9 +1,7 @@
 r"""Play the trained bot on the real Pokemon Showdown ladder against humans.
 
 Unlike every other script here, this connects to the OFFICIAL server (sim3.psim.us), not
-the local one -- so the local server does NOT need to be running. By default it plays the
-agent we ship (the policy + 1-ply search) as a registered account; pass --raw for the bare
-policy.
+the local one -- so the local server does NOT need to be running. 
 
 Setup (once):
   1. Go to https://play.pokemonshowdown.com, click the gear (Options) -> Register, and
@@ -78,8 +76,11 @@ def build_agent(model, account, kind):
         # blindness to opponent setup / wasted turns); it ships whenever the trained net exists.
         value_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                   "models", "value_net.pt")
+        # value_boost_margin: wider net authority while the opponent is visibly boosted --
+        # 55% in mirror A/B (n=60, dilution expected for eval fixes); the ladder is its test.
         return EnginePlayer(n_determinizations=8, search_time_ms=150, threads=8, record=True,
                             value_model_path=value_path if os.path.exists(value_path) else None,
+                            value_boost_margin=26,
                             **kwargs)
     if kind == "search":
         return SearchPlayer(model=model, **kwargs)
