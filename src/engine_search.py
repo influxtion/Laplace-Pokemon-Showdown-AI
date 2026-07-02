@@ -72,6 +72,9 @@ class EnginePlayer(Player):
         # opponent's raw speed is essentially known; if it moved first when its raw speed says
         # it shouldn't have, it's Scarf'd (or has a speed ability -- same modeling either way).
         self._opp_speed = {}
+        # battle_tag -> pending delayed effects: '<side>_wish' -> (lands_on_turn, heal_amount),
+        # '<side>_fs' -> hits_at_end_of_turn. Sides are 'p1'/'p2' as on the protocol.
+        self._pending = {}
 
     # --- speed inference from turn order --------------------------------------
 
@@ -88,25 +91,44 @@ class EnginePlayer(Player):
             self.diag["speed_scan_err"] = self.diag.get("speed_scan_err", 0) + 1
 
     def _scan_speed_evidence(self, battle, split_messages):
-        """Collect who-moved-first evidence from a message payload. Comparisons are skipped
-        for turns 'tainted' by mid-turn switches (pivots) or in-turn speed-boost changes,
-        since the end-of-payload battle state then doesn't reflect move-order conditions."""
+        """Collect who-moved-first evidence (Scarf inference) and pending delayed effects
+        (Wish / Future Sight) from a message payload. Speed comparisons are skipped for turns
+        'tainted' by mid-turn switches (pivots) or in-turn speed-boost changes, since the
+        end-of-payload battle state then doesn't reflect move-order conditions."""
         moves = []          # (side, move_id) in order within the current turn
         tainted = False
+        wish_side = fs_side = None      # sides that queued a delayed effect this payload
+        pend = self._pending.setdefault(battle.battle_tag, {})
         for msg in split_messages:
             if len(msg) < 2:
                 continue
             tag = msg[1]
             if tag == "turn":
+                # A new turn line anchors any delayed effect queued earlier in the payload:
+                # Wish heals at the end of the turn we're now deciding; Future Sight one later.
+                turn = int(msg[2])
+                if wish_side:
+                    pend[f"{wish_side}_wish"] = (turn, pend.pop("_wish_amt", 0))
+                    wish_side = None
+                if fs_side:
+                    pend[f"{fs_side}_fs"] = turn + 1
+                    fs_side = None
                 moves, tainted = [], False
             elif tag in ("switch", "drag") and moves:
                 tainted = True
             elif tag in ("-boost", "-unboost") and len(msg) > 3 and msg[3] == "spe":
                 tainted = True
             elif tag == "move" and len(msg) > 3:
+                if to_id_str(msg[3]) == "wish":
+                    wish_side = msg[2][:2]
+                    healer = battle.active_pokemon if wish_side == battle.player_role \
+                        else battle.opponent_active_pokemon
+                    pend["_wish_amt"] = int(_estimate_stat(healer, "hp")) // 2 if healer else 0
                 moves.append((msg[2][:2], to_id_str(msg[3])))
                 if len(moves) == 2 and not tainted:
                     self._infer_scarf(battle, moves)
+            elif tag == "-start" and len(msg) > 3 and msg[3] == "move: Future Sight":
+                fs_side = msg[2][:2]
 
     def _infer_scarf(self, battle, moves):
         """Update the Scarf verdict for the opponent's active from one same-priority
@@ -188,7 +210,8 @@ class EnginePlayer(Player):
             try:
                 state = build_state(battle, use_stats=self.use_stats,
                                     opp_used_since_switch=opp_used,
-                                    opp_speed_hints=speed_hints)
+                                    opp_speed_hints=speed_hints,
+                                    pending=self._pending.get(battle.battle_tag))
                 res = monte_carlo_tree_search(state, self.SEARCH_TIME_MS, threads=self.THREADS)
             except BaseException:
                 # poke-engine can *panic* on an inconsistent state (raises PanicException, which

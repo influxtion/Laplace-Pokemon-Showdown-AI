@@ -418,28 +418,44 @@ def _dummy():
     return PEPokemon(id="pikachu", level=1, hp=0, maxhp=0)
 
 
-def _side_conditions(sc):
+def _remaining(start_turn, now, base, extended):
+    """Turns remaining for a timed condition set on `start_turn`. If it has outlived its
+    base duration it must be item-extended (Light Clay / weather rocks / Terrain Extender),
+    so switch to the extended clock; never report less than 1 while it's still active."""
+    left = base - (now - start_turn)
+    if left < 1:
+        left = extended - (now - start_turn)
+    return max(1, left)
+
+
+def _side_conditions(sc, now):
     """poke-env side_conditions dict -> engine SideConditions. Hazards carry layer counts;
-    screens/tailwind we mark present (we don't get exact turns-remaining from poke-env)."""
+    timed conditions (screens/tailwind) carry real turns-remaining derived from the start
+    turn poke-env records (they used to be hard-coded as freshly set, so a Reflect about to
+    expire looked 5 turns strong)."""
     layers = {}
-    present = set()
+    starts = {}
     for cond, value in sc.items():
         name = cond.name
         if name in ("SPIKES", "TOXIC_SPIKES"):
             layers[name] = value
         else:
-            present.add(name)
+            starts[name] = value    # start turn for non-stackable conditions
+    def timed(name, base, extended=None):
+        if name not in starts:
+            return 0
+        return _remaining(starts[name], now, base, extended or base)
     return SideConditions(
-        stealth_rock=1 if "STEALTH_ROCK" in present else 0,
+        stealth_rock=1 if "STEALTH_ROCK" in starts else 0,
         spikes=layers.get("SPIKES", 0),
         toxic_spikes=layers.get("TOXIC_SPIKES", 0),
-        sticky_web=1 if "STICKY_WEB" in present else 0,
-        tailwind=4 if "TAILWIND" in present else 0,
-        reflect=5 if "REFLECT" in present else 0,
-        light_screen=5 if "LIGHT_SCREEN" in present else 0,
-        aurora_veil=5 if "AURORA_VEIL" in present else 0,
-        safeguard=5 if "SAFEGUARD" in present else 0,
-        mist=5 if "MIST" in present else 0,
+        sticky_web=1 if "STICKY_WEB" in starts else 0,
+        tailwind=timed("TAILWIND", 4),
+        reflect=timed("REFLECT", 5, 8),
+        light_screen=timed("LIGHT_SCREEN", 5, 8),
+        aurora_veil=timed("AURORA_VEIL", 5, 8),
+        safeguard=timed("SAFEGUARD", 5),
+        mist=timed("MIST", 5),
     )
 
 
@@ -475,7 +491,18 @@ def _sub_health(mon, maxhp):
     return 0
 
 
-def _our_side(battle):
+def _delayed(pending, side, now):
+    """Engine (wish, future_sight) tuples for one side from the tracked pending effects.
+    Wish heals at the end of the turn it 'lands on'; Future Sight hits one turn later."""
+    pending = pending or {}
+    wish_turn, wish_amt = pending.get(f"{side}_wish", (0, 0))
+    wish = (1, int(wish_amt)) if wish_turn == now else (0, 0)
+    fs_turn = pending.get(f"{side}_fs", 0)
+    fs = (max(0, min(2, fs_turn - now + 1)), "0") if fs_turn >= now else (0, "0")
+    return wish, fs
+
+
+def _our_side(battle, pending=None):
     active = battle.active_pokemon
     active_moves = _moves_from_objs(battle.available_moves)
     active_pe = _own_pokemon(active, moves_override=active_moves)
@@ -483,10 +510,11 @@ def _our_side(battle):
     pkmn = [active_pe] + [_own_pokemon(m) for m in bench]
     while len(pkmn) < 6:
         pkmn.append(_dummy())
+    wish, fs = _delayed(pending, battle.player_role or "p1", battle.turn)
     return Side(
-        pokemon=pkmn[:6], side_conditions=_side_conditions(battle.side_conditions),
+        pokemon=pkmn[:6], side_conditions=_side_conditions(battle.side_conditions, battle.turn),
         active_index="0", volatile_status_durations=VolatileStatusDurations(),
-        wish=(0, 0), future_sight=(0, "0"), volatile_statuses=_volatile_set(active),
+        wish=wish, future_sight=fs, volatile_statuses=_volatile_set(active),
         substitute_health=_sub_health(active, _maxhp(active, own=True)),
         last_used_move=_last_used_str(active, active_moves),
         switch_out_move_second_saved_move="none",
@@ -496,7 +524,8 @@ def _our_side(battle):
     )
 
 
-def _opp_side(battle, use_stats=True, opp_used_since_switch=None, opp_speed_hints=None):
+def _opp_side(battle, use_stats=True, opp_used_since_switch=None, opp_speed_hints=None,
+              pending=None):
     hints = opp_speed_hints or {}
     active = battle.opponent_active_pokemon
     active_pe = _opp_pokemon_determinized(active, use_stats, used_since_switch=opp_used_since_switch,
@@ -515,10 +544,13 @@ def _opp_side(battle, use_stats=True, opp_used_since_switch=None, opp_speed_hint
             continue
         seen.add(sp)
         pkmn.append(_sampled_unrevealed_pokemon(sp, use_stats))
+    opp_role = "p2" if (battle.player_role or "p1") == "p1" else "p1"
+    wish, fs = _delayed(pending, opp_role, battle.turn)
     return Side(
-        pokemon=pkmn[:6], side_conditions=_side_conditions(battle.opponent_side_conditions),
+        pokemon=pkmn[:6],
+        side_conditions=_side_conditions(battle.opponent_side_conditions, battle.turn),
         active_index="0", volatile_status_durations=VolatileStatusDurations(),
-        wish=(0, 0), future_sight=(0, "0"), volatile_statuses=_volatile_set(active),
+        wish=wish, future_sight=fs, volatile_statuses=_volatile_set(active),
         substitute_health=_sub_health(active, _maxhp(active, own=False)),
         last_used_move=_last_used_str(active, active_pe.moves),
         switch_out_move_second_saved_move="none",
@@ -527,32 +559,47 @@ def _opp_side(battle, use_stats=True, opp_used_since_switch=None, opp_speed_hint
 
 
 def _weather_str(battle):
-    for w in battle.weather:
+    """(engine weather name, turns remaining). Ability weathers (Desolate Land etc.) don't
+    time out; item extensions are inferred by outliving the base 5 turns."""
+    for w, start in battle.weather.items():
         s = _WEATHER.get(w.name)
         if s:
-            return s
-    return "none"
+            if s in ("harshsun", "heavyrain"):
+                return s, -1
+            return s, _remaining(start, battle.turn, 5, 8)
+    return "none", -1
 
 
 def _terrain_str(battle):
-    for f in battle.fields:
+    for f, start in battle.fields.items():
         s = _TERRAIN.get(f.name)
         if s:
-            return s
-    return "none"
+            return s, _remaining(start, battle.turn, 5, 8)
+    return "none", 0
 
 
-def build_state(battle, use_stats=True, opp_used_since_switch=None, opp_speed_hints=None):
+def _trick_room(battle):
+    for f, start in battle.fields.items():
+        if f.name == "TRICK_ROOM":
+            return True, _remaining(start, battle.turn, 5, 5)
+    return False, 0
+
+
+def build_state(battle, use_stats=True, opp_used_since_switch=None, opp_speed_hints=None,
+                pending=None):
     """A determinized poke-engine State for the current position. Call repeatedly to get
     different opponent-set samples. use_stats toggles the real randbats item/ability/tera feed.
     opp_used_since_switch: move ids the opponent's active has used since switching in (the
     caller tracks this across turns) -- drives Choice-lock inference.
-    opp_speed_hints: {species_id: 'scarf'|'noscarf'} turn-order verdicts (see engine_search)."""
+    opp_speed_hints: {species_id: 'scarf'|'noscarf'} turn-order verdicts (see engine_search).
+    pending: tracked Wish/Future Sight effects ({'p1_wish': (turn, amt), 'p2_fs': turn, ...})."""
+    weather, weather_left = _weather_str(battle)
+    terrain, terrain_left = _terrain_str(battle)
+    tr, tr_left = _trick_room(battle)
     return State(
-        side_one=_our_side(battle),
-        side_two=_opp_side(battle, use_stats, opp_used_since_switch, opp_speed_hints),
-        weather=_weather_str(battle), weather_turns_remaining=-1,
-        terrain=_terrain_str(battle), terrain_turns_remaining=0,
-        trick_room=any(f.name == "TRICK_ROOM" for f in battle.fields),
-        trick_room_turns_remaining=0, team_preview=False,
+        side_one=_our_side(battle, pending),
+        side_two=_opp_side(battle, use_stats, opp_used_since_switch, opp_speed_hints, pending),
+        weather=weather, weather_turns_remaining=weather_left,
+        terrain=terrain, terrain_turns_remaining=terrain_left,
+        trick_room=tr, trick_room_turns_remaining=tr_left, team_preview=False,
     )
