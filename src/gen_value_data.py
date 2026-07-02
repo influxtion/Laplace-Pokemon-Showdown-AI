@@ -25,8 +25,10 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 
 BATTLE_FORMAT = "gen9randombattle"
+# v2: 368-feat featurizer (ability/recovery/speed-race flags), 2 worlds per decision.
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                        "data_value")
+                        "data_value2")
+WORLDS_PER_DECISION = 2
 
 
 def _play_share(n, det, time_ms, idx, stamp):
@@ -46,13 +48,14 @@ def _play_share(n, det, time_ms, idx, stamp):
 
         def choose_move(self, battle):
             try:
-                state = build_state(
-                    battle, use_stats=self.use_stats,
-                    opp_used_since_switch=self._opp_used_since_switch(battle),
-                    opp_speed_hints=self._opp_speed.get(battle.battle_tag, {}),
-                    pending=self._pending.get(battle.battle_tag))
-                self.samples.setdefault(battle.battle_tag, []).append(
-                    featurize(state).astype(np.float16))
+                recorded = self.samples.setdefault(battle.battle_tag, [])
+                for _ in range(WORLDS_PER_DECISION):   # 2 hidden-set draws of the same position
+                    state = build_state(
+                        battle, use_stats=self.use_stats,
+                        opp_used_since_switch=self._opp_used_since_switch(battle),
+                        opp_speed_hints=self._opp_speed.get(battle.battle_tag, {}),
+                        pending=self._pending.get(battle.battle_tag))
+                    recorded.append(featurize(state).astype(np.float16))
             except Exception:
                 pass
             return super().choose_move(battle)

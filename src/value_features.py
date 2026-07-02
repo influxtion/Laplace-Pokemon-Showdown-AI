@@ -45,8 +45,27 @@ _TERRAINS = ("electricterrain", "grassyterrain", "mistyterrain", "psychicterrain
 _BOOST_KEYS = ("attack_boost", "defense_boost", "special_attack_boost",
                "special_defense_boost", "speed_boost", "accuracy_boost", "evasion_boost")
 
-# global 12 + 2 sides x (2 agg + 11 conditions + 34 active + 5*22 bench)
-N_VALUE_FEATURES = 12 + 2 * (2 + 11 + 34 + 5 * 22)
+# Ability groups that swing a position's value (v2). Grouped by effect, not name, so one
+# flag generalizes across e.g. all the hit-absorbing immunity abilities.
+_ABILITY_FLAGS = (
+    ("levitate",),
+    ("unaware",),
+    ("magicguard",),
+    ("regenerator",),
+    ("intimidate",),
+    ("speedboost", "protosynthesis", "quarkdrive"),
+    ("waterabsorb", "voltabsorb", "flashfire", "stormdrain", "sapsipper", "eartheater",
+     "dryskin", "lightningrod"),
+    ("thickfat", "multiscale", "furcoat", "icescales"),
+    ("moldbreaker", "teravolt", "turboblaze"),
+    ("hugepower", "purepower", "gorillatactics"),
+)
+
+_RECOVERY_MOVES = {"roost", "recover", "softboiled", "slackoff", "synthesis", "moonlight",
+                   "morningsun", "shoreup", "milkdrink", "rest", "strengthsap", "wish"}
+
+# global 12 + 2 sides x (2 agg + 11 conditions + 45 active + 5*24 bench)
+N_VALUE_FEATURES = 12 + 2 * (2 + 11 + 45 + 5 * 24)
 
 
 def _eff(atk_types, def_types):
@@ -73,6 +92,16 @@ def _status_onehot(status):
 def _item_flags(item):
     it = (item or "").lower()
     return [1.0 if it in group else 0.0 for group in _ITEM_FLAGS]
+
+
+def _ability_flags(ability):
+    ab = (ability or "").lower()
+    return [1.0 if ab in group else 0.0 for group in _ABILITY_FLAGS]
+
+
+def _has_recovery(mon):
+    return 1.0 if any(m.id in _RECOVERY_MOVES and not m.disabled and m.pp > 0
+                      for m in mon.moves) else 0.0
 
 
 def _mon_alive(mon):
@@ -149,6 +178,8 @@ def _side_features(side, opp_side, best_dmg_frac, opp_best_dmg_frac):
     vols = set(side.volatile_statuses)
     feats += [1.0 if v in vols else 0.0 for v in _VOLATILES]
     feats += _item_flags(active.item)
+    feats += _ability_flags(active.ability)
+    feats.append(_has_recovery(active))
     feats.append(best_dmg_frac)
     my_spe = _effective_speed(active, side)
     opp_spe = _effective_speed(opp_active, opp_side)
@@ -165,8 +196,10 @@ def _side_features(side, opp_side, best_dmg_frac, opp_best_dmg_frac):
             my_types = [t for t in m.types if t and t != "typeless"]
             feats += [1.0] + _stat_block(m) + _status_onehot(m.status) + _item_flags(m.item)
             feats += [_eff(my_types, opp_types) / 4.0, _eff(opp_types, my_types) / 4.0]
+            feats.append(1.0 if m.speed > opp_spe else 0.0)   # wins the speed race if sent in
+            feats.append(_has_recovery(m))
         else:
-            feats += [0.0] * 22
+            feats += [0.0] * 24
     return feats
 
 

@@ -94,7 +94,8 @@ class EnginePlayer(Player):
         import torch
         from train_value import ValueNet
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
-        net = ValueNet(ckpt["n_in"])
+        net = ValueNet(ckpt["n_in"], hidden=tuple(ckpt.get("hidden", (256, 128))),
+                       dropout=ckpt.get("dropout", 0.1))
         net.load_state_dict(ckpt["state_dict"])
         net.eval()
         torch.set_num_threads(1)     # tiny net; don't fight the engine threads

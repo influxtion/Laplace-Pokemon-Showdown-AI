@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_GLOB = os.path.join(ROOT, "data_value", "chunk_*.npz")
+DATA_GLOB = os.path.join(ROOT, "data_value2", "chunk_*.npz")   # v2 features (368)
 MODEL_PATH = os.path.join(ROOT, "models", "value_net.pt")
 
 
@@ -78,12 +78,17 @@ def main():
     ap.add_argument("--batch", type=int, default=4096)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--patience", type=int, default=5)
+    ap.add_argument("--hidden", default="256,128",
+                    help="comma-separated hidden layer sizes")
+    ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--out", default=MODEL_PATH)
     args = ap.parse_args()
+    hidden = tuple(int(h) for h in args.hidden.split(","))
 
     tx, ty, vx, vy = load_split()
     n_in = tx.shape[1]
     torch.manual_seed(7)
-    model = ValueNet(n_in)
+    model = ValueNet(n_in, hidden=hidden, dropout=args.dropout)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     loss_fn = nn.BCEWithLogitsLoss()
 
@@ -123,10 +128,11 @@ def main():
                 print(f"early stop (best val {best_val:.4f})")
                 break
 
-    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
     torch.save({"state_dict": best_state or model.state_dict(), "n_in": n_in,
-                "val_loss": best_val}, MODEL_PATH)
-    print(f"saved {MODEL_PATH} (val loss {best_val:.4f})")
+                "hidden": list(hidden), "dropout": args.dropout,
+                "val_loss": best_val}, args.out)
+    print(f"saved {args.out} (val loss {best_val:.4f})")
 
 
 if __name__ == "__main__":
