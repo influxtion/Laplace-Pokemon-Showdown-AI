@@ -31,7 +31,7 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 WORLDS_PER_DECISION = 2
 
 
-def _play_share(n, det, time_ms, idx, stamp):
+def _play_share(n, det, time_ms, idx, stamp, out_dir=None):
     import numpy as np
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from poke_env import AccountConfiguration
@@ -87,19 +87,25 @@ def _play_share(n, det, time_ms, idx, stamp):
                 np.zeros(0, np.float16), np.zeros(0, np.int32))
 
     x, y, g = asyncio.new_event_loop().run_until_complete(run())
-    os.makedirs(DATA_DIR, exist_ok=True)
-    path = os.path.join(DATA_DIR, f"chunk_{stamp}_{idx}.npz")
+    out_dir = out_dir or DATA_DIR       # passed explicitly: workers re-import the module
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"chunk_{stamp}_{idx}.npz")
     np.savez_compressed(path, x=x, y=y, g=g)
     return len(y), float(y.mean()) if len(y) else 0.0
 
 
 def main():
+    global DATA_DIR
     ap = argparse.ArgumentParser(description="Self-play data generation for the value net.")
     ap.add_argument("--battles", type=int, default=200)
     ap.add_argument("--workers", type=int, default=10)
     ap.add_argument("--det", type=int, default=4)
     ap.add_argument("--time-ms", type=int, default=60)
+    ap.add_argument("--out-dir", default=None,
+                    help="chunk output dir (default data_value2/)")
     args = ap.parse_args()
+    if args.out_dir:
+        DATA_DIR = os.path.abspath(args.out_dir)
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     base, extra = divmod(args.battles, args.workers)
@@ -111,7 +117,7 @@ def main():
     t0 = time.time()
     total = 0
     with ProcessPoolExecutor(max_workers=len(shares)) as ex:
-        futs = [ex.submit(_play_share, n, args.det, args.time_ms, i, stamp)
+        futs = [ex.submit(_play_share, n, args.det, args.time_ms, i, stamp, DATA_DIR)
                 for i, n in enumerate(shares)]
         for f in futs:
             n, mean = f.result()

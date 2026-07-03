@@ -82,8 +82,12 @@ def main():
                     help="comma-separated hidden layer sizes")
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--out", default=MODEL_PATH)
+    ap.add_argument("--data", default=None, help="chunk dir (default data_value2/)")
     args = ap.parse_args()
     hidden = tuple(int(h) for h in args.hidden.split(","))
+    global DATA_GLOB
+    if args.data:
+        DATA_GLOB = os.path.join(os.path.abspath(args.data), "chunk_*.npz")
 
     tx, ty, vx, vy = load_split()
     n_in = tx.shape[1]

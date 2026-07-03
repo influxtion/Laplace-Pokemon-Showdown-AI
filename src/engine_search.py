@@ -315,6 +315,7 @@ class EnginePlayer(Player):
             ranked = self._damage_tiebreak(battle, ranked)
             ranked = self._value_rerank(ranked, battle)
             ranked = self._noop_demote(ranked)
+            ranked = self._dead_lock_guard(battle, ranked)
             for choice, _share in ranked:
                 order = self._order_for_choice(choice, battle)
                 if order is not None:
@@ -484,6 +485,39 @@ class EnginePlayer(Player):
         order = [c for c in winners if c not in noops] + [c for c in winners if c in noops]
         rest = [rc for rc in ranked if rc[0] not in set(winners)]
         return [(c, scores[c]) for c in order] + rest
+
+    def _dead_lock_guard(self, battle, ranked):
+        """Never lock into a status move with nowhere to pivot.
+
+        Observed live (Ditto-as-Giratina, last mon, Choice Scarf): with every line
+        losing, the worlds' votes are noise, and 5/8 picked Will-O-Wisp -- locking the
+        final Pokemon into a status move for the rest of the game. Locked status with no
+        bench is strictly dominated by locked attack: both are locks, one does damage.
+        Applies only when (a) we hold an unlocked Choice item, (b) there are no legal
+        switches, and (c) an attacking choice also won a world -- so it is a swap of two
+        world-winners, never an override of the search's only idea."""
+        me = battle.active_pokemon
+        if (not ranked or me is None or not me.item
+                or to_id_str(me.item) not in ("choiceband", "choicespecs", "choicescarf")
+                or battle.available_switches or len(battle.available_moves) <= 1):
+            return ranked
+
+        def is_status(choice):
+            if choice.startswith("switch "):
+                return False
+            move_id = choice[:-5] if choice.endswith("-tera") else choice
+            mv = get_move(move_id)
+            return mv is not None and getattr(mv.category, "name", "") == "STATUS"
+
+        top_choice, top_score = ranked[0]
+        if top_score < 10.0 or not is_status(top_choice):
+            return ranked
+        for i, (choice, score) in enumerate(ranked[1:], start=1):
+            if score >= 10.0 and not is_status(choice):
+                self.diag["dead_lock_guard"] = self.diag.get("dead_lock_guard", 0) + 1
+                order = [ranked[i]] + ranked[:i] + ranked[i + 1:]
+                return order
+        return ranked
 
     def _damage_tiebreak(self, battle, ranked, eps=0.15):
         """Among effectively-tied top choices, prefer the one that actually damages the
