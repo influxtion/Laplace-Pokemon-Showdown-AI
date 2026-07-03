@@ -166,7 +166,7 @@ SETS = _SetSheet()
 # and matches the true generator distribution. Validated need: at compute-matched settings we
 # lost 1-11 to Foul Play, whose only relevant structural edge was this sampling.
 _JOINT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "data_joint_sets_gen9.json")
+                           "data", "joint_sets_gen9.json")
 
 
 class _JointSets:
@@ -233,7 +233,7 @@ JOINT = _JointSets()
 # sheet has no items, so we previously guessed -> under-estimated Choice/Life Orb/weather damage
 # and stayed in fatal matchups). Cached locally; refresh with the curl in the module docstring.
 _STATS_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "data_randbats_stats_gen9.json")
+                           "data", "randbats_stats_gen9.json")
 
 
 def _weighted(dist):

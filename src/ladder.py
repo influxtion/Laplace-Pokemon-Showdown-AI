@@ -15,7 +15,6 @@ Setup (once):
 Then, from the project root:
     python -u src\ladder.py                       # play 10 ranked ladder games
     python -u src\ladder.py --battles 25          # play 25
-    python -u src\ladder.py --raw                 # bare policy, no search
     python -u src\ladder.py --mode accept         # wait for someone to challenge you
     python -u src\ladder.py --mode challenge --opponent SomeUser
 
@@ -28,14 +27,9 @@ import argparse
 import asyncio
 import os
 
-from sb3_contrib import MaskablePPO
-
 from poke_env import AccountConfiguration, ShowdownServerConfiguration
 
-from eval_search import pick_model_path
-from search import SearchPlayer
 from engine_search import EnginePlayer
-from opponent import ModelPlayer
 
 BATTLE_FORMAT = "gen9randombattle"
 SPECTATE_URL = "https://play.pokemonshowdown.com/"   # + battle room id = a watchable link
@@ -57,39 +51,34 @@ def load_dotenv(path=_ENV_PATH):
             os.environ.setdefault(key.strip(), value.strip())
 
 
-def build_agent(model, account, kind):
-    """The bot to ladder with, pointed at the official server under the given account.
-    kind: "engine" (poke-engine MCTS, strongest), "search" (1-ply), or "raw" (bare policy)."""
-    kwargs = dict(
+def build_agent(account):
+    """The Laplace bot (poke-engine MCTS over determinized opponent teams), pointed at the
+    official server under the given account."""
+    # poke-engine needs no trained model; it searches the position directly. Ladder is one
+    # game at a time on the official server, so we spend a generous per-turn budget (more
+    # determinizations + threads than the throughput-tuned benchmark default) -- ~1-2s/turn,
+    # well within Showdown's move timer. record=True keeps per-turn decision traces, which
+    # get dumped next to the replay for post-hoc loss analysis.
+    # The learned value head re-ranks near-tied root candidates (fixes the engine eval's
+    # blindness to opponent setup / wasted turns); it ships whenever the trained net exists.
+    value_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "models", "value_net.pt")
+    # value_boost_margin: wider net authority while the opponent is visibly boosted --
+    # 55% in mirror A/B (n=60, dilution expected for eval fixes); the ladder is its test.
+    # FP-recipe root (2026-07-03): plain share averaging + mixed strategy in a 0.9
+    # window. vs Foul Play 57% (17-13) at mix_frac=0.9 vs 28.3% (17-43) for robust
+    # argmax; mirror gate 47.5%/120 (the small tax buys unexploitability the mirror
+    # can't price -- humans switch immunity absorbers into deterministic clicks).
+    return EnginePlayer(
         account_configuration=account,
         server_configuration=ShowdownServerConfiguration,
         battle_format=BATTLE_FORMAT,
-        start_timer_on_battle_start=True,   # start the clock each game so an AFK opponent can't stall the bot
+        start_timer_on_battle_start=True,   # start the clock so an AFK opponent can't stall the bot
+        n_determinizations=8, search_time_ms=150, threads=8, record=True,
+        value_model_path=value_path if os.path.exists(value_path) else None,
+        value_boost_margin=26,
+        robust_vote=False, mix_root=True, mix_frac=0.9,
     )
-    if kind == "engine":
-        # poke-engine needs no trained model; it searches the position directly. Ladder is one
-        # game at a time on the official server, so we spend a generous per-turn budget (more
-        # determinizations + threads than the throughput-tuned benchmark default) -- ~1-2s/turn,
-        # well within Showdown's move timer. record=True keeps per-turn decision traces, which
-        # get dumped next to the replay for post-hoc loss analysis.
-        # The learned value head re-ranks near-tied root candidates (fixes the engine eval's
-        # blindness to opponent setup / wasted turns); it ships whenever the trained net exists.
-        value_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                  "models", "value_net.pt")
-        # value_boost_margin: wider net authority while the opponent is visibly boosted --
-        # 55% in mirror A/B (n=60, dilution expected for eval fixes); the ladder is its test.
-        # FP-recipe root (2026-07-03): plain share averaging + mixed strategy in a 0.9
-        # window. vs Foul Play 57% (17-13) at mix_frac=0.9 vs 28.3% (17-43) for robust
-        # argmax; mirror gate 47.5%/120 (the small tax buys unexploitability the mirror
-        # can't price -- humans switch immunity absorbers into deterministic clicks).
-        return EnginePlayer(n_determinizations=8, search_time_ms=150, threads=8, record=True,
-                            value_model_path=value_path if os.path.exists(value_path) else None,
-                            value_boost_margin=26,
-                            robust_vote=False, mix_root=True, mix_frac=0.9,
-                            **kwargs)
-    if kind == "search":
-        return SearchPlayer(model=model, **kwargs)
-    return ModelPlayer(model=model, deterministic=True, **kwargs)
 
 
 async def report_progress(agent, total, poll=3.0):
@@ -152,12 +141,6 @@ async def main():
                              "challenge = challenge --opponent")
     parser.add_argument("--battles", type=int, default=10, help="how many games to play")
     parser.add_argument("--opponent", default=None, help="username to challenge (challenge mode)")
-    parser.add_argument("--raw", action="store_true",
-                        help="use the bare policy instead of search")
-    parser.add_argument("--search", action="store_true",
-                        help="use the 1-ply policy+damage search instead of the poke-engine MCTS")
-    parser.add_argument("--model", default=None,
-                        help="model .zip to load (default: best available, see eval_search)")
     parser.add_argument("--username", default=os.environ.get("SHOWDOWN_USERNAME"))
     parser.add_argument("--password", default=os.environ.get("SHOWDOWN_PASSWORD"))
     args = parser.parse_args()
@@ -169,17 +152,9 @@ async def main():
         parser.error("challenge mode needs --opponent USERNAME.")
 
     account = AccountConfiguration(args.username, args.password)
-    kind = "raw" if args.raw else "search" if args.search else "engine"
-    labels = {"engine": "poke-engine MCTS", "search": "1-ply search", "raw": "raw policy"}
-    # The engine agent is model-free; the search/raw agents need a trained policy.
-    model = None
-    if kind != "engine":
-        model_path = args.model or pick_model_path()
-        print(f"Loading {model_path}.", flush=True)
-        model = MaskablePPO.load(model_path)
-    print(f"Playing as '{args.username}' ({labels[kind]}).", flush=True)
+    print(f"Playing as '{args.username}' (Laplace: poke-engine MCTS).", flush=True)
 
-    agent = build_agent(model, account, kind)
+    agent = build_agent(account)
 
     if args.mode == "ladder":
         print(f"Queuing for {args.battles} ranked ladder game(s)...", flush=True)
