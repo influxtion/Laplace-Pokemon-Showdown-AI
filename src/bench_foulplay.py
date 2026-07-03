@@ -54,20 +54,31 @@ async def main():
 
     print(f"Challenging {args.opponent} to {args.battles} game(s) "
           f"(det={args.det}, {args.time_ms}ms, {args.threads}t)...", flush=True)
-    await agent.send_challenges(args.opponent, n_challenges=args.battles)
-
     os.makedirs(OUT_DIR, exist_ok=True)
-    for tag, battle in agent.battles.items():
-        result = "won" if battle.won else ("tie" if battle.won is None else "lost")
-        try:
-            agent.save_replay(tag, os.path.join(OUT_DIR, f"{result}-{tag}.html"))
-            traces = agent.traces.get(tag)
-            if traces:
-                with open(os.path.join(OUT_DIR, f"{result}-{tag}.trace.json"), "w",
-                          encoding="utf-8") as f:
-                    json.dump(traces, f, indent=1)
-        except Exception:
-            pass
+    saved = set()
+    # One challenge at a time with a pause: Foul Play only accepts while it is back in
+    # its 'waiting for challenge' state, so back-to-back challenges get dropped and both
+    # sides deadlock (observed live). Saving replays per game also survives interruption.
+    for i in range(args.battles):
+        if i:
+            await asyncio.sleep(8)
+        await agent.send_challenges(args.opponent, n_challenges=1)
+        for tag, battle in agent.battles.items():
+            if tag in saved or not battle.finished:
+                continue
+            saved.add(tag)
+            result = "won" if battle.won else ("tie" if battle.won is None else "lost")
+            try:
+                agent.save_replay(tag, os.path.join(OUT_DIR, f"{result}-{tag}.html"))
+                traces = agent.traces.get(tag)
+                if traces:
+                    with open(os.path.join(OUT_DIR, f"{result}-{tag}.trace.json"), "w",
+                              encoding="utf-8") as f:
+                        json.dump(traces, f, indent=1)
+            except Exception:
+                pass
+        print(f"  game {i + 1}/{args.battles} done "
+              f"(running {agent.n_won_battles}W / {agent.n_lost_battles}L)", flush=True)
 
     w, l = agent.n_won_battles, agent.n_lost_battles
     print(f"RESULT: {w}W / {l}L vs {args.opponent} "

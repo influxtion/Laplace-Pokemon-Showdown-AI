@@ -33,8 +33,12 @@ import re
 LOG_RE = re.compile(r'<script type="text/plain" class="battle-log-data">(.*?)</script>', re.S)
 
 
-def read_log(path):
+BOT_USERNAME = "influxobot"
+
+
+def read_log(path, username=None):
     """The protocol log lines of a saved replay, and which side (p1/p2) is the bot."""
+    username = (username or BOT_USERNAME).lower()
     with open(path, encoding="utf-8", errors="replace") as f:
         text = f.read()
     m = LOG_RE.search(text)
@@ -43,7 +47,7 @@ def read_log(path):
     me = None
     for l in lines:
         p = l.split("|")
-        if len(p) > 3 and p[1] == "player" and p[3].lower() == "influxobot":
+        if len(p) > 3 and p[1] == "player" and p[3].lower() == username:
             me = p[2]
     return lines, me
 
@@ -127,6 +131,8 @@ def main():
     ap.add_argument("--dir", default=os.path.join("replays", "ladder"))
     ap.add_argument("--include-file", action="append", default=[],
                     help="extra replay html(s) to mine (counted as losses)")
+    ap.add_argument("--username", default=BOT_USERNAME,
+                    help="the bot's username in the replays (default influxobot)")
     args = ap.parse_args()
 
     games = []
@@ -143,7 +149,7 @@ def main():
     totals = {"won": {}, "lost": {}, "tie": {}}
     counts = {"won": 0, "lost": 0, "tie": 0}
     for path, result in games:
-        lines, me = read_log(path)
+        lines, me = read_log(path, args.username)
         if me is None:
             print(f"  ?? could not find influxobot in {path}")
             continue
