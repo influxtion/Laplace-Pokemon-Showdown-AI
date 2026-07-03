@@ -159,6 +159,76 @@ class _SetSheet:
 SETS = _SetSheet()
 
 
+# --- joint set data (complete sets with observed counts) ------------------------------------
+# Aggregated real generated randbats sets: "level,item,ability,move1..move4,teraType" -> count
+# (from foul-play's public dataset, data.foulplay.cc). Sampling complete JOINT sets weighted
+# by count preserves the move/item/ability/tera correlations that marginal probabilities lose
+# and matches the true generator distribution. Validated need: at compute-matched settings we
+# lost 1-11 to Foul Play, whose only relevant structural edge was this sampling.
+_JOINT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "data_joint_sets_gen9.json")
+
+
+class _JointSets:
+    def __init__(self, path=_JOINT_PATH):
+        self.by_species = {}
+        try:
+            raw = json.load(open(path, encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        for sp, sets in raw.items():
+            parsed = []
+            for key, count in sets.items():
+                parts = key.split(",")
+                if len(parts) < 5:
+                    continue
+                try:
+                    level = int(parts[0])
+                except ValueError:
+                    continue
+                parsed.append({
+                    "level": level,
+                    "item": to_id_str(parts[1]),
+                    "ability": to_id_str(parts[2]),
+                    "tera": parts[-1].lower(),
+                    "moves": [to_id_str(m) for m in parts[3:-1]],
+                    "count": int(count),
+                })
+            if parsed:
+                self.by_species[to_id_str(sp)] = parsed
+
+    def sample(self, species_id, revealed_moves=(), item=None, ability=None,
+               item_exclude=(), force_scarf=False):
+        """One complete set consistent with the evidence, weighted by observed count.
+
+        Filters are applied as a ladder that never empties the pool: each constraint
+        narrows the candidates only if survivors remain (a stale dataset must degrade
+        to 'less informed', never to 'no set')."""
+        cands = self.by_species.get(species_id)
+        if not cands:
+            return None
+        revealed = set(revealed_moves)
+
+        def narrow(pool, pred):
+            kept = [s for s in pool if pred(s)]
+            return kept or pool
+
+        cands = narrow(cands, lambda s: revealed <= set(s["moves"]))
+        if item:
+            cands = narrow(cands, lambda s: s["item"] == item)
+        elif force_scarf:
+            cands = narrow(cands, lambda s: s["item"] == "choicescarf")
+        elif item_exclude:
+            cands = narrow(cands, lambda s: s["item"] not in item_exclude)
+        if ability:
+            cands = narrow(cands, lambda s: s["ability"] == ability)
+        weights = [s["count"] for s in cands]
+        return random.choices(cands, weights=weights)[0]
+
+
+JOINT = _JointSets()
+
+
 # Real per-role item/ability/tera probabilities from the pkmn randbats *stats* feed (the set
 # sheet has no items, so we previously guessed -> under-estimated Choice/Life Orb/weather damage
 # and stayed in fatal matchups). Cached locally; refresh with the curl in the module docstring.
@@ -305,13 +375,16 @@ def _own_pokemon(mon, moves_override=None):
     )
 
 
-def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None, speed_hint=None):
+def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None, speed_hint=None,
+                              use_joint=False):
     """Build an engine Pokemon for a revealed opponent mon, sampling its hidden set.
     use_stats toggles the real randbats item/ability/tera feed (for A/B testing it).
     used_since_switch: move ids this mon has used since it last switched in (active mon only) --
     2+ distinct moves rules out a Choice item, 1 move + a Choice item means it's locked.
     speed_hint: 'scarf'/'noscarf' verdict from observed turn order (randbats speed spreads are
-    fixed, so outspeeding its known raw speed means Scarf) -- overrides item sampling."""
+    fixed, so outspeeding its known raw speed means Scarf) -- overrides item sampling.
+    use_joint: sample a complete counted joint set (see _JointSets) instead of composing
+    the set from marginals; falls through to the marginal path when no joint data exists."""
     species = to_id_str(mon.species)
     # Formes that appear mid-battle (Mimikyu-Busted, Ogerpon-*-Tera, etc.) aren't keys in the
     # randbats sheet/stats feed; fall back to the base species so we still get real sets.
@@ -321,9 +394,47 @@ def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None, speed
     revealed = list(mon.moves.keys())
     # A mon that used two different moves without leaving the field can't be Choice-locked.
     multi_moved = bool(used_since_switch) and len(used_since_switch) >= 2
-    s = SETS.sample_set(sheet_id, revealed)
     item_exclude = _CHOICE_ITEMS if multi_moved else \
         ("choicescarf",) if speed_hint == "noscarf" else ()
+
+    if use_joint:
+        joint_id = species if species in JOINT.by_species else to_id_str(mon.base_species)
+        js = JOINT.sample(
+            joint_id, revealed_moves=revealed,
+            item=to_id_str(mon.item) if mon.item else None,
+            ability=to_id_str(mon.ability) if mon.ability else None,
+            item_exclude=item_exclude,
+            force_scarf=(speed_hint == "scarf" and not mon.item and not multi_moved))
+        if js is not None:
+            move_ids = (list(dict.fromkeys(revealed))
+                        + [m for m in js["moves"] if m not in revealed])[:4]
+            ability = to_id_str(mon.ability) if mon.ability else js["ability"]
+            tera = (mon.tera_type.name.lower() if getattr(mon, "tera_type", None)
+                    else js["tera"])
+            item = to_id_str(mon.item) if mon.item else js["item"]
+            if speed_hint == "scarf" and not mon.item and not multi_moved:
+                item = "choicescarf"
+            locked = None
+            last = getattr(mon, "last_move", None)
+            if (last is not None and not multi_moved and last.id in move_ids
+                    and (item in _CHOICE_ITEMS or ability == "gorillatactics")):
+                locked = last.id
+            maxhp = _maxhp(mon, own=False)
+            return PEPokemon(
+                id=species, level=mon.level or js["level"],
+                types=_types_tuple(mon), base_types=_base_types_tuple(mon),
+                hp=_hp(mon, maxhp), maxhp=maxhp,
+                ability=ability, base_ability=ability, item=item,
+                nature="serious", evs=(85,) * 6,
+                attack=_stat(mon, "atk", False), defense=_stat(mon, "def", False),
+                special_attack=_stat(mon, "spa", False),
+                special_defense=_stat(mon, "spd", False),
+                speed=_stat(mon, "spe", False),
+                status=_status_str(mon), moves=_moves_from_ids(move_ids, only_enabled=locked),
+                tera_type=tera, terastallized=bool(getattr(mon, "is_terastallized", False)),
+            )
+
+    s = SETS.sample_set(sheet_id, revealed)
     if s is not None:
         role = s.get("role", "")
         st_item = STATS.item(sheet_id, role, exclude=item_exclude) if use_stats else None
@@ -374,8 +485,39 @@ def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None, speed
     )
 
 
-def _sampled_unrevealed_pokemon(species_id, use_stats=True):
+def _sampled_unrevealed_pokemon(species_id, use_stats=True, use_joint=False):
     """A wholly-unseen opponent bench slot: pick a random set for this species."""
+    if use_joint:
+        js = JOINT.sample(species_id)
+        if js is not None:
+            entry = _POKEDEX.get(species_id) or {}
+            base = entry.get("baseStats", {})
+
+            class _Shim:
+                def __init__(s_):
+                    s_.base_stats = {k: base.get(k, 80)
+                                     for k in ("hp", "atk", "def", "spa", "spd", "spe")}
+                    s_.level = js["level"]
+                    s_.stats = {}
+            shim = _Shim()
+            maxhp = int(_estimate_stat(shim, "hp"))
+            types = [t.lower() for t in entry.get("types", ["normal"])]
+            if len(types) == 1:
+                types.append("typeless")
+            return PEPokemon(
+                id=species_id, level=js["level"],
+                types=(types[0], types[1]), base_types=(types[0], types[1]),
+                hp=maxhp, maxhp=maxhp,
+                ability=js["ability"], base_ability=js["ability"], item=js["item"],
+                nature="serious", evs=(85,) * 6,
+                attack=int(_estimate_stat(shim, "atk")),
+                defense=int(_estimate_stat(shim, "def")),
+                special_attack=int(_estimate_stat(shim, "spa")),
+                special_defense=int(_estimate_stat(shim, "spd")),
+                speed=int(_estimate_stat(shim, "spe")),
+                status="None", moves=_moves_from_ids(js["moves"]),
+                tera_type=js["tera"], terastallized=False,
+            )
     info = SETS.by_species.get(species_id)
     if not info or not info["sets"]:
         return PEPokemon(id=species_id, level=SETS.level(species_id))
@@ -553,14 +695,16 @@ def _our_side(battle, pending=None):
 
 
 def _opp_side(battle, use_stats=True, opp_used_since_switch=None, opp_speed_hints=None,
-              pending=None):
+              pending=None, use_joint=False):
     hints = opp_speed_hints or {}
     active = battle.opponent_active_pokemon
     active_pe = _opp_pokemon_determinized(active, use_stats, used_since_switch=opp_used_since_switch,
-                                          speed_hint=hints.get(to_id_str(active.species)))
+                                          speed_hint=hints.get(to_id_str(active.species)),
+                                          use_joint=use_joint)
     bench = [m for m in battle.opponent_team.values() if m is not active]
     pkmn = [active_pe] + [_opp_pokemon_determinized(m, use_stats,
-                                                    speed_hint=hints.get(to_id_str(m.species)))
+                                                    speed_hint=hints.get(to_id_str(m.species)),
+                                                    use_joint=use_joint)
                           for m in bench]
 
     # Fill unseen bench up to 6 with sampled species (so endgame / faint-count eval is sane).
@@ -571,7 +715,7 @@ def _opp_side(battle, use_stats=True, opp_used_since_switch=None, opp_speed_hint
             pkmn.append(_dummy())
             continue
         seen.add(sp)
-        pkmn.append(_sampled_unrevealed_pokemon(sp, use_stats))
+        pkmn.append(_sampled_unrevealed_pokemon(sp, use_stats, use_joint=use_joint))
     opp_role = "p2" if (battle.player_role or "p1") == "p1" else "p1"
     wish, fs = _delayed(pending, opp_role, battle.turn)
     last_used = _last_used_str(active, active_pe.moves)
@@ -617,19 +761,22 @@ def _trick_room(battle):
 
 
 def build_state(battle, use_stats=True, opp_used_since_switch=None, opp_speed_hints=None,
-                pending=None):
+                pending=None, use_joint=False):
     """A determinized poke-engine State for the current position. Call repeatedly to get
     different opponent-set samples. use_stats toggles the real randbats item/ability/tera feed.
     opp_used_since_switch: move ids the opponent's active has used since switching in (the
     caller tracks this across turns) -- drives Choice-lock inference.
     opp_speed_hints: {species_id: 'scarf'|'noscarf'} turn-order verdicts (see engine_search).
-    pending: tracked Wish/Future Sight effects ({'p1_wish': (turn, amt), 'p2_fs': turn, ...})."""
+    pending: tracked Wish/Future Sight effects ({'p1_wish': (turn, amt), 'p2_fs': turn, ...}).
+    use_joint: sample complete counted joint sets (distributionally correct) instead of
+    composing sets from marginals."""
     weather, weather_left = _weather_str(battle)
     terrain, terrain_left = _terrain_str(battle)
     tr, tr_left = _trick_room(battle)
     return State(
         side_one=_our_side(battle, pending),
-        side_two=_opp_side(battle, use_stats, opp_used_since_switch, opp_speed_hints, pending),
+        side_two=_opp_side(battle, use_stats, opp_used_since_switch, opp_speed_hints, pending,
+                           use_joint=use_joint),
         weather=weather, weather_turns_remaining=weather_left,
         terrain=terrain, terrain_turns_remaining=terrain_left,
         trick_room=tr, trick_room_turns_remaining=tr_left, team_preview=False,

@@ -1,4 +1,4 @@
-r"""EnginePlayer: a poke-env bot that searches with poke-engine (the Foul Play recipe).
+﻿r"""EnginePlayer: a poke-env bot that searches with poke-engine (the Foul Play recipe).
 
 For each of our turns we:
   1. sample N_DETERMINIZATIONS concrete opponent teams consistent with what's revealed
@@ -16,6 +16,9 @@ opponent's hidden set.
 A poke-env Player, used at test time -- see eval_search.py / play.py / ladder.py.
 """
 
+from collections import namedtuple
+from concurrent.futures import ProcessPoolExecutor
+
 import numpy as np
 
 from poke_env.player import Player
@@ -30,6 +33,35 @@ from poke_engine_adapter import build_state
 def _spe_mult(boost):
     """Speed multiplier for a boost stage."""
     return (2 + boost) / 2 if boost >= 0 else 2 / (2 - boost)
+
+
+# --- parallel determinization search ---------------------------------------------
+# poke-engine holds the GIL while searching, so concurrent worlds need PROCESSES.
+# Foul Play does exactly this (its 12 worlds cost 120ms wall instead of 1.4s); it is
+# why it affords 2x our world count on the same move timer. States cross the process
+# boundary as strings; results come back as plain tuples (MctsResult is a Rust object
+# and does not pickle).
+
+_Opt = namedtuple("_Opt", "move_choice visits")
+_Res = namedtuple("_Res", "side_one side_two total_visits")
+
+
+def _search_world(state_str, time_ms, threads):
+    """Worker: rebuild the state, search it, return a picklable result (None on panic)."""
+    from poke_engine import State, monte_carlo_tree_search as _mcts
+    try:
+        res = _mcts(State.from_string(state_str), time_ms, threads=threads)
+        return ([(o.move_choice, o.visits) for o in res.side_one],
+                [(o.move_choice, o.visits) for o in res.side_two],
+                res.total_visits)
+    except BaseException:
+        return None
+
+
+def _shim(raw):
+    """Worker tuple -> an object with the same shape the sequential path produces."""
+    s1, s2, total = raw
+    return _Res([_Opt(c, v) for c, v in s1], [_Opt(c, v) for c, v in s2], total)
 
 
 class EnginePlayer(Player):
@@ -48,7 +80,7 @@ class EnginePlayer(Player):
                  debug=False, record=False, use_stats=True, speed_inference=True,
                  value_model_path=None, value_worlds=4, value_opp_moves=2,
                  value_margin=11.0, value_on_force_switch=False, value_boost_margin=0.0,
-                 tera_min_wins=1, **kwargs):
+                 tera_min_wins=1, parallel_worlds=False, use_joint_sets=True, **kwargs):
         super().__init__(*args, **kwargs)
         if n_determinizations is not None:
             self.N_DETERMINIZATIONS = n_determinizations
@@ -99,6 +131,18 @@ class EnginePlayer(Player):
         # mirror can't price the tempo lost by holding tera in tera-races. Reverted to 1
         # (2026-07-02); the knob stays for future study at higher determinization counts.
         self.tera_min_wins = tera_min_wins
+        # Search all determinized worlds concurrently in a process pool (see module top).
+        # Same wall-clock budget buys N_DETERMINIZATIONS x more search.
+        self.parallel_worlds = parallel_worlds
+        # Sample complete counted joint sets in determinization (distributionally correct;
+        # from the compute-matched Foul Play benchmark diagnosis).
+        self.use_joint_sets = use_joint_sets
+        self._executor = None
+
+    def _pool(self):
+        if self._executor is None:
+            self._executor = ProcessPoolExecutor(max_workers=min(self.N_DETERMINIZATIONS, 12))
+        return self._executor
         if value_model_path:
             self._load_value_model(value_model_path)
 
@@ -244,18 +288,50 @@ class EnginePlayer(Player):
         self._worlds = []
         opp_used = self._opp_used_since_switch(battle)
         speed_hints = self._opp_speed.get(battle.battle_tag, {})
-        for _ in range(self.N_DETERMINIZATIONS):
-            try:
-                state = build_state(battle, use_stats=self.use_stats,
-                                    opp_used_since_switch=opp_used,
-                                    opp_speed_hints=speed_hints,
-                                    pending=self._pending.get(battle.battle_tag))
-                res = monte_carlo_tree_search(state, self.SEARCH_TIME_MS, threads=self.THREADS)
-            except BaseException:
-                # poke-engine can *panic* on an inconsistent state (raises PanicException, which
-                # is NOT an Exception subclass); skip that sample rather than crash the turn.
-                self.diag["det_fail"] += 1
-                continue
+
+        searched = []            # (state, result) pairs from either search path
+        if self.parallel_worlds:
+            jobs = []
+            for _ in range(self.N_DETERMINIZATIONS):
+                try:
+                    state = build_state(battle, use_stats=self.use_stats,
+                                        opp_used_since_switch=opp_used,
+                                        opp_speed_hints=speed_hints,
+                                        pending=self._pending.get(battle.battle_tag),
+                                        use_joint=self.use_joint_sets)
+                    fut = self._pool().submit(_search_world, state.to_string(),
+                                              self.SEARCH_TIME_MS, self.THREADS)
+                    jobs.append((state, fut))
+                except BaseException:
+                    self.diag["det_fail"] += 1
+            for state, fut in jobs:
+                try:
+                    raw = fut.result(timeout=self.SEARCH_TIME_MS / 1000 * 4 + 10)
+                except Exception:
+                    raw = None
+                if raw is None:
+                    self.diag["det_fail"] += 1
+                    continue
+                searched.append((state, _shim(raw)))
+        else:
+            for _ in range(self.N_DETERMINIZATIONS):
+                try:
+                    state = build_state(battle, use_stats=self.use_stats,
+                                        opp_used_since_switch=opp_used,
+                                        opp_speed_hints=speed_hints,
+                                        pending=self._pending.get(battle.battle_tag),
+                                        use_joint=self.use_joint_sets)
+                    res = monte_carlo_tree_search(state, self.SEARCH_TIME_MS,
+                                                  threads=self.THREADS)
+                except BaseException:
+                    # poke-engine can *panic* on an inconsistent state (raises
+                    # PanicException, which is NOT an Exception subclass); skip that
+                    # sample rather than crash the turn.
+                    self.diag["det_fail"] += 1
+                    continue
+                searched.append((state, res))
+
+        for state, res in searched:
             self.diag["det_runs"] += 1
             self._worlds.append((state, res))
             total = res.total_visits or 1
