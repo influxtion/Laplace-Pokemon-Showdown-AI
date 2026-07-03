@@ -138,13 +138,13 @@ class EnginePlayer(Player):
         # from the compute-matched Foul Play benchmark diagnosis).
         self.use_joint_sets = use_joint_sets
         self._executor = None
+        if value_model_path:
+            self._load_value_model(value_model_path)
 
     def _pool(self):
         if self._executor is None:
             self._executor = ProcessPoolExecutor(max_workers=min(self.N_DETERMINIZATIONS, 12))
         return self._executor
-        if value_model_path:
-            self._load_value_model(value_model_path)
 
     def _load_value_model(self, path):
         import torch
