@@ -80,7 +80,8 @@ class EnginePlayer(Player):
                  debug=False, record=False, use_stats=True, speed_inference=True,
                  value_model_path=None, value_worlds=4, value_opp_moves=2,
                  value_margin=11.0, value_on_force_switch=False, value_boost_margin=0.0,
-                 tera_min_wins=1, parallel_worlds=False, use_joint_sets=True, **kwargs):
+                 tera_min_wins=1, parallel_worlds=False, use_joint_sets=True,
+                 mix_root=False, mix_frac=0.75, robust_vote=True, **kwargs):
         super().__init__(*args, **kwargs)
         if n_determinizations is not None:
             self.N_DETERMINIZATIONS = n_determinizations
@@ -137,6 +138,29 @@ class EnginePlayer(Player):
         # Sample complete counted joint sets in determinization (distributionally correct;
         # from the compute-matched Foul Play benchmark diagnosis).
         self.use_joint_sets = use_joint_sets
+        # Mixed root strategy (the second structural Foul Play edge, after joint sets):
+        # deterministic argmax is exploitable -- humans switch immunity absorbers into our
+        # predictable clicks, and FP's MCTS found the same holes (twice-evidenced: 1800+
+        # ladder replay 2026-07-02, compute-matched FP benchmark 2026-07-03). When ON, the
+        # final choice is sampled (score-weighted) among world-winners within mix_frac of
+        # the top score that no guard vetoed; '-tera' is only playable as the argmax (the
+        # once-per-game resource is never spent on a die roll).
+        self.mix_root = mix_root
+        self.mix_frac = mix_frac
+        self._vetoed = set()     # choices demoted by a guard this turn: never in the mix
+        # robust_vote=False reverts aggregation to FP-style plain averaging of visit
+        # shares (joint sampling draws worlds by count, so the uniform average IS the
+        # likelihood-weighted one). The robust vote was built when marginal sampling
+        # over-represented incoherent worlds (the Scale-Shot-into-Fairy pathology);
+        # with joint sets those worlds may no longer occur, and averaging preserves
+        # more of the policy mass for mixing. Downstream scores stay on the same
+        # w*10+share scale (a plain-average "winner" = its argmax world count) so the
+        # guards' >=10 world-winner checks keep meaning.
+        self.robust_vote = robust_vote
+        # Minimum score of a "trusted" candidate for the guards/mix/rerank. Robust mode:
+        # 10.0 = won a world (scores are w*10+share). Averaging mode: scores are plain
+        # 0..1 shares and every candidate is honestly ranked, so the floor is 0.
+        self._win_floor = 10.0 if robust_vote else 0.0
         self._executor = None
         if value_model_path:
             self._load_value_model(value_model_path)
@@ -352,6 +376,12 @@ class EnginePlayer(Player):
         scores = {}
         for choice, share in pooled.items():
             share /= runs
+            if not self.robust_vote:
+                # FP-style plain average of visit shares. Joint sampling draws worlds
+                # by count, so the uniform average IS the likelihood-weighted one;
+                # tera_min_wins is inert here.
+                scores[choice] = share
+                continue
             w = wins.get(choice, 0)
             needed = self.tera_min_wins if choice.endswith("-tera") else 1
             scores[choice] = (w * 10.0 + share) if w >= needed else share * 1e-3
@@ -384,6 +414,7 @@ class EnginePlayer(Player):
                 return self.choose_default_move(battle)
 
             self.diag["turns"] += 1
+            self._vetoed = set()
             pooled = self._pooled_policy(battle)
             if not pooled:
                 self.diag["empty_pooled"] += 1
@@ -392,13 +423,14 @@ class EnginePlayer(Player):
             ranked = self._value_rerank(ranked, battle)
             ranked = self._noop_demote(ranked)
             ranked = self._dead_lock_guard(battle, ranked)
+            ranked, mixed = self._mix_sample(ranked)
             for choice, _share in ranked:
                 order = self._order_for_choice(choice, battle)
                 if order is not None:
                     if self.debug:
                         self._log(battle, pooled, choice)
                     if self.record:
-                        self._record(battle, pooled, choice, fallback=False)
+                        self._record(battle, pooled, choice, fallback=False, mixed=mixed)
                     return order
             # Engine gave nothing usable -> safe fallback (a dumb move; a bug signal if frequent).
             self.diag["fallback"] += 1
@@ -409,6 +441,44 @@ class EnginePlayer(Player):
         except Exception:
             self.diag["fallback"] += 1
             return self.choose_random_move(battle)
+
+    def _mix_sample(self, ranked):
+        """Sample the final choice among near-tied world-winners (mix_root=True).
+
+        Deterministic argmax is exploitable: humans (and Foul Play's MCTS) learn our
+        response and switch the counter in -- the immune-absorber pattern from the
+        2026-07-02 fresh-run mining. Foul Play's answer is a mixed root strategy
+        (random.choices over moves within 75% of the top score); this is our port,
+        constrained so it can never undo a shipped guard:
+          - only world-winners (score >= 10) are ever eligible;
+          - the eligible set is the PREFIX of the final ranked order -- the first
+            candidate below mix_frac * top_score, below 10, or vetoed by a guard
+            (noop / dead-lock / immune-tiebreak) ends it, so guard-demoted choices
+            and everything after them stay out;
+          - '-tera' is eligible only as the argmax: the once-per-game resource is
+            never spent on a die roll (tera_wasted is loss-correlated on ladder);
+          - weights are the robust-vote scores, so world-win counts dominate.
+        Returns (possibly reordered ranked, whether a non-argmax choice was sampled)."""
+        if not self.mix_root or len(ranked) < 2 or ranked[0][1] < self._win_floor:
+            return ranked, False
+        top_score = ranked[0][1]
+        elig = []
+        for i, (choice, score) in enumerate(ranked):
+            if (score < self._win_floor or score < top_score * self.mix_frac
+                    or choice in self._vetoed):
+                break
+            if i > 0 and choice.endswith("-tera"):
+                continue
+            elig.append((choice, score))
+        if len(elig) < 2:
+            return ranked, False
+        import random
+        pick = random.choices([c for c, _ in elig], weights=[s for _, s in elig], k=1)[0]
+        if pick == ranked[0][0]:
+            return ranked, False
+        self.diag["mix_fired"] = self.diag.get("mix_fired", 0) + 1
+        scores = dict(ranked)
+        return [(pick, scores[pick])] + [rc for rc in ranked if rc[0] != pick], True
 
     # --- learned value re-ranking ---------------------------------------------
 
@@ -445,9 +515,12 @@ class EnginePlayer(Player):
         if self._value_model is None or len(ranked) < 2 or not self._worlds:
             return ranked
         top_score = ranked[0][1]
-        if top_score < 10.0:      # top choice won no world: nothing trustworthy to rerank
+        if top_score < self._win_floor:   # top choice won no world: nothing trustworthy
             return ranked
-        margin = self.value_margin
+        # value_margin/value_boost_margin are calibrated in robust-vote units (one
+        # world-win = 10); averaging-mode scores are 0..1 shares, so /100 keeps the
+        # authority band roughly equivalent (11 -> 0.11 of pooled share).
+        margin = self.value_margin if self.robust_vote else self.value_margin / 100.0
         free_switch = (self.value_on_force_switch and battle is not None
                        and bool(getattr(battle, "force_switch", False)))
         if free_switch:
@@ -457,8 +530,9 @@ class EnginePlayer(Player):
             if opp is not None:
                 b = opp.boosts
                 if b.get("atk", 0) + b.get("spa", 0) + b.get("spe", 0) >= 2:
-                    margin = self.value_boost_margin
-        tied = [c for c, s in ranked if s >= 10.0 and top_score - s <= margin]
+                    margin = self.value_boost_margin if self.robust_vote \
+                        else self.value_boost_margin / 100.0
+        tied = [c for c, s in ranked if s >= self._win_floor and top_score - s <= margin]
         if len(tied) < 2:
             return ranked
         tied = tied[:5 if free_switch else 3]
@@ -531,9 +605,9 @@ class EnginePlayer(Player):
         attacker differs from passing, so it survives; vs a status click it genuinely is
         a pass and gets demoted. Switches never match the pass-turn baseline, so they are
         checked but effectively always kept."""
-        if len(ranked) < 2 or not self._worlds or ranked[0][1] < 10.0:
+        if len(ranked) < 2 or not self._worlds or ranked[0][1] < self._win_floor:
             return ranked
-        winners = [c for c, s in ranked if s >= 10.0][:3]
+        winners = [c for c, s in ranked if s >= self._win_floor][:3]
         if len(winners) < 2:
             return ranked
         state, res = self._worlds[0]
@@ -555,6 +629,7 @@ class EnginePlayer(Player):
                 self.diag["noop_err"] = self.diag.get("noop_err", 0) + 1
         if not noops or len(noops) == len(winners):
             return ranked
+        self._vetoed |= noops
         if ranked[0][0] in noops:
             self.diag["noop_demote"] = self.diag.get("noop_demote", 0) + 1
         scores = dict(ranked)
@@ -586,22 +661,28 @@ class EnginePlayer(Player):
             return mv is not None and getattr(mv.category, "name", "") == "STATUS"
 
         top_choice, top_score = ranked[0]
-        if top_score < 10.0 or not is_status(top_choice):
+        if top_score < self._win_floor or not is_status(top_choice):
             return ranked
         for i, (choice, score) in enumerate(ranked[1:], start=1):
-            if score >= 10.0 and not is_status(choice):
+            if score >= self._win_floor and not is_status(choice):
                 self.diag["dead_lock_guard"] = self.diag.get("dead_lock_guard", 0) + 1
+                self._vetoed.add(top_choice)
                 order = [ranked[i]] + ranked[:i] + ranked[i + 1:]
                 return order
         return ranked
 
-    def _damage_tiebreak(self, battle, ranked, eps=0.15):
+    def _damage_tiebreak(self, battle, ranked, eps=None):
         """Among effectively-tied top choices, prefer the one that actually damages the
         *revealed* current opponent. Observed live: Close Combat and Brave Bird each won 3
         worlds with identical pooled shares vs a Ghost-type, and the coin flip landed on the
         immune move. Determinization noise can't distinguish exact ties; a one-shot damage
         estimate against the known opponent can. Switches in the tie keep their position
         relative to each other but rank below any move that deals damage."""
+        if eps is None:
+            # Robust mode: 0.15 share gap within the same world-win count is a tie.
+            # Averaging mode scores are pure shares where 0.15 is a real preference
+            # gap, so "tied" is much tighter there.
+            eps = 0.15 if self.robust_vote else 0.03
         if len(ranked) < 2 or ranked[0][1] - ranked[1][1] >= eps:
             return ranked
         me, opp = battle.active_pokemon, battle.opponent_active_pokemon
@@ -623,13 +704,20 @@ class EnginePlayer(Player):
             return -1.0
 
         tied.sort(key=lambda rc: dmg(rc[0]), reverse=True)
+        # A tied MOVE that deals nothing while a tied alternative deals real damage is the
+        # exact immune-click case this guard exists for -- keep it out of any root mix too
+        # (switches, dmg sentinel -1, are a different action class and stay mixable).
+        best_dmg = dmg(tied[0][0])
+        if best_dmg > 0.1:
+            self._vetoed |= {c for c, _s in tied
+                             if not c.startswith("switch ") and dmg(c) <= 0.0}
         return tied + ranked[len(tied):]
 
-    def _record(self, battle, pooled, choice, fallback):
+    def _record(self, battle, pooled, choice, fallback, mixed=False):
         """Append a per-turn decision snapshot for post-hoc loss analysis (record=True)."""
         me, opp = battle.active_pokemon, battle.opponent_active_pokemon
         top = sorted(pooled.items(), key=lambda kv: kv[1], reverse=True)[:3]
-        self.traces.setdefault(battle.battle_tag, []).append({
+        entry = {
             "turn": battle.turn,
             "me": f"{me.species} {me.current_hp_fraction:.0%}" if me else "-",
             "opp": f"{opp.species} {opp.current_hp_fraction:.0%}" if opp else "-",
@@ -638,7 +726,10 @@ class EnginePlayer(Player):
             "top": [(c, round(s, 2)) for c, s in top],
             "choice": choice,
             "fallback": fallback,
-        })
+        }
+        if mixed:
+            entry["mixed"] = True
+        self.traces.setdefault(battle.battle_tag, []).append(entry)
 
     def choose_max_damage_move(self, battle):
         if battle.available_moves:

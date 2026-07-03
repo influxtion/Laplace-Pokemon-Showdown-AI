@@ -38,22 +38,32 @@ async def main():
     ap.add_argument("--det", type=int, default=6)
     ap.add_argument("--time-ms", type=int, default=120)
     ap.add_argument("--threads", type=int, default=2)
+    ap.add_argument("--mix", action="store_true",
+                    help="mixed root strategy (sample among near-tied world-winners)")
+    ap.add_argument("--avg", action="store_true",
+                    help="FP-style share averaging instead of the robust vote")
+    ap.add_argument("--mix-frac", type=float, default=0.75,
+                    help="mix window as a fraction of the top score")
+    ap.add_argument("--username", default="influxbench",
+                    help="account name (use a distinct one per config for mining)")
     args = ap.parse_args()
 
     value_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                               "models", "value_net.pt")
     agent = EnginePlayer(
-        account_configuration=AccountConfiguration("influxbench", None),
+        account_configuration=AccountConfiguration(args.username, None),
         server_configuration=LocalhostServerConfiguration,
         battle_format=BATTLE_FORMAT,
         n_determinizations=args.det, search_time_ms=args.time_ms, threads=args.threads,
         value_model_path=value_path if os.path.exists(value_path) else None,
-        value_boost_margin=26, record=True,
+        value_boost_margin=26, record=True, mix_root=args.mix,
+        mix_frac=args.mix_frac, robust_vote=not args.avg,
         start_timer_on_battle_start=True,
     )
 
     print(f"Challenging {args.opponent} to {args.battles} game(s) "
-          f"(det={args.det}, {args.time_ms}ms, {args.threads}t)...", flush=True)
+          f"(det={args.det}, {args.time_ms}ms, {args.threads}t, mix={args.mix}, "
+          f"avg={args.avg})...", flush=True)
     os.makedirs(OUT_DIR, exist_ok=True)
     saved = set()
     # One challenge at a time with a pause: Foul Play only accepts while it is back in

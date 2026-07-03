@@ -78,9 +78,14 @@ def build_agent(model, account, kind):
                                   "models", "value_net.pt")
         # value_boost_margin: wider net authority while the opponent is visibly boosted --
         # 55% in mirror A/B (n=60, dilution expected for eval fixes); the ladder is its test.
+        # FP-recipe root (2026-07-03): plain share averaging + mixed strategy in a 0.9
+        # window. vs Foul Play 57% (17-13) at mix_frac=0.9 vs 28.3% (17-43) for robust
+        # argmax; mirror gate 47.5%/120 (the small tax buys unexploitability the mirror
+        # can't price -- humans switch immunity absorbers into deterministic clicks).
         return EnginePlayer(n_determinizations=8, search_time_ms=150, threads=8, record=True,
                             value_model_path=value_path if os.path.exists(value_path) else None,
                             value_boost_margin=26,
+                            robust_vote=False, mix_root=True, mix_frac=0.9,
                             **kwargs)
     if kind == "search":
         return SearchPlayer(model=model, **kwargs)
