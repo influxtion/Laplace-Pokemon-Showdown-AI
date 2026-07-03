@@ -13,7 +13,7 @@ and Terastallization are modelled correctly, and MCTS handles the simultaneous-m
 turn (plain minimax lets the opponent "see" our move). Determinization is how we cope with the
 opponent's hidden set.
 
-A poke-env Player, used at test time -- see eval_search.py / play.py / ladder.py.
+A poke-env Player, used at test time -- see ladder.py / bench_foulplay.py / eval_engine.py.
 """
 
 from collections import namedtuple
