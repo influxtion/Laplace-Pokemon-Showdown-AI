@@ -728,7 +728,15 @@ class EnginePlayer(Player):
                         return 0.0
             return -1.0
 
+        argmax = ranked[0][0]
         tied.sort(key=lambda rc: dmg(rc[0]), reverse=True)
+        # '-tera' only as the argmax, same rule as every other reranker: dmg() strips the
+        # '-tera' suffix so a tera twin sorts by its plain damage anyway, and promoting one
+        # on a tie spends the once-per-game resource on a coin flip (observed live
+        # 2026-07-04: spikes 0.19 vs woodhammer-tera 0.18 -> tera burned on a 0.01 tie,
+        # the last reranker with this hole).
+        tied = ([rc for rc in tied if rc[0] == argmax or not rc[0].endswith("-tera")]
+                + [rc for rc in tied if rc[0] != argmax and rc[0].endswith("-tera")])
         # A tied MOVE that deals nothing while a tied alternative deals real damage is the
         # exact immune-click case this guard exists for -- keep it out of any root mix too
         # (switches, dmg sentinel -1, are a different action class and stay mixable).
