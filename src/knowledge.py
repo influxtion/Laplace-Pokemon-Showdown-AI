@@ -86,14 +86,70 @@ def _max_hp(mon):
     return _estimate_stat(mon, "hp")
 
 
+# Abilities that nullify a whole attack type (immunity or absorb-heal). The type chart
+# (damage_multiplier) misses these: an Earth Eater Orthworm reads as taking full Earthquake
+# damage, and the engine-side search only prices the absorb inside its own determinized
+# worlds -- when MCTS visit shares flatten in a bad position, the pooled argmax can land on
+# a move that literally heals the target (observed live 2026-07-04, game ...847095 T34).
+_ABSORB_ABILITY_TYPE = {
+    "levitate": "GROUND", "eartheater": "GROUND",
+    "waterabsorb": "WATER", "dryskin": "WATER", "stormdrain": "WATER",
+    "voltabsorb": "ELECTRIC", "lightningrod": "ELECTRIC", "motordrive": "ELECTRIC",
+    "flashfire": "FIRE", "wellbakedbody": "FIRE",
+    "sapsipper": "GRASS",
+}
+
+# Mold Breaker-class attackers punch through every ability above.
+_ABILITY_IGNORING = {"moldbreaker", "teravolt", "turboblaze"}
+
+# Moves whose effective type/interaction breaks the simple table: Tera Blast's type is the
+# user's tera type, Thousand Arrows hits through Ground immunities.
+_ABSORB_CHECK_SKIP = {"terablast", "thousandarrows"}
+
+
+def _ability_absorbs(attacker, move, defender):
+    """True iff the defender's ability CERTAINLY nullifies this move: the ability is
+    revealed, or every still-possible randbats set for the species runs an absorbing
+    ability for the move's type. Any uncertainty -> False (never veto on a guess)."""
+    if move.id in _ABSORB_CHECK_SKIP or move.type is None:
+        return False
+    if attacker is not None and to_id_str(attacker.ability or "") in _ABILITY_IGNORING:
+        return False
+    mtype = move.type.name
+    if defender.ability:
+        return _ABSORB_ABILITY_TYPE.get(to_id_str(defender.ability)) == mtype
+    probs = KNOWLEDGE.predicted_abilities(defender)
+    absorbed = sum(p for a, p in probs.items() if _ABSORB_ABILITY_TYPE.get(a) == mtype)
+    return absorbed >= 0.99
+
+
+def move_nullified(attacker, move, defender):
+    """True iff an attacking `move` is CERTAIN to deal zero damage to `defender`:
+    type-chart immunity on the revealed typing, or an absorb ability per
+    _ability_absorbs. Deterministic hard knowledge only -- safe to demote on."""
+    try:
+        if move is None or defender is None or move.base_power <= 0:
+            return False
+        if move.id in _ABSORB_CHECK_SKIP:
+            return False
+        if defender.damage_multiplier(move) == 0:
+            return True
+        return _ability_absorbs(attacker, move, defender)
+    except Exception:
+        return False
+
+
 def estimate_damage_fraction(attacker, move, defender):
     """Estimated damage of `move` from `attacker` into `defender`, as a fraction of the
-    defender's max HP (0 for status/immune, clamped to 1.5 for overkill).
+    defender's max HP (0 for status/immune/certainly-absorbed, clamped to 1.5 for
+    overkill).
 
     Runs in the hot loop on live moves, so it swallows errors: one odd move's data
     shouldn't crash a multi-hour run, and a missed estimate just reads 0.
     """
     try:
+        if _ability_absorbs(attacker, move, defender):
+            return 0.0
         return _estimate_damage_fraction(attacker, move, defender)
     except Exception:
         return 0.0

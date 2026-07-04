@@ -26,7 +26,8 @@ from poke_env.data import to_id_str
 
 from poke_engine import monte_carlo_tree_search, generate_instructions
 
-from knowledge import estimate_damage_fraction, get_move, safe_priority, _estimate_stat
+from knowledge import (estimate_damage_fraction, get_move, move_nullified, safe_priority,
+                       _estimate_stat)
 from poke_engine_adapter import build_state
 
 
@@ -433,6 +434,7 @@ class EnginePlayer(Player):
                 top = rk[0][0] if rk else top
                 return rk
 
+            ranked = _stage("absorb", self._absorb_demote(battle, ranked))
             ranked = _stage("tiebreak", self._damage_tiebreak(battle, ranked))
             ranked = _stage("value", self._value_rerank(ranked, battle))
             ranked = _stage("noop", self._noop_demote(ranked))
@@ -712,6 +714,47 @@ class EnginePlayer(Player):
                 order = [ranked[i]] + ranked[:i] + ranked[i + 1:]
                 return order
         return ranked
+
+    def _absorb_demote(self, battle, ranked):
+        """Demote attacks the standing opponent CERTAINLY nullifies (type immunity or an
+        absorb ability like Earth Eater), at any score gap.
+
+        The near-tie guards can't catch this class: observed live 2026-07-04 (game
+        ...847095 T34), Metagross clicked Earthquake into a revealed-Earth-Eater Orthworm
+        at earthquake=0.26 vs knockoff=0.21 -- a 0.05 gap, outside _damage_tiebreak's
+        averaging-mode eps. Every pipeline layer had the ability right; the position was
+        just bad enough that MCTS visit shares flattened and argmax-over-noise landed on
+        the one move that HEALS the target. Replay repro: the same search re-run gives a
+        near-uniform pooled policy with EQ at 0.17-0.18 every time.
+
+        move_nullified is deterministic hard knowledge (revealed ability/typing, or
+        every surviving randbats set agrees), so unlike the value net this may override
+        a confident search score. The MCTS lines where a nullified click is right (opp
+        predicted to switch out) are hedge plays; when the search genuinely prefers one
+        it will also top worlds after the demote target list empties -- we stand down
+        rather than veto if NOTHING non-nullified remains. Demoted choices join
+        self._vetoed so the mixer can't resurrect them."""
+        me, opp = battle.active_pokemon, battle.opponent_active_pokemon
+        if len(ranked) < 2 or me is None or opp is None:
+            return ranked
+
+        def nullified(choice):
+            if choice.startswith("switch "):
+                return False
+            move_id = choice[:-5] if choice.endswith("-tera") else choice
+            for mv in battle.available_moves:
+                if mv.id == move_id:
+                    return move_nullified(me, mv, opp)
+            return False
+
+        dead = {c for c, _s in ranked if nullified(c)}
+        if not dead or all(c in dead or c.endswith("-tera") for c, _s in ranked):
+            return ranked
+        if ranked[0][0] in dead:
+            self.diag["absorb_demote"] = self.diag.get("absorb_demote", 0) + 1
+        self._vetoed |= dead
+        return ([rc for rc in ranked if rc[0] not in dead]
+                + [rc for rc in ranked if rc[0] in dead])
 
     def _damage_tiebreak(self, battle, ranked, eps=None):
         """Among effectively-tied top choices, prefer the one that actually damages the
