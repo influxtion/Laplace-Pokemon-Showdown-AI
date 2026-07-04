@@ -56,7 +56,7 @@ async def main():
         battle_format=BATTLE_FORMAT,
         n_determinizations=args.det, search_time_ms=args.time_ms, threads=args.threads,
         value_model_path=value_path if os.path.exists(value_path) else None,
-        value_boost_margin=26, record=True, mix_root=args.mix,
+        value_boost_margin=0, record=True, mix_root=args.mix,
         mix_frac=args.mix_frac, robust_vote=not args.avg,
         start_timer_on_battle_start=True,
     )
