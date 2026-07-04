@@ -63,8 +63,11 @@ def build_agent(account):
     # blindness to opponent setup / wasted turns); it ships whenever the trained net exists.
     value_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                               "models", "value_net.pt")
-    # value_boost_margin: wider net authority while the opponent is visibly boosted --
-    # 55% in mirror A/B (n=60, dilution expected for eval fixes); the ladder is its test.
+    # value_boost_margin: OFF (was 26). Cohort-2 mining 2026-07-03 (11W-19L, 2018->1848):
+    # with the opponent boosted, the stale v3 net used the widened band to override the
+    # search toward worse moves (Freezing Glare over Hurricane x4 into a +6 Calm Mind
+    # sweep, every pick inside the 0.26 margin). The net keeps its A/B-supported base
+    # tie-break authority (value_margin=11); re-widen only after a v4 retrain earns it.
     # FP-recipe root (2026-07-03): plain share averaging + mixed strategy in a 0.9
     # window. vs Foul Play 57% (17-13) at mix_frac=0.9 vs 28.3% (17-43) for robust
     # argmax; mirror gate 47.5%/120 (the small tax buys unexploitability the mirror
@@ -76,7 +79,7 @@ def build_agent(account):
         start_timer_on_battle_start=True,   # start the clock so an AFK opponent can't stall the bot
         n_determinizations=8, search_time_ms=150, threads=8, record=True,
         value_model_path=value_path if os.path.exists(value_path) else None,
-        value_boost_margin=26,
+        value_boost_margin=0,
         robust_vote=False, mix_root=True, mix_frac=0.9,
     )
 

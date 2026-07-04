@@ -532,7 +532,12 @@ class EnginePlayer(Player):
                 if b.get("atk", 0) + b.get("spa", 0) + b.get("spe", 0) >= 2:
                     margin = self.value_boost_margin if self.robust_vote \
                         else self.value_boost_margin / 100.0
-        tied = [c for c, s in ranked if s >= self._win_floor and top_score - s <= margin]
+        # Same rule as _mix_sample: '-tera' is eligible only as the argmax. The net may
+        # confirm or displace a tera the search already chose, but never PROMOTE one from
+        # below -- cohort-2 mining (2026-07-03): 7/17 teras in losses were rerank
+        # promotions of a non-argmax '-tera' vs 0/6 in wins (tera_wasted 0.37/loss, 0/win).
+        tied = [c for c, s in ranked if s >= self._win_floor and top_score - s <= margin
+                and (c == ranked[0][0] or not c.endswith("-tera"))]
         if len(tied) < 2:
             return ranked
         tied = tied[:5 if free_switch else 3]
@@ -570,9 +575,15 @@ class EnginePlayer(Player):
             for i, w, p in zip(owners, weights, probs):
                 num[i] += w * p
                 den[i] += w
-            valued = [(c, float(num[i] / den[i])) for i, c in enumerate(tied) if den[i] > 0]
-            if not valued:
+            if (den <= 0).any():
+                # A candidate with no valued successor means its rolls CRASHED, not that
+                # it's bad: reordering here would silently demote it below every valued
+                # candidate with unbounded score gap (observed live 2026-07-03:
+                # spiritbreak 0.75 -> reflect 0.15 the turn before the mon died). A
+                # failed roll is a bug signal, never a verdict -- stand down entirely.
+                self.diag["value_roll_fail"] = self.diag.get("value_roll_fail", 0) + 1
                 return ranked
+            valued = [(c, float(num[i] / den[i])) for i, c in enumerate(tied)]
             valued.sort(key=lambda cv: cv[1], reverse=True)
             if valued[0][0] != ranked[0][0]:
                 self.diag["value_rerank"] = self.diag.get("value_rerank", 0) + 1
@@ -629,6 +640,20 @@ class EnginePlayer(Player):
                 self.diag["noop_err"] = self.diag.get("noop_err", 0) + 1
         if not noops or len(noops) == len(winners):
             return ranked
+        # A '-tera' variant always differs from the pass-turn baseline (tera rewrites the
+        # state before we act, even if we then die), so it can never be flagged a no-op --
+        # which made this reorder a tera PROMOTER: plain move demoted as a no-op, its tera
+        # twin bubbles to the front and burns the once-per-game resource on a move the
+        # search scored 19:1 against (observed live 2026-07-03: psyshock 0.11 ->
+        # psyshock-tera, flagged tera_wasted). Same rule as _mix_sample/_value_rerank:
+        # '-tera' is only playable as the argmax, so treat non-argmax tera like a no-op
+        # here. If that leaves nothing promotable, stand down rather than spend tera.
+        keep = [c for c in winners
+                if c not in noops and (c == ranked[0][0] or not c.endswith("-tera"))]
+        if not keep:
+            return ranked
+        demoted = [c for c in winners if c not in keep]
+        noops = set(demoted)
         self._vetoed |= noops
         if ranked[0][0] in noops:
             self.diag["noop_demote"] = self.diag.get("noop_demote", 0) + 1
