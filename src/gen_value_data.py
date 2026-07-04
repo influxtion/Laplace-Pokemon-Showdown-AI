@@ -60,13 +60,23 @@ def _play_share(n, det, time_ms, idx, stamp, out_dir=None):
                 pass
             return super().choose_move(battle)
 
+    # Players run the LADDER root config (share averaging + mixed strategy + the current
+    # value net), not the engine defaults: the net's target is P(win | both sides play
+    # like the deployed bot), so the data distribution must match deployment. v3's data
+    # predates the whole mixed-root era -- that mismatch is why its authority had to be
+    # cut (cohort-2 mining 2026-07-03). Bootstrapping on the previous net is intended.
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _net = os.path.join(_root, "models", "value_net.pt")
+    ladder_kw = dict(robust_vote=False, mix_root=True, mix_frac=0.9, value_boost_margin=0,
+                     value_model_path=_net if os.path.exists(_net) else None)
+
     async def run():
         a = DataPlayer(account_configuration=AccountConfiguration.generate(f"dga{idx}", rand=True),
                        battle_format=BATTLE_FORMAT, n_determinizations=det,
-                       search_time_ms=time_ms, threads=2)
+                       search_time_ms=time_ms, threads=2, **ladder_kw)
         b = DataPlayer(account_configuration=AccountConfiguration.generate(f"dgb{idx}", rand=True),
                        battle_format=BATTLE_FORMAT, n_determinizations=det,
-                       search_time_ms=time_ms, threads=2)
+                       search_time_ms=time_ms, threads=2, **ladder_kw)
         await a.battle_against(b, n_battles=n)
 
         xs, ys, gs = [], [], []
