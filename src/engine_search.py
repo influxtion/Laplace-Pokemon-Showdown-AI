@@ -419,18 +419,35 @@ class EnginePlayer(Player):
             if not pooled:
                 self.diag["empty_pooled"] += 1
             ranked = sorted(pooled.items(), key=lambda kv: kv[1], reverse=True)
-            ranked = self._damage_tiebreak(battle, ranked)
-            ranked = self._value_rerank(ranked, battle)
-            ranked = self._noop_demote(ranked)
-            ranked = self._dead_lock_guard(battle, ranked)
+            # Per-stage attribution: which reranker changed the front-runner this turn.
+            # Pure logging for the trace (mining attributes overrides EXACTLY instead of
+            # re-deriving guard eligibility post-hoc -- a hand re-derivation misattributed
+            # one once, 2026-07-03). Multiple stages can fire on one turn; all are kept.
+            reorders = []
+            top = ranked[0][0] if ranked else None
+
+            def _stage(name, rk):
+                nonlocal top
+                if rk and top is not None and rk[0][0] != top:
+                    reorders.append(name)
+                top = rk[0][0] if rk else top
+                return rk
+
+            ranked = _stage("tiebreak", self._damage_tiebreak(battle, ranked))
+            ranked = _stage("value", self._value_rerank(ranked, battle))
+            ranked = _stage("noop", self._noop_demote(ranked))
+            ranked = _stage("deadlock", self._dead_lock_guard(battle, ranked))
             ranked, mixed = self._mix_sample(ranked)
             for choice, _share in ranked:
                 order = self._order_for_choice(choice, battle)
                 if order is not None:
+                    if choice != (ranked[0][0] if ranked else choice):
+                        reorders.append("fallthrough")   # top pick(s) not legal right now
                     if self.debug:
                         self._log(battle, pooled, choice)
                     if self.record:
-                        self._record(battle, pooled, choice, fallback=False, mixed=mixed)
+                        self._record(battle, pooled, choice, fallback=False, mixed=mixed,
+                                     reorders=reorders)
                     return order
             # Engine gave nothing usable -> safe fallback (a dumb move; a bug signal if frequent).
             self.diag["fallback"] += 1
@@ -746,7 +763,7 @@ class EnginePlayer(Player):
                              if not c.startswith("switch ") and dmg(c) <= 0.0}
         return tied + ranked[len(tied):]
 
-    def _record(self, battle, pooled, choice, fallback, mixed=False):
+    def _record(self, battle, pooled, choice, fallback, mixed=False, reorders=None):
         """Append a per-turn decision snapshot for post-hoc loss analysis (record=True)."""
         me, opp = battle.active_pokemon, battle.opponent_active_pokemon
         top = sorted(pooled.items(), key=lambda kv: kv[1], reverse=True)[:3]
@@ -762,6 +779,8 @@ class EnginePlayer(Player):
         }
         if mixed:
             entry["mixed"] = True
+        if reorders:
+            entry["reorders"] = reorders
         self.traces.setdefault(battle.battle_tag, []).append(entry)
 
     def choose_max_damage_move(self, battle):
