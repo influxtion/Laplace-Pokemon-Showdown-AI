@@ -111,6 +111,7 @@ class _SetSheet:
 
     def __init__(self, path=_SETS_PATH):
         self.by_species = {}      # species_id -> {"level": int, "sets": [ {...} ]}
+        self._pools = {}          # species_id -> union of its sets' movepools (lazy cache)
         try:
             raw = json.load(open(path, encoding="utf-8"))
         except (OSError, ValueError):
@@ -128,6 +129,17 @@ class _SetSheet:
 
     def level(self, species_id):
         return (self.by_species.get(species_id) or {}).get("level", 100)
+
+    def movepool(self, species_id):
+        """Union of every set's movepool for a species (cached), or None if unknown."""
+        pool = self._pools.get(species_id)
+        if pool is None:
+            info = self.by_species.get(species_id)
+            if not info or not info["sets"]:
+                return None
+            pool = set().union(*(set(s["moves"]) for s in info["sets"]))
+            self._pools[species_id] = pool
+        return pool
 
     def sample_set(self, species_id, revealed_ids):
         """Pick a set consistent with the revealed moves (uniform over the survivors)."""
@@ -375,6 +387,67 @@ def _own_pokemon(mon, moves_override=None):
     )
 
 
+# --- Zoroark / Illusion inference ------------------------------------------------------------
+
+_ILLUSION_FORMES = ("zoroarkhisui", "zoroark")
+_TELL_IGNORED_MOVES = {"struggle"}     # not part of any movepool; never evidence
+
+
+class _FakeType:
+    __slots__ = ("name",)
+
+    def __init__(self, name):
+        self.name = name
+
+
+class _ZoroShim:
+    """A poke-env-mon lookalike that re-skins a disguised opponent as the identified
+    Zoroark forme. Illusion copies the teammate's species/level/gender in the protocol
+    (gen9 randbats runs Illusion Level Mod, so even the displayed LEVEL is the
+    teammate's -- verified in server/config/formats.ts) but HP%, status and move usage
+    are the mon's own. So species-derived values (typing, base stats, level, set
+    sampling) come from the Zoroark forme; observed state proxies through."""
+
+    def __init__(self, mon, zoro_id):
+        self._mon = mon
+        self.species = zoro_id
+        self.base_species = zoro_id
+        self.level = SETS.level(zoro_id)
+        entry = _POKEDEX.get(zoro_id) or {}
+        base = entry.get("baseStats", {})
+        self.base_stats = {k: base.get(k, 80)
+                           for k in ("hp", "atk", "def", "spa", "spd", "spe")}
+        self.stats = {}                # force the randbats estimate from base+level
+        self.types = tuple(_FakeType(t) for t in entry.get("types", ["Dark"]))
+
+    def __getattr__(self, name):       # only consulted for attrs not set above
+        return getattr(self._mon, name)
+
+
+def _illusion_tell(mon):
+    """gen9 randbats Zoroark detection: Illusion fakes species/level/gender but cannot
+    fake MOVE USAGE. A revealed move outside the displayed species' full randbats
+    movepool means a disguised Zoroark (observed live 2026-07-04: 'Heracross' clicking
+    Dark Pulse kept its psychic-immunity hidden and cost the game). Returns a Zoroark
+    forme whose movepool covers every revealed move -- sampled per call when both fit,
+    so determinized worlds express the forme uncertainty -- else None. Conservative by
+    construction: never fires on missing sheet data, on Ditto (Transform shows foreign
+    moves), or once the Illusion is already broken (species is a Zoroark forme)."""
+    species = to_id_str(mon.species)
+    if species in _ILLUSION_FORMES or species == "ditto":
+        return None
+    revealed = set(mon.moves.keys()) - _TELL_IGNORED_MOVES
+    if not revealed or "transform" in revealed:
+        return None
+    sheet_id = species if species in SETS.by_species else to_id_str(mon.base_species)
+    pool = SETS.movepool(sheet_id)
+    if pool is None or revealed <= pool:
+        return None
+    fits = [z for z in _ILLUSION_FORMES
+            if (zp := SETS.movepool(z)) and revealed <= zp]
+    return random.choice(fits) if fits else None
+
+
 def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None, speed_hint=None,
                               use_joint=False):
     """Build an engine Pokemon for a revealed opponent mon, sampling its hidden set.
@@ -385,6 +458,9 @@ def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None, speed
     fixed, so outspeeding its known raw speed means Scarf) -- overrides item sampling.
     use_joint: sample a complete counted joint set (see _JointSets) instead of composing
     the set from marginals; falls through to the marginal path when no joint data exists."""
+    zoro = _illusion_tell(mon)
+    if zoro:
+        mon = _ZoroShim(mon, zoro)     # everything below now samples the Zoroark forme
     species = to_id_str(mon.species)
     # Formes that appear mid-battle (Mimikyu-Busted, Ogerpon-*-Tera, etc.) aren't keys in the
     # randbats sheet/stats feed; fall back to the base species so we still get real sets.
