@@ -112,6 +112,14 @@ class EnginePlayer(Player):
         # battle_tag -> pending delayed effects: '<side>_wish' -> (lands_on_turn, heal_amount),
         # '<side>_fs' -> hits_at_end_of_turn. Sides are 'p1'/'p2' as on the protocol.
         self._pending = {}
+        # battle_tag -> list of per-decision records for the futility guard: what we clicked
+        # into which matchup and where the opponent's HP / our boosts stood. Mined 2026-07-04:
+        # the #1 loss class is chipping a target whose recovery outpaces us (Iron Head x4 into
+        # Soft-Boiled Blissey, Moonblast x10 into Wish/Protect Sylveon) or re-boosting into a
+        # Haze user (Quiver Dance x7 into Milotic) -- each click confidently argmax, so the
+        # near-tie guards never engage. History is observation, not prediction: the guard
+        # only fires after the futility has actually happened on the field.
+        self._futility_hist = {}
         # Learned value head (Track A). The engine's MCTS leaf eval under-fears opponent
         # setup (observed: a guaranteed-fail Substitute scored 0.478 vs 0.480 for the best
         # move against a +3/+3/+3 sweeper), so near-tied root candidates are re-ranked by
@@ -435,6 +443,7 @@ class EnginePlayer(Player):
                 return rk
 
             ranked = _stage("absorb", self._absorb_demote(battle, ranked))
+            ranked = _stage("futility", self._futility_demote(battle, ranked))
             ranked = _stage("tiebreak", self._damage_tiebreak(battle, ranked))
             ranked = _stage("value", self._value_rerank(ranked, battle))
             ranked = _stage("noop", self._noop_demote(ranked))
@@ -450,6 +459,7 @@ class EnginePlayer(Player):
                     if self.record:
                         self._record(battle, pooled, choice, fallback=False, mixed=mixed,
                                      reorders=reorders)
+                    self._futility_record(battle, choice)
                     return order
             # Engine gave nothing usable -> safe fallback (a dumb move; a bug signal if frequent).
             self.diag["fallback"] += 1
@@ -752,6 +762,106 @@ class EnginePlayer(Player):
             return ranked
         if ranked[0][0] in dead:
             self.diag["absorb_demote"] = self.diag.get("absorb_demote", 0) + 1
+        self._vetoed |= dead
+        return ([rc for rc in ranked if rc[0] not in dead]
+                + [rc for rc in ranked if rc[0] in dead])
+
+    # Futility guard tuning: how many of our most recent consecutive same-move clicks must
+    # be net-erased (chip) / net-reset (boosts) before the move is demoted, and the HP slack
+    # that still counts as erased (leftovers-scale jitter shouldn't hide a wall).
+    # Chip anchoring note (from replaying the mined Blissey game): walls OSCILLATE -- hp
+    # snapshots ran 71->35->50->61->23, so "no progress since the run started" anchors on
+    # her maximum and never fires, while at the 23% snapshot flagging would be wrong. The
+    # honest signature is a healed-back stretch ENDING NOW: current hp at-or-above some
+    # snapshot at least FUTILE_CHIP_RUN clicks old (35->61 across two Iron Heads = the last
+    # two clicks bought nothing). Slow-but-monotone chip never matches; one berry pop
+    # doesn't either (progress from the older anchor still shows).
+    FUTILE_CHIP_RUN = 2
+    FUTILE_BOOST_RUN = 2
+    FUTILE_HP_EPS = 0.02
+
+    def _futility_record(self, battle, choice):
+        """Append this decision to the battle's futility history (see __init__)."""
+        me, opp = battle.active_pokemon, battle.opponent_active_pokemon
+        if me is None or opp is None:
+            return
+        self._futility_hist.setdefault(battle.battle_tag, []).append({
+            "turn": battle.turn,
+            "me": me.species,
+            "opp": opp.species,
+            "choice": choice,
+            "opp_hp": opp.current_hp_fraction,
+            "my_boosts": sum(v for v in (me.boosts or {}).values() if v > 0),
+        })
+
+    def _futility_demote(self, battle, ranked):
+        """Demote moves that observed history proves are going nowhere, at any score gap.
+
+        Mined 2026-07-04 (3 independent replay deep-reads, ladder AND Foul Play losses,
+        all converging): the #1 loss class is the search treating each chip hit as
+        progress against a target whose recovery erases it (Blissey Soft-Boiled x4,
+        Sylveon Wish/Protect x10, Regenerator pivot cycles) or re-boosting into a Haze
+        user (Quiver Dance x7 into Milotic). Every such click is a CONFIDENT argmax
+        (roost 0.85, QD 0.36-0.55), so tie-window guards structurally cannot engage,
+        and the value net shares the blind spot (self-play stalls symmetrically).
+
+        Detection is pure observation -- no recovery prediction, no set guessing:
+          * chip futility: our most recent consecutive decisions in this same matchup
+            (same our-mon, same opp-mon) all clicked this same damaging move, and the
+            opponent's CURRENT hp is at-or-above some run snapshot at least
+            FUTILE_CHIP_RUN clicks old -- i.e. the last >=2 clicks were net-erased
+            (see the class-constant comment for the oscillation anchoring rationale);
+          * boost futility: same, for a self-boosting status move over FUTILE_BOOST_RUN
+            clicks with our net positive boosts not increased (a Haze/phaze happened).
+        A run breaks on any different choice or either side switching (new matchup =
+        fresh evidence), so after a demote forces one different move the loop cannot
+        silently resume for another full run. Demoted moves join _vetoed (the mixer
+        was re-picking the same futile click otherwise); if nothing non-futile remains,
+        stand down -- never leave the search with no idea."""
+        me, opp = battle.active_pokemon, battle.opponent_active_pokemon
+        if len(ranked) < 2 or me is None or opp is None:
+            return ranked
+        hist = self._futility_hist.get(battle.battle_tag)
+        if not hist or len(hist) < self.FUTILE_BOOST_RUN:
+            return ranked
+
+        def run_of(choice):
+            """Consecutive most-recent decisions that clicked `choice` in this matchup."""
+            run = []
+            for rec in reversed(hist):
+                if (rec["choice"] != choice or rec["me"] != me.species
+                        or rec["opp"] != opp.species):
+                    break
+                run.append(rec)
+            return run     # most-recent first; run[-1] is the start of the streak
+
+        def futile(choice):
+            if choice.startswith("switch "):
+                return False
+            move_id = choice[:-5] if choice.endswith("-tera") else choice
+            mv = get_move(move_id)
+            if mv is None:
+                return False
+            run = run_of(choice)
+            if getattr(mv.category, "name", "") != "STATUS":
+                if len(run) < self.FUTILE_CHIP_RUN:
+                    return False
+                # Anchors at least FUTILE_CHIP_RUN clicks back (run is most-recent-first).
+                anchors = [rec["opp_hp"] for rec in run[self.FUTILE_CHIP_RUN - 1:]]
+                return opp.current_hp_fraction >= min(anchors) - self.FUTILE_HP_EPS
+            boosts = dict(mv.boosts or {})
+            boosts.update(mv.self_boost or {})
+            if not any(v > 0 for v in boosts.values()):
+                return False
+            my_now = sum(v for v in (me.boosts or {}).values() if v > 0)
+            return (len(run) >= self.FUTILE_BOOST_RUN
+                    and my_now <= run[-1]["my_boosts"])
+
+        dead = {c for c, _s in ranked if futile(c)}
+        if not dead or all(c in dead or c.endswith("-tera") for c, _s in ranked):
+            return ranked
+        if ranked[0][0] in dead:
+            self.diag["futility_demote"] = self.diag.get("futility_demote", 0) + 1
         self._vetoed |= dead
         return ([rc for rc in ranked if rc[0] not in dead]
                 + [rc for rc in ranked if rc[0] in dead])
