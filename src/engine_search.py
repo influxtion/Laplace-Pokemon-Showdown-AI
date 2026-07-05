@@ -82,7 +82,8 @@ class EnginePlayer(Player):
                  value_model_path=None, value_worlds=4, value_opp_moves=2,
                  value_margin=11.0, value_on_force_switch=False, value_boost_margin=0.0,
                  tera_min_wins=1, parallel_worlds=False, use_joint_sets=True,
-                 mix_root=False, mix_frac=0.75, robust_vote=True, **kwargs):
+                 mix_root=False, mix_frac=0.75, robust_vote=True,
+                 absorb_guard=True, futility_guard=True, **kwargs):
         super().__init__(*args, **kwargs)
         if n_determinizations is not None:
             self.N_DETERMINIZATIONS = n_determinizations
@@ -156,6 +157,11 @@ class EnginePlayer(Player):
         # once-per-game resource is never spent on a die roll).
         self.mix_root = mix_root
         self.mix_frac = mix_frac
+        # Guard toggles exist for LADDER bisecting (2026-07-04 slump investigation):
+        # mirror gates can miss tempo effects only human opponents charge for (the
+        # tera-gate precedent), so each root guard must be cheaply switchable per-arm.
+        self.absorb_guard = absorb_guard
+        self.futility_guard = futility_guard
         self._vetoed = set()     # choices demoted by a guard this turn: never in the mix
         # robust_vote=False reverts aggregation to FP-style plain averaging of visit
         # shares (joint sampling draws worlds by count, so the uniform average IS the
@@ -442,8 +448,10 @@ class EnginePlayer(Player):
                 top = rk[0][0] if rk else top
                 return rk
 
-            ranked = _stage("absorb", self._absorb_demote(battle, ranked))
-            ranked = _stage("futility", self._futility_demote(battle, ranked))
+            if self.absorb_guard:
+                ranked = _stage("absorb", self._absorb_demote(battle, ranked))
+            if self.futility_guard:
+                ranked = _stage("futility", self._futility_demote(battle, ranked))
             ranked = _stage("tiebreak", self._damage_tiebreak(battle, ranked))
             ranked = _stage("value", self._value_rerank(ranked, battle))
             ranked = _stage("noop", self._noop_demote(ranked))
