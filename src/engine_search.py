@@ -82,7 +82,7 @@ class EnginePlayer(Player):
                  value_model_path=None, value_worlds=4, value_opp_moves=2,
                  value_margin=11.0, value_on_force_switch=False, value_boost_margin=0.0,
                  tera_min_wins=1, parallel_worlds=False, use_joint_sets=True,
-                 mix_root=False, mix_frac=0.75, robust_vote=True,
+                 mix_root=False, mix_frac=0.75, mix_collapse_eps=0.03, robust_vote=True,
                  absorb_guard=True, futility_guard=True, gamble_guard=False, **kwargs):
         super().__init__(*args, **kwargs)
         if n_determinizations is not None:
@@ -157,6 +157,17 @@ class EnginePlayer(Player):
         # once-per-game resource is never spent on a die roll).
         self.mix_root = mix_root
         self.mix_frac = mix_frac
+        # Collapse-aware mix suppression (2026-07-05, from the gamble-veto investigation):
+        # in lost-ish positions MCTS Q-values flatten and pooled visit shares go
+        # near-uniform (Hydrapple T39: recover/ficklebeam/gigadrain/NP all 0.24-0.26) --
+        # the shares are argmax noise, not a strategy, and every observed clean-cohort
+        # death-gamble was a mix SAMPLE from such a set. When >=3 candidates are eligible
+        # and the eligible span (top - last) is within this epsilon, skip mixing and let
+        # the damage-tiebreak/value-rerank order stand -- those stages carry the only
+        # real signal left in a flat set. Two eligibles always mix (the Sucker Punch
+        # 50/50 is a GENUINE mixed-strategy spot, near-equal shares are correct there).
+        # Same 0.03 share-unit scale as _damage_tiebreak's tie window. 0 disables.
+        self.mix_collapse_eps = mix_collapse_eps
         # Guard toggles exist for LADDER bisecting (2026-07-04 slump investigation):
         # mirror gates can miss tempo effects only human opponents charge for (the
         # tera-gate precedent), so each root guard must be cheaply switchable per-arm.
@@ -511,6 +522,11 @@ class EnginePlayer(Player):
                 continue
             elig.append((choice, score))
         if len(elig) < 2:
+            return ranked, False
+        if (self.mix_collapse_eps and len(elig) >= 3
+                and elig[0][1] - elig[-1][1] <= self.mix_collapse_eps):
+            # Policy collapse: a >=3-way flat eligible set is Q-noise, not a strategy.
+            self.diag["mix_suppressed"] = self.diag.get("mix_suppressed", 0) + 1
             return ranked, False
         import random
         pick = random.choices([c for c, _ in elig], weights=[s for _, s in elig], k=1)[0]
