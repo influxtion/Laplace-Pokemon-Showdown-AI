@@ -26,10 +26,37 @@ account present, don't flood the ladder, and don't farm a specific person.
 import argparse
 import asyncio
 import os
+import sys
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# --fork: run the Phase-2 engine build -- value net at the MCTS leaf (blend 0.5 with the
+# stock eval, UCT c2=0.1) at 600ms/world, cross-engine validated 43/60 = 71.7% vs the
+# stock 120ms build (2026-07-06). The fork wheel lives in poke-engine-fork/py and is
+# shadowed onto sys.path; the venv's stock poke-engine is untouched, so omitting the
+# flag is a complete rollback. This block must run BEFORE engine_search imports
+# poke_engine, hence the sys.argv peek instead of argparse. The LAPLACE_* env vars are
+# read once by the Rust engine on first search; without LAPLACE_VALUE_NET the fork
+# behaves bit-identically to stock. setdefault = an explicit env override wins.
+FORK_MODE = "--fork" in sys.argv
+if FORK_MODE:
+    sys.path.insert(0, os.path.join(_ROOT, "poke-engine-fork", "py"))
+    os.environ.setdefault("LAPLACE_VALUE_NET",
+                          os.path.join(_ROOT, "poke-engine-fork", "value_net_v5.bin"))
+    os.environ.setdefault("LAPLACE_VALUE_NET_BLEND", "0.5")
+    os.environ.setdefault("LAPLACE_UCT_C2", "0.1")
 
 from poke_env import AccountConfiguration, ShowdownServerConfiguration
 
 from engine_search import EnginePlayer
+
+if FORK_MODE:
+    import poke_engine
+    if not hasattr(poke_engine, "featurize_state"):
+        sys.exit(f"--fork: loaded STOCK poke_engine from {poke_engine.__file__} -- "
+                 f"is the fork wheel installed in poke-engine-fork/py?")
+    if not os.path.exists(os.environ["LAPLACE_VALUE_NET"]):
+        sys.exit(f"--fork: weight file missing: {os.environ['LAPLACE_VALUE_NET']}")
 
 BATTLE_FORMAT = "gen9randombattle"
 SPECTATE_URL = "https://play.pokemonshowdown.com/"   # + battle room id = a watchable link
@@ -51,7 +78,7 @@ def load_dotenv(path=_ENV_PATH):
             os.environ.setdefault(key.strip(), value.strip())
 
 
-def build_agent(account):
+def build_agent(account, fork=False):
     """The Laplace bot (poke-engine MCTS over determinized opponent teams), pointed at the
     official server under the given account."""
     # poke-engine needs no trained model; it searches the position directly. Ladder is one
@@ -72,12 +99,16 @@ def build_agent(account):
     # window. vs Foul Play 57% (17-13) at mix_frac=0.9 vs 28.3% (17-43) for robust
     # argmax; mirror gate 47.5%/120 (the small tax buys unexploitability the mirror
     # can't price -- humans switch immunity absorbers into deterministic clicks).
+    # Fork mode spends 600ms/world (vs 150ms stock): informed search converts time into
+    # strength where the stock eval provably can't (budget falsified twice for stock;
+    # fork600-vs-stock120 = 71.7%/60). ~5s/turn at det8 sequential -- inside the move
+    # timer, but with less bank cushion in very long games.
     return EnginePlayer(
         account_configuration=account,
         server_configuration=ShowdownServerConfiguration,
         battle_format=BATTLE_FORMAT,
         start_timer_on_battle_start=True,   # start the clock so an AFK opponent can't stall the bot
-        n_determinizations=8, search_time_ms=150, threads=8, record=True,
+        n_determinizations=8, search_time_ms=600 if fork else 150, threads=8, record=True,
         value_model_path=value_path if os.path.exists(value_path) else None,
         value_boost_margin=0,
         robust_vote=False, mix_root=True, mix_frac=0.9,
@@ -146,6 +177,9 @@ async def main():
     parser.add_argument("--opponent", default=None, help="username to challenge (challenge mode)")
     parser.add_argument("--username", default=os.environ.get("SHOWDOWN_USERNAME"))
     parser.add_argument("--password", default=os.environ.get("SHOWDOWN_PASSWORD"))
+    parser.add_argument("--fork", action="store_true",
+                        help="run the Phase-2 fork engine (net-at-leaf, 600ms/world); "
+                             "handled at import time, this flag just documents it")
     args = parser.parse_args()
 
     if not args.username:
@@ -155,9 +189,15 @@ async def main():
         parser.error("challenge mode needs --opponent USERNAME.")
 
     account = AccountConfiguration(args.username, args.password)
-    print(f"Playing as '{args.username}' (Laplace: poke-engine MCTS).", flush=True)
+    if FORK_MODE:
+        import poke_engine
+        print(f"Playing as '{args.username}' (Laplace FORK: net-at-leaf blend 0.5, "
+              f"c2={os.environ['LAPLACE_UCT_C2']}, 600ms/world).\n"
+              f"  engine: {poke_engine.__file__}", flush=True)
+    else:
+        print(f"Playing as '{args.username}' (Laplace: poke-engine MCTS).", flush=True)
 
-    agent = build_agent(account)
+    agent = build_agent(account, fork=FORK_MODE)
 
     if args.mode == "ladder":
         print(f"Queuing for {args.battles} ranked ladder game(s)...", flush=True)
