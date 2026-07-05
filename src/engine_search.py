@@ -81,6 +81,7 @@ class EnginePlayer(Player):
                  debug=False, record=False, use_stats=True, speed_inference=True,
                  value_model_path=None, value_worlds=4, value_opp_moves=2,
                  value_margin=11.0, value_on_force_switch=False, value_boost_margin=0.0,
+                 value_case_fix=True,
                  tera_min_wins=1, parallel_worlds=False, use_joint_sets=True,
                  mix_root=False, mix_frac=0.75, mix_collapse_eps=0.03, robust_vote=True,
                  absorb_guard=True, futility_guard=True, gamble_guard=False, **kwargs):
@@ -133,6 +134,12 @@ class EnginePlayer(Player):
         self.value_margin = value_margin
         self.value_on_force_switch = value_on_force_switch
         self.value_boost_margin = value_boost_margin
+        # apply_instructions round-trips states to UPPERCASE ids; without case
+        # normalization the featurizer's recovery/volatile/typeless checks silently die
+        # on exactly the states the net scores (found 2026-07-05; training data is
+        # lowercase adapter states, so True = train/inference consistency). Kwarg kept
+        # for A/B bisecting; False = legacy behavior.
+        self.value_case_fix = value_case_fix
         # Terastallizing is once-per-game and irreversible; replay mining showed it burned
         # on mons that die within a turn in 48% of tera-losses (vs 12% of tera-wins). A
         # single world's tactical line shouldn't spend the resource: '-tera' choices need
@@ -616,7 +623,8 @@ class EnginePlayer(Player):
                             w = (o.visits / opp_total) * (si.percentage / 100.0)
                             if w <= 0.0:
                                 continue
-                            feats.append(featurize(state.apply_instructions(si)))
+                            feats.append(featurize(state.apply_instructions(si),
+                                                   self.value_case_fix))
                             owners.append(cand_i)
                             weights.append(w)
             if not feats:
@@ -965,7 +973,7 @@ class EnginePlayer(Player):
             for si in branches:
                 if si.percentage <= 0:
                     continue
-                feats.append(featurize(state.apply_instructions(si)))
+                feats.append(featurize(state.apply_instructions(si), self.value_case_fix))
                 ws.append(si.percentage)
             if not feats:
                 return None

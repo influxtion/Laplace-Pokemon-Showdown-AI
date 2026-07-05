@@ -99,7 +99,10 @@ def _ability_flags(ability):
     return [1.0 if ab in group else 0.0 for group in _ABILITY_FLAGS]
 
 
-def _has_recovery(mon):
+def _has_recovery(mon, case_fix=True):
+    if case_fix:
+        return 1.0 if any((m.id or "").lower() in _RECOVERY_MOVES and not m.disabled
+                          and m.pp > 0 for m in mon.moves) else 0.0
     return 1.0 if any(m.id in _RECOVERY_MOVES and not m.disabled and m.pp > 0
                       for m in mon.moves) else 0.0
 
@@ -129,14 +132,19 @@ def _effective_speed(mon, side):
     return spe
 
 
-def _active_damage_fracs(state):
+def _active_damage_fracs(state, case_fix=True):
     """Best damage fraction each active deals to the other, via the engine's damage calc.
     Diagonal move pairing: one call per move slot yields both sides' rolls for that slot."""
     s1, s2 = state.side_one, state.side_two
     a1 = s1.pokemon[int(s1.active_index)]
     a2 = s2.pokemon[int(s2.active_index)]
-    m1 = [m.id for m in a1.moves if m.id != "none" and not m.disabled] or ["splash"]
-    m2 = [m.id for m in a2.moves if m.id != "none" and not m.disabled] or ["splash"]
+    if case_fix:
+        _usable = lambda mon: [m.id for m in mon.moves
+                               if (m.id or "").lower() != "none" and not m.disabled]
+    else:
+        _usable = lambda mon: [m.id for m in mon.moves if m.id != "none" and not m.disabled]
+    m1 = _usable(a1) or ["splash"]
+    m2 = _usable(a2) or ["splash"]
     best1 = best2 = 0.0
     for i in range(max(len(m1), len(m2))):
         try:
@@ -151,7 +159,7 @@ def _active_damage_fracs(state):
     return min(best1, 2.0), min(best2, 2.0)
 
 
-def _side_features(side, opp_side, best_dmg_frac, opp_best_dmg_frac):
+def _side_features(side, opp_side, best_dmg_frac, opp_best_dmg_frac, case_fix=True):
     active = side.pokemon[int(side.active_index)]
     opp_active = opp_side.pokemon[int(opp_side.active_index)]
     mons = list(side.pokemon)
@@ -175,11 +183,12 @@ def _side_features(side, opp_side, best_dmg_frac, opp_best_dmg_frac):
     feats += _status_onehot(active.status)
     feats += [getattr(side, k) / 6.0 for k in _BOOST_KEYS]
     feats.append(side.substitute_health / max(active.maxhp, 1))
-    vols = set(side.volatile_statuses)
+    vols = ({v.lower() for v in side.volatile_statuses} if case_fix
+            else set(side.volatile_statuses))
     feats += [1.0 if v in vols else 0.0 for v in _VOLATILES]
     feats += _item_flags(active.item)
     feats += _ability_flags(active.ability)
-    feats.append(_has_recovery(active))
+    feats.append(_has_recovery(active, case_fix))
     feats.append(best_dmg_frac)
     my_spe = _effective_speed(active, side)
     opp_spe = _effective_speed(opp_active, opp_side)
@@ -189,22 +198,35 @@ def _side_features(side, opp_side, best_dmg_frac, opp_best_dmg_frac):
     # Bench, canonically sorted so slot order doesn't matter.
     bench = [m for i, m in enumerate(mons) if i != int(side.active_index)]
     bench.sort(key=lambda m: (-_mon_alive(m), -(m.hp / max(m.maxhp, 1)), -m.speed, m.id))
-    opp_types = [t for t in opp_active.types if t and t != "typeless"]
+    if case_fix:
+        _real = lambda mon: [t for t in mon.types if t and t.lower() != "typeless"]
+    else:
+        _real = lambda mon: [t for t in mon.types if t and t != "typeless"]
+    opp_types = _real(opp_active)
     for i in range(5):
         if i < len(bench) and _mon_alive(bench[i]):
             m = bench[i]
-            my_types = [t for t in m.types if t and t != "typeless"]
+            my_types = _real(m)
             feats += [1.0] + _stat_block(m) + _status_onehot(m.status) + _item_flags(m.item)
             feats += [_eff(my_types, opp_types) / 4.0, _eff(opp_types, my_types) / 4.0]
             feats.append(1.0 if m.speed > opp_spe else 0.0)   # wins the speed race if sent in
-            feats.append(_has_recovery(m))
+            feats.append(_has_recovery(m, case_fix))
         else:
             feats += [0.0] * 24
     return feats
 
 
-def featurize(state):
-    """State -> float32 vector of length N_VALUE_FEATURES, from side_one's perspective."""
+def featurize(state, case_fix=True):
+    """State -> float32 vector of length N_VALUE_FEATURES, from side_one's perspective.
+
+    case_fix (2026-07-05): states returned by apply_instructions round-trip through the
+    Rust engine and come back with UPPERCASE enum ids ('ROOST', 'SUBSTITUTE', 'TYPELESS'),
+    while adapter-built states (= all training data) are lowercase. The original
+    case-sensitive checks silently zeroed has_recovery and the volatile flags and broke
+    the 'typeless' filter (phantom neutral bench matchups) on every round-tripped state --
+    i.e. at every _value_rerank / gamble-veto inference. case_fix=True normalizes case so
+    inference matches training semantics; it is a no-op on lowercase adapter states.
+    False reproduces the legacy behavior (kept for the A/B arm)."""
     feats = []
     w = (state.weather or "none").lower()
     feats += [1.0 if w in group else 0.0 for group in _WEATHERS]
@@ -217,7 +239,7 @@ def featurize(state):
     feats.append(1.0 if state.trick_room else 0.0)
     feats.append(min(max(state.trick_room_turns_remaining, 0), 5) / 5.0 if state.trick_room else 0.0)
 
-    d1, d2 = _active_damage_fracs(state)
-    feats += _side_features(state.side_one, state.side_two, d1, d2)
-    feats += _side_features(state.side_two, state.side_one, d2, d1)
+    d1, d2 = _active_damage_fracs(state, case_fix)
+    feats += _side_features(state.side_one, state.side_two, d1, d2, case_fix)
+    feats += _side_features(state.side_two, state.side_one, d2, d1, case_fix)
     return np.asarray(feats, dtype=np.float32)
