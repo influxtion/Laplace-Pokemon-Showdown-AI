@@ -83,7 +83,7 @@ class EnginePlayer(Player):
                  value_margin=11.0, value_on_force_switch=False, value_boost_margin=0.0,
                  tera_min_wins=1, parallel_worlds=False, use_joint_sets=True,
                  mix_root=False, mix_frac=0.75, robust_vote=True,
-                 absorb_guard=True, futility_guard=True, **kwargs):
+                 absorb_guard=True, futility_guard=True, gamble_guard=False, **kwargs):
         super().__init__(*args, **kwargs)
         if n_determinizations is not None:
             self.N_DETERMINIZATIONS = n_determinizations
@@ -162,6 +162,7 @@ class EnginePlayer(Player):
         # tera-gate precedent), so each root guard must be cheaply switchable per-arm.
         self.absorb_guard = absorb_guard
         self.futility_guard = futility_guard
+        self.gamble_guard = gamble_guard
         self._vetoed = set()     # choices demoted by a guard this turn: never in the mix
         # robust_vote=False reverts aggregation to FP-style plain averaging of visit
         # shares (joint sampling draws worlds by count, so the uniform average IS the
@@ -454,6 +455,8 @@ class EnginePlayer(Player):
                 ranked = _stage("futility", self._futility_demote(battle, ranked))
             ranked = _stage("tiebreak", self._damage_tiebreak(battle, ranked))
             ranked = _stage("value", self._value_rerank(ranked, battle))
+            if self.gamble_guard:
+                ranked = _stage("gamble", self._gamble_veto(battle, ranked))
             ranked = _stage("noop", self._noop_demote(ranked))
             ranked = _stage("deadlock", self._dead_lock_guard(battle, ranked))
             ranked, mixed = self._mix_sample(ranked)
@@ -870,6 +873,130 @@ class EnginePlayer(Player):
             return ranked
         if ranked[0][0] in dead:
             self.diag["futility_demote"] = self.diag.get("futility_demote", 0) + 1
+        self._vetoed |= dead
+        return ([rc for rc in ranked if rc[0] not in dead]
+                + [rc for rc in ranked if rc[0] in dead])
+
+    def _gamble_veto(self, battle, ranked):
+        """Demote a status/setup click that a competent opponent punishes for free.
+
+        Decoupled-UCT MCTS prices the opponent as the average of its exploration mixture,
+        not as a best-responder: re-searching a clean live loss (Scrafty vs 15% Mismagius,
+        2026-07-04) showed the tree giving the guaranteed-kill Knock Off only 7-20% of
+        opponent visits vs 72-89% for Bulk Up -- so our setup clicks get scored against an
+        opponent who mostly declines free kills. Humans at 2000+ never decline. This veto
+        imposes best-response reasoning at the root, in two steps, all via simulation
+        (generate_instructions), never rules:
+
+        1. KILL REPLIES: roll the setup candidate against every attacking option the
+           determinized opponent has; replies with P(our active faints) >= 0.9 are kills.
+           Simulation handles the user-raised legitimate-gamble cases natively: a faster
+           Calm Mind that lifts us out of range survives its roll; Sucker Punch fails
+           against a status click; Protect/Substitute absorb the hit. No kill -> no veto.
+        2. RISK DOMINANCE ("does punishing cost them anything?"): roll our best NON-setup
+           candidate against the kill reply and against the opponent's tree-preferred
+           reply, score both with the value net FROM THEIR SIDE. If the kill reply is
+           within eps of their best even when we don't set up, punishing is free -- assume
+           a competent human clicks it, veto our setup. If punishing only pays against our
+           setup (a genuine mind game, e.g. they should switch out), the search's gamble
+           stands -- setup-on-the-predicted-switch remains legal.
+
+        Demoted choices join _vetoed (two of three clean-cohort gambles were MIX picks
+        from near-uniform policies); stands down if no candidate survives its own rolls
+        (last-mon desperation stays legal)."""
+        if self._value_model is None or len(ranked) < 2 or not self._worlds:
+            return ranked
+        me = battle.active_pokemon
+        if me is None or getattr(battle, "force_switch", False):
+            return ranked
+
+        def is_status(choice):
+            if choice.startswith("switch "):
+                return False
+            mv = get_move(choice[:-5] if choice.endswith("-tera") else choice)
+            return mv is not None and getattr(mv.category, "name", "") == "STATUS"
+
+        # Examine the whole promotable set, not just top-3: the Plusle case (clean cohort
+        # 2644172532 T21) had nastyplot promoted from 4th by the value rerank.
+        prefix = [c for c, s in ranked[:5] if s >= self._win_floor]
+        setups = [c for c in prefix if is_status(c)]
+        alts = [c for c in prefix if not is_status(c)]
+        if not setups or not alts:
+            return ranked
+        alt = alts[0]
+
+        def faint_prob(state, our_choice, opp_choice):
+            """P(our active is fainted after one ply), from engine branch weights."""
+            branches = generate_instructions(
+                state, self._engine_choice(our_choice), self._engine_choice(opp_choice))
+            die = total = 0.0
+            for si in branches:
+                total += si.percentage
+                st2 = state.apply_instructions(si)
+                act = st2.side_one.pokemon[int(str(st2.side_one.active_index))]
+                if act.hp <= 0:
+                    die += si.percentage
+            return die / total if total else 0.0
+
+        def their_value(state, our_choice, opp_choice):
+            """Opponent's mean value-net score of the one-ply successor (1 = they win)."""
+            from value_features import featurize
+            import numpy as _np
+            import torch
+            branches = generate_instructions(
+                state, self._engine_choice(our_choice), self._engine_choice(opp_choice))
+            feats, ws = [], []
+            for si in branches:
+                if si.percentage <= 0:
+                    continue
+                feats.append(featurize(state.apply_instructions(si)))
+                ws.append(si.percentage)
+            if not feats:
+                return None
+            with torch.no_grad():
+                ours = torch.sigmoid(
+                    self._value_model(torch.from_numpy(_np.stack(feats)))).numpy()
+            w = _np.asarray(ws)
+            return float(1.0 - (ours * w).sum() / w.sum())
+
+        dead = set()
+        try:
+            for cand in setups:
+                votes = checked = 0
+                for state, res in self._worlds[:2]:
+                    opp_moves = [o.move_choice for o in res.side_two
+                                 if not o.move_choice.startswith("switch")
+                                 and o.move_choice != "No Move"]
+                    if not opp_moves:
+                        continue
+                    kills = [k for k in opp_moves
+                             if faint_prob(state, cand, k) >= 0.95]
+                    if not kills:
+                        checked += 1
+                        continue
+                    top_reply = max(res.side_two, key=lambda o: o.visits).move_choice
+                    vt = their_value(state, alt, top_reply)
+                    if vt is None:
+                        continue
+                    checked += 1
+                    # punishing is FREE for them if some kill reply is ~as good as their
+                    # preferred line even against our non-setup alternative
+                    if any((vk := their_value(state, alt, k)) is not None
+                           and vk >= vt - 0.02 for k in kills):
+                        votes += 1
+                if checked and votes * 2 >= checked and votes > 0:
+                    dead.add(cand)
+        except Exception:
+            self.diag["gamble_err"] = self.diag.get("gamble_err", 0) + 1
+            return ranked
+        if not dead:
+            return ranked
+        survivors = [c for c, s in ranked
+                     if c not in dead and (c == ranked[0][0] or not c.endswith("-tera"))]
+        if not survivors:
+            return ranked
+        if ranked[0][0] in dead:
+            self.diag["gamble_veto"] = self.diag.get("gamble_veto", 0) + 1
         self._vetoed |= dead
         return ([rc for rc in ranked if rc[0] not in dead]
                 + [rc for rc in ranked if rc[0] in dead])
