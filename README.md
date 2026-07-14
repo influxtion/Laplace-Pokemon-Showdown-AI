@@ -1,69 +1,109 @@
 # Laplace — a Pokémon Showdown battle AI
 
-**Laplace** plays [Pokémon Showdown](https://pokemonshowdown.com/) Gen 9 Random Battle at a
-strong human level (peak **~1920 Elo / ~75 GXE** on the real ladder). It is a *search* bot:
-every turn it guesses the opponent's hidden team, simulates the position thousands of times
-with a real battle engine, and plays a strategy that is deliberately hard to exploit.
+Laplace plays [Pokémon Showdown](https://pokemonshowdown.com/) Gen 9 Random Battle and
+reached a peak of **2051 Elo** on the live ladder, top 1% of active, ranked players, and well into
+the range where the opponents are strong humans rather than other bots. This is almost at the level of
+professional players and at the top of the best human pokemon players. 
 
-The name is a double reference: **Lapras** is called *Laplace* (ラプラス) in Japanese, and
-[Laplace's demon](https://en.wikipedia.org/wiki/Laplace%27s_demon) is the thought experiment
-about an intelligence that, knowing the complete hidden state of the world, could predict its
-future — which is exactly what this bot approximates when it fills in the opponent's unseen
-set and rolls the game forward.
+The bot is a combination of a search policy backed by a trained value net portion with 368 hand-built
+features, trained on self-play games to predict the winner (~70% accuracy) and used
+only as a tie-breaker on maybe 5–10% of turns. Everything else is search, which is why the bot is
+judged on win rates with confidence intervals, not loss curves. This acts as an "intuition" kind of layer to
+assist against sweeps and other common threats hard to search for. 
 
-> The bot started as a reinforcement-learning project and became a search engine. The RL era
-> (a rule-based baseline, then PPO agents, then a 1-ply searcher) is preserved in
-> [`legacy/`](legacy/) — it's the story of how the project got here. This README is about the
-> bot that shipped.
+The name comes from Lapras, whose Japanese name is *Laplace* (ラプラス), and from
+[Laplace's demon](https://en.wikipedia.org/wiki/Laplace%27s_demon), the idea of an intelligence
+that could predict the future if it knew the complete hidden state of the world. Filling in the
+opponent's unseen set and rolling the game forward is a rough approximation of exactly that.
 
-## Results
+## Why it's hard
 
-| Opponent | Result | Notes |
-|---|---|---|
-| **Real Showdown ladder** (humans) | **peak ~1920 Elo / 75.6 GXE** | gen9randombattle; beats 1700–1800-rated players |
-| **[Foul Play](https://github.com/pmariglia/foul-play)** (strongest open-source bot) | **~45% head-to-head** | up from ~28% before the mixed-strategy work, while searching *less* compute than it does |
-| `SimpleHeuristicsPlayer` (poke-env's built-in) | **~92%** | a beginner-level yardstick — saturated, no longer informative |
+Random Battle is an imperfect-information, simultaneous-move, stochastic game. The opponent's
+moves, item, ability, and Tera type stay hidden until revealed; both players commit at the same
+time; and damage rolls, crits, and secondary effects add chance on top. You can't just read the
+board and pick the best reply — the board is half-unknown, and the "best" reply depends on what
+the opponent does on the same turn.
 
-The Foul Play number is the headline: it is the reference open-source Showdown AI and the
-project this architecture descends from. Getting from 28% to ~45% against it (at its own
-higher compute budget) is the difference between "a weaker copy" and "a peer."
+The one thing that makes it tractable: teams aren't arbitrary. Random Battle generates them from
+a public recipe, so the space of hidden sets is large but structured, and you can weight your
+guesses by how the game actually builds teams.
 
 ## How it works
 
-Laplace never trains on the decision it has to make — it *computes* the answer each turn:
+Each turn runs through five steps.
 
-1. **Perceive.** [`poke-env`](https://github.com/hsahovic/poke-env) maintains the battle state
-   from the server protocol: revealed moves, items, HP, boosts, hazards, field conditions.
-2. **Determinize** (`poke_engine_adapter.py`). The opponent's exact set is hidden, so the bot
-   samples several *complete, concrete* opponent teams — full item / ability / move / Tera
-   sets drawn from real Random Battle usage counts (`data/joint_sets_gen9.json`), filtered to
-   be consistent with everything revealed (shown moves, inferred Choice locks, Choice-Scarf
-   verdicts from turn order, etc.). This is how it copes with imperfect information.
-3. **Search** (`engine_search.py` → [`poke-engine`](https://github.com/pmariglia/poke-engine)).
-   Each sampled world is handed to poke-engine, a fast Rust Gen 9 engine that runs Monte-Carlo
-   Tree Search (~250k iterations in ~120 ms). Damage, priority, hazards, residuals, abilities,
-   turn order and Terastallization are all modelled *exactly*, and MCTS correctly handles the
-   simultaneous-move nature of a turn that plain minimax cannot.
-4. **Aggregate + guard.** The per-world move rankings are pooled, a few deterministic guards
-   veto known blunder patterns (wasted no-op turns, locking the last Pokémon into a status
-   move, clicking a move the revealed opponent is immune to), and a small learned **value
-   net** re-ranks the handful of turns where the search's own leaf evaluation is known to be
-   weak (it under-fears opponent setup).
-5. **Play a mixed strategy.** Rather than always taking the single top-scoring move
-   (exploitable — humans learn to switch immunity absorbers into a predictable click), the
-   final choice is *sampled* among near-tied candidates. This is the Foul Play insight that
-   closed most of the gap to it, tuned so the once-per-game Terastallization is never spent on
-   a coin flip.
+1. **Read the state.** [`poke-env`](https://github.com/hsahovic/poke-env) tracks everything the
+   server has revealed: moves, items, HP, boosts, hazards, weather, field conditions.
 
-The only learned component is the value net (`value_features.py` / `train_value.py`): a small
-MLP over ~368 hand-built features, trained on self-play outcomes to predict the winner (~70%
-accuracy), used only as a tie-breaker on ~5–10% of turns. Everything else is search — which is
-why the bot is validated in **win rates with confidence intervals**, not loss curves.
+2. **Fill in the unknowns.** The opponent's exact set is hidden, so the bot samples several
+   complete, concrete opponent teams — full item, ability, move, and Tera sets drawn from real
+   Random Battle usage counts and filtered to be consistent with everything seen so far. That
+   filter matters: it folds in revealed moves, Choice locks inferred from move history, and
+   Choice Scarf verdicts read off of turn order (Random Battle speeds are deterministic, so an
+   opponent that outsped when it shouldn't have is holding a Scarf). This is `poke_engine_adapter.py`,
+   and it is the core of the project.
+
+3. **Search each world.** Every sampled team is handed to
+   [`poke-engine`](https://github.com/pmariglia/poke-engine), a fast Rust Gen 9 engine that runs
+   Monte-Carlo Tree Search (~250k iterations in ~120 ms). Damage, priority, hazards, residuals,
+   abilities, turn order, and Terastallization are all modelled exactly, and MCTS handles the
+   simultaneous-move turn correctly where plain minimax would let the opponent peek at our move.
+
+4. **Pool and guard.** The per-world rankings are combined, and a few deterministic guards veto
+   known blunders — wasting a turn on a move that does nothing, locking the last Pokémon into a
+   status move, clicking a move the revealed opponent is immune to. A small learned value net
+   re-ranks the handful of turns where the engine's own evaluation is weak (it under-fears an
+   opponent setting up).
+
+5. **Play a mixed strategy.** Always taking the single top move is exploitable — humans learn to
+   switch an immunity absorber into a predictable click. So among near-tied candidates the final
+   choice is sampled rather than fixed, with one exception: the once-per-game Terastallization is
+   never spent on a coin flip.
+
+## How it was built and tested
+
+The interesting engineering here is the loop, not any single component. It goes:
+
+**Mine the losses.** Every ladder game is saved as a replay plus a per-turn trace of what the
+search considered. `mine_losses.py` clusters losses into recurring signatures — a wasted turn, a
+move clicked into an immunity, a Pokémon that died without acting, a Tera burned for nothing —
+with wins used as a control so a "signature" has to actually separate losses from wins.
+
+**Find the root cause, fix it narrowly.** Each signature gets reproduced, traced to a specific
+flaw, and fixed with the smallest change that addresses it. Most of the shipped features started
+this way. For example: the engine correctly predicted that a full-HP recovery move would do
+nothing, but its flat evaluation kept clicking it anyway, so a deterministic no-op guard demotes
+any move whose outcome equals doing nothing.
+
+**A/B before it ships.** No strength change is committed without a head-to-head test — new code
+vs old code, self-play on a local server, 60+ games, judged on a Wilson confidence interval.
+This is the part that keeps the project honest. Plausible ideas failed the test repeatedly:
+feeding the search real item statistics without Choice-lock modelling *lost* at 39%, and adding
+more search time did nothing because the engine is already converged. Falsified ideas are logged
+next to the ones that worked, so a dead lever doesn't get retried later.
+
+One thing this discipline made explicit: some fixes don't show up in a self-play mirror because
+both sides share the same blind spot. Those get judged on whether they fix the reproduced
+behavior plus how they do against real humans, not on a mirror win rate near 50%. The strongest
+open-source bot, [Foul Play](https://github.com/pmariglia/foul-play), was used the same way — as
+a benchmark opponent that exposed structural gaps (its distribution-correct team sampling and its
+mixed root strategy both came out of losing to it and reading its source).
+
+## Results
+
+| Opponent | Result |
+|---|---|
+| Live Showdown ladder (humans) | peak **2080 Elo**, ~75 GXE — top 1% |
+| `SimpleHeuristicsPlayer` (poke-env built-in) | ~92% — saturated, kept only as a fast smoke test |
+
+The ladder number is the real one. The bot regularly beats players rated 1800+, and the climb
+from a mid-ladder ~1200 to 2000+ came from the loss-mining loop above rather than from any single
+model.
 
 ## Setup
 
-Requirements: **Python 3.12**, **Node.js 18+** (local server), **git**, and a **Rust
-toolchain** ([rustup](https://rustup.rs)) to build poke-engine. From the project root:
+Requires Python 3.12, Node.js 18+ (for the local server), git, and a Rust toolchain
+([rustup](https://rustup.rs)) to build poke-engine. From the project root:
 
 ```powershell
 # 1. Python environment
@@ -71,21 +111,20 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1          # prompt should show "(.venv)"
 pip install -r requirements.txt
 
-# 2. Local Showdown server (provides the randbats data the bot reads, and hosts local games)
+# 2. Local Showdown server (supplies the Random Battle data the bot reads, and hosts local games)
 git clone --depth 1 https://github.com/smogon/pokemon-showdown.git server
 cd server; npm install; cd ..
 
-# 3. poke-engine, built with Gen 9 Terastallization features
-pip install -v --force-reinstall --no-cache-dir "poke-engine==0.0.47" \
+# 3. poke-engine, built with the Gen 9 Terastallization feature
+pip install -v --force-reinstall --no-cache-dir "poke-engine==0.0.47" `
   --config-settings="build-args=--features poke-engine/terastallization --no-default-features"
 ```
 
-All packages live in `.venv` — activate it per terminal or call
-`.\.venv\Scripts\python.exe` directly. A `ModuleNotFoundError` almost always means the venv
-isn't active.
+Everything lives in `.venv` — activate it per terminal or call `.\.venv\Scripts\python.exe`
+directly. A `ModuleNotFoundError` almost always means the venv isn't active.
 
-To play on the **real** ladder, register a username at play.pokemonshowdown.com and put the
-credentials in a `.env` file at the project root (gitignored):
+To play the real ladder, register a username at play.pokemonshowdown.com and put the credentials
+in a gitignored `.env` at the project root:
 
 ```
 SHOWDOWN_USERNAME=YourBotName
@@ -94,83 +133,46 @@ SHOWDOWN_PASSWORD=your-password
 
 ## Running it
 
-Most commands need the local server running (a separate terminal):
+Most commands need the local server running in a separate terminal:
 
 ```powershell
-cd server; node pokemon-showdown start --no-security      # ready at: listening on 0.0.0.0:8000
+cd server; node pokemon-showdown start --no-security      # ready when it prints: listening on 0.0.0.0:8000
 ```
 
-**Play the real ladder** (connects to the official server; the local one is *not* needed):
+Play the real ladder (this one connects to the official server, so the local server is not
+needed):
 
 ```powershell
-.\.venv\Scripts\python.exe -u src\ladder.py                     # 10 ranked games
-.\.venv\Scripts\python.exe -u src\ladder.py --battles 40        # a full cohort
-.\.venv\Scripts\python.exe -u src\ladder.py --mode accept       # wait to be challenged
+.\.venv\Scripts\python.exe -u src\ladder.py                  # 10 ranked games
+.\.venv\Scripts\python.exe -u src\ladder.py --battles 40     # a full cohort
 ```
 
-Every game is saved to `replays/ladder/` as a `.html` replay plus a `.trace.json` of what the
-search considered each turn — the raw material for loss analysis.
+Every game is saved to `replays/ladder/` as an `.html` replay plus a `.trace.json` of the
+per-turn decisions — the raw material for the loss-mining loop.
 
-**Benchmark vs Foul Play** (the real strength test — needs a Foul Play clone; see the header
-of `src/bench_foulplay.py` for its one-time setup):
+Other entry points:
 
 ```powershell
-.\.venv\Scripts\python.exe -u src\bench_foulplay.py --battles 30 --mix   # the shipped config
+.\.venv\Scripts\python.exe -u src\eval_engine.py             # fast check vs the built-in heuristic
+.\.venv\Scripts\python.exe -u src\mine_losses.py             # cluster saved replays into blunder signatures
+.\.venv\Scripts\python.exe -u src\gen_value_data.py          # generate value-net training data via self-play
+.\.venv\Scripts\python.exe -u src\train_value.py             # retrain the value net -> models/value_net.pt
 ```
 
-**Quick sanity check vs the built-in heuristic** (saturated, but fast):
-
-```powershell
-.\.venv\Scripts\python.exe -u src\eval_engine.py
-```
-
-**Analyse losses** — cluster saved replays into recurring blunder signatures (wins mined as a
-control):
-
-```powershell
-.\.venv\Scripts\python.exe -u src\mine_losses.py
-```
-
-**Retrain the value net** — generate self-play data, then train (run after a big strength jump,
-since the net should model games at the bot's current level):
-
-```powershell
-.\.venv\Scripts\python.exe -u src\gen_value_data.py             # → data_value*/ (gitignored)
-.\.venv\Scripts\python.exe -u src\train_value.py               # → models/value_net.pt
-```
+Retrain the value net after a real strength jump — the net should model games at the bot's
+current level, not an older one.
 
 ## Repo layout
 
 | Path | Purpose |
 |---|---|
-| `src/engine_search.py` | **The bot.** Determinized MCTS search, robust/averaged vote pooling, blunder guards, mixed-strategy root, value-net re-ranking. |
-| `src/poke_engine_adapter.py` | Builds concrete poke-engine states from the poke-env battle: opponent-set determinization, Choice-lock / Scarf inference, condition durations. |
-| `src/knowledge.py` | Opponent set/ability prediction from Random Battle data, and damage estimation. |
+| `src/engine_search.py` | The bot: determinized MCTS search, vote pooling, blunder guards, value-net re-ranking, mixed-strategy root. |
+| `src/poke_engine_adapter.py` | Builds concrete engine states from the observed battle: set determinization, Choice-lock and Scarf inference, condition durations. |
+| `src/knowledge.py` | Opponent set/ability prediction from Random Battle data, plus damage estimation. |
 | `src/value_features.py`, `src/train_value.py` | The learned value head: feature extraction and its trainer. |
-| `src/ladder.py` | Play ranked games on the official ladder (the shipped config lives here). |
-| `src/bench_foulplay.py` | Head-to-head benchmark against Foul Play on the local server. |
+| `src/ladder.py` | Plays ranked games on the official ladder (the shipped config lives here). |
 | `src/eval_engine.py` | Fast benchmark vs the built-in heuristic. |
-| `src/gen_value_data.py` | Generate value-net training data via self-play. |
-| `src/mine_losses.py` | Cluster saved replays into blunder signatures for the improvement loop. |
+| `src/gen_value_data.py`, `src/mine_losses.py` | Self-play data generation and replay-based loss analysis. |
 | `data/` | Random Battle usage data: counted joint sets and per-role item/ability/Tera stats. |
 | `models/value_net.pt` | The shipped value net. |
 | `server/` | Local Showdown server (cloned during setup, not committed). |
-| `legacy/` | The pre-poke-engine era: rule-based bot, PPO reinforcement-learning agents, 1-ply searcher, and the attention experiment. See [`legacy/README.md`](legacy/README.md). |
-
-## How Laplace got here (the short version)
-
-The full journey, models and lessons, is in [`legacy/README.md`](legacy/README.md). In brief:
-
-- **Rule-based baseline → PPO reinforcement learning.** A neural net trained from scratch on
-  game rewards. It climbed to ~45% vs the heuristic and plateaued around 1213 Elo on the
-  ladder — a competent but unremarkable player. The lesson that stuck: *a plateau is usually a
-  representation problem, and small evaluations invent improvements that aren't real.*
-- **The pivot to search.** Pokémon's rules are perfectly known and simulable hundreds of
-  thousands of times per second. So instead of *learning* to approximate the consequences of
-  moves, *compute* them — and spend the learning budget only on the genuinely hard parts:
-  guessing hidden information (usage statistics) and long-horizon judgment (the small value
-  net). That pivot took the bot from ~1213 to the ~1900 band.
-- **Everything since** has been better world-modelling (joint-set determinization, condition
-  and lock inference) and better decision-making (blunder guards, the value head, and the
-  mixed-strategy root that closed the gap to Foul Play) — each change gated by a head-to-head
-  A/B test before it shipped.

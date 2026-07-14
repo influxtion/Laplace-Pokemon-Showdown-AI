@@ -32,3 +32,6 @@ backup_old/
 
 # Showdown ladder credentials (never commit)
 .env
+
+#Legacy models
+legacy/
