@@ -65,8 +65,8 @@ Each turn runs through five steps.
 The interesting engineering here is the loop, not any single component. It goes:
 
 **Mine the losses.** Every ladder game is saved as a replay plus a per-turn trace of what the
-search considered. `mine_losses.py` clusters losses into recurring signatures — a wasted turn, a
-move clicked into an immunity, a Pokémon that died without acting, a Tera burned for nothing —
+search considered. `mine_losses.py` clusters losses into recurring signatures: a wasted turn, a
+move clicked into an immunity, a Pokémon that died without acting, a Tera burned for nothing,
 with wins used as a control so a "signature" has to actually separate losses from wins.
 
 **Find the root cause, fix it narrowly.** Each signature gets reproduced, traced to a specific
@@ -93,12 +93,7 @@ mixed root strategy both came out of losing to it and reading its source).
 
 | Opponent | Result |
 |---|---|
-| Live Showdown ladder (humans) | peak **2080 Elo**, ~75 GXE — top 1% |
-| `SimpleHeuristicsPlayer` (poke-env built-in) | ~92% — saturated, kept only as a fast smoke test |
-
-The ladder number is the real one. The bot regularly beats players rated 1800+, and the climb
-from a mid-ladder ~1200 to 2000+ came from the loss-mining loop above rather than from any single
-model.
+| Live Showdown ladder (humans) | peak **2137 Elo**, ~81 GXE — top 1% and top 500 in the world |
 
 ## Setup
 
