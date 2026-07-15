@@ -1,4 +1,4 @@
-# Laplace — a Pokémon Showdown battle AI
+# Laplace, a Pokémon Showdown battle AI
 
 Laplace plays [Pokémon Showdown](https://pokemonshowdown.com/) Gen 9 Random Battle and
 reached a peak of **2137 Elo** on the live ladder, top 1% of active, ranked players, and well into
@@ -21,7 +21,7 @@ opponent's unseen set and rolling the game forward is a rough approximation of e
 Random Battle is an imperfect-information, simultaneous-move, stochastic game. The opponent's
 moves, item, ability, and Tera type stay hidden until revealed; both players commit at the same
 time; and damage rolls, crits, and secondary effects add chance on top. You can't just read the
-board and pick the best reply — the board is half-unknown, and the "best" reply depends on what
+board and pick the best reply; the board is half-unknown, and the "best" reply depends on what
 the opponent does on the same turn.
 
 The one thing that makes it tractable: teams aren't arbitrary. Random Battle generates them from
@@ -50,7 +50,7 @@ Each turn runs through five steps.
    simultaneous-move turn correctly where plain minimax would let the opponent peek at our move.
 
 4. **Pool and guard.** The per-world rankings are combined, and a few deterministic guards veto
-   known blunders — wasting a turn on a move that does nothing, locking the last Pokémon into a
+   known blunders: wasting a turn on a move that does nothing, locking the last Pokémon into a
    status move, clicking a move the revealed opponent is immune to. A small learned value net
    re-ranks the handful of turns where the engine's own evaluation is weak (it under-fears an
    opponent setting up).
