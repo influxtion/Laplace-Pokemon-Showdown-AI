@@ -3,7 +3,8 @@
 Laplace plays [Pokémon Showdown](https://pokemonshowdown.com/) Gen 9 Random Battle and
 reached a peak of **2137 Elo** on the live ladder, top 1% of active, ranked players, and well into
 the range where the opponents are strong humans rather than other bots. The bot achieved top 500 (#447) on the ladder.
-This is almost at the level of professional players and at the top of the best human pokemon players. 
+This is almost at the level of professional players and at the top of the best human pokemon players. It received over
+200k views on social media.
 
 The bot is a combination of a search policy backed by a trained value net portion with 368 hand-built
 features, trained on self-play games to predict the winner (~70% accuracy) and used
