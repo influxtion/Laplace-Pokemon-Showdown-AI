@@ -14,8 +14,14 @@ turn (plain minimax lets the opponent "see" our move). Determinization is how we
 opponent's hidden set.
 
 A poke-env Player, used at test time -- see ladder.py / bench_foulplay.py / eval_engine.py.
+
+An optional `observer` callback (see _emit) reports each turn's search internals -- worlds
+finishing, pooled candidates, which guard reordered them, the final pick -- for live
+commentary. It is pure instrumentation: nothing it returns is read, so the moves played are
+identical with and without one attached (live_analysis.py is the shipped consumer).
 """
 
+import time
 from collections import namedtuple
 from concurrent.futures import ProcessPoolExecutor
 
@@ -84,7 +90,8 @@ class EnginePlayer(Player):
                  value_case_fix=True,
                  tera_min_wins=1, parallel_worlds=False, use_joint_sets=True,
                  mix_root=False, mix_frac=0.75, mix_collapse_eps=0.03, robust_vote=True,
-                 absorb_guard=True, futility_guard=True, gamble_guard=False, **kwargs):
+                 absorb_guard=True, futility_guard=True, gamble_guard=False,
+                 observer=None, **kwargs):
         super().__init__(*args, **kwargs)
         if n_determinizations is not None:
             self.N_DETERMINIZATIONS = n_determinizations
@@ -195,9 +202,26 @@ class EnginePlayer(Player):
         # 10.0 = won a world (scores are w*10+share). Averaging mode: scores are plain
         # 0..1 shares and every candidate is honestly ranked, so the floor is 0.
         self._win_floor = 10.0 if robust_vote else 0.0
+        # Optional live-commentary hook: observer(event, **payload), called at a handful of
+        # points in the turn (see _emit). Pure instrumentation -- nothing read back into the
+        # decision -- so a run with an observer plays the same moves as one without.
+        # live_analysis.LiveAnalyzer is the shipped consumer (analyze_battle.py).
+        self.observer = observer
         self._executor = None
         if value_model_path:
             self._load_value_model(value_model_path)
+
+    def _emit(self, event, **data):
+        """Fire the live observer, if one is attached.
+
+        Costs one attribute read when it's off, and an observer that raises is counted and
+        swallowed: a broken commentary renderer must never lose the game it's narrating."""
+        if self.observer is None:
+            return
+        try:
+            self.observer(event, **data)
+        except Exception:
+            self.diag["observer_err"] = self.diag.get("observer_err", 0) + 1
 
     def _pool(self):
         if self._executor is None:
@@ -347,10 +371,14 @@ class EnginePlayer(Player):
         opp_used = self._opp_used_since_switch(battle)
         speed_hints = self._opp_speed.get(battle.battle_tag, {})
 
+        n = self.N_DETERMINIZATIONS
+        self._emit("search_start", worlds=n, time_ms=self.SEARCH_TIME_MS,
+                   threads=self.THREADS, parallel=self.parallel_worlds)
+
         searched = []            # (state, result) pairs from either search path
         if self.parallel_worlds:
             jobs = []
-            for _ in range(self.N_DETERMINIZATIONS):
+            for j in range(n):
                 try:
                     state = build_state(battle, use_stats=self.use_stats,
                                         opp_used_since_switch=opp_used,
@@ -362,17 +390,24 @@ class EnginePlayer(Player):
                     jobs.append((state, fut))
                 except BaseException:
                     self.diag["det_fail"] += 1
-            for state, fut in jobs:
+                    self._emit("world_fail", index=j, total=n)
+            for i, (state, fut) in enumerate(jobs):
+                t0 = time.perf_counter()
                 try:
                     raw = fut.result(timeout=self.SEARCH_TIME_MS / 1000 * 4 + 10)
                 except Exception:
                     raw = None
                 if raw is None:
                     self.diag["det_fail"] += 1
+                    self._emit("world_fail", index=i, total=n)
                     continue
-                searched.append((state, _shim(raw)))
+                res = _shim(raw)
+                self._emit("world", index=i, total=n, state=state, res=res,
+                           ms=(time.perf_counter() - t0) * 1000)
+                searched.append((state, res))
         else:
-            for _ in range(self.N_DETERMINIZATIONS):
+            for i in range(n):
+                t0 = time.perf_counter()
                 try:
                     state = build_state(battle, use_stats=self.use_stats,
                                         opp_used_since_switch=opp_used,
@@ -386,7 +421,10 @@ class EnginePlayer(Player):
                     # PanicException, which is NOT an Exception subclass); skip that
                     # sample rather than crash the turn.
                     self.diag["det_fail"] += 1
+                    self._emit("world_fail", index=i, total=n)
                     continue
+                self._emit("world", index=i, total=n, state=state, res=res,
+                           ms=(time.perf_counter() - t0) * 1000)
                 searched.append((state, res))
 
         for state, res in searched:
@@ -449,10 +487,13 @@ class EnginePlayer(Player):
 
             self.diag["turns"] += 1
             self._vetoed = set()
+            t_turn = time.perf_counter()
+            self._emit("turn_start", battle=battle)
             pooled = self._pooled_policy(battle)
             if not pooled:
                 self.diag["empty_pooled"] += 1
             ranked = sorted(pooled.items(), key=lambda kv: kv[1], reverse=True)
+            self._emit("pooled", battle=battle, ranked=ranked, worlds=self._worlds)
             # Per-stage attribution: which reranker changed the front-runner this turn.
             # Pure logging for the trace (mining attributes overrides EXACTLY instead of
             # re-deriving guard eligibility post-hoc -- a hand re-derivation misattributed
@@ -462,8 +503,11 @@ class EnginePlayer(Player):
 
             def _stage(name, rk):
                 nonlocal top
-                if rk and top is not None and rk[0][0] != top:
+                changed = bool(rk) and top is not None and rk[0][0] != top
+                if changed:
                     reorders.append(name)
+                self._emit("stage", name=name, ranked=rk, changed=changed,
+                           was=top, vetoed=frozenset(self._vetoed))
                 top = rk[0][0] if rk else top
                 return rk
 
@@ -488,16 +532,24 @@ class EnginePlayer(Player):
                     if self.record:
                         self._record(battle, pooled, choice, fallback=False, mixed=mixed,
                                      reorders=reorders)
+                    self._emit("decision", battle=battle, choice=choice, ranked=ranked,
+                               mixed=mixed, reorders=list(reorders), fallback=False,
+                               ms=(time.perf_counter() - t_turn) * 1000)
                     self._futility_record(battle, choice)
                     return order
             # Engine gave nothing usable -> safe fallback (a dumb move; a bug signal if frequent).
             self.diag["fallback"] += 1
             if self.record:
                 self._record(battle, pooled, "<fallback>", fallback=True)
+            self._emit("decision", battle=battle, choice="<fallback>", ranked=ranked,
+                       mixed=False, reorders=list(reorders), fallback=True,
+                       ms=(time.perf_counter() - t_turn) * 1000)
             return self.choose_max_damage_move(battle) if battle.available_moves \
                 else self.choose_random_move(battle)
         except Exception:
             self.diag["fallback"] += 1
+            self._emit("decision", battle=battle, choice="<crash>", ranked=[],
+                       mixed=False, reorders=[], fallback=True, ms=0.0)
             return self.choose_random_move(battle)
 
     def _mix_sample(self, ranked):
@@ -534,9 +586,11 @@ class EnginePlayer(Player):
                 and elig[0][1] - elig[-1][1] <= self.mix_collapse_eps):
             # Policy collapse: a >=3-way flat eligible set is Q-noise, not a strategy.
             self.diag["mix_suppressed"] = self.diag.get("mix_suppressed", 0) + 1
+            self._emit("mix", eligible=elig, pick=None, suppressed=True)
             return ranked, False
         import random
         pick = random.choices([c for c, _ in elig], weights=[s for _, s in elig], k=1)[0]
+        self._emit("mix", eligible=elig, pick=pick, suppressed=False)
         if pick == ranked[0][0]:
             return ranked, False
         self.diag["mix_fired"] = self.diag.get("mix_fired", 0) + 1
@@ -649,6 +703,8 @@ class EnginePlayer(Player):
                 return ranked
             valued = [(c, float(num[i] / den[i])) for i, c in enumerate(tied)]
             valued.sort(key=lambda cv: cv[1], reverse=True)
+            self._emit("value", valued=valued, margin=margin, free_switch=free_switch,
+                       branches=len(feats))
             if valued[0][0] != ranked[0][0]:
                 self.diag["value_rerank"] = self.diag.get("value_rerank", 0) + 1
             order = [c for c, _v in valued]

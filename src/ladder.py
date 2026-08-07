@@ -21,11 +21,23 @@ Then, from the project root:
 Ladder games are rated, so your GXE/ELO shows on the account's profile -- the honest test
 the training scripts couldn't give us. Follow Showdown's rules for automated play: keep the
 account present, don't flood the ladder, and don't farm a specific person.
+
+Every game is archived to replays/ladder/ as <result>-<battle-tag>.html (a self-contained
+Showdown replay you open in a browser) plus a .trace.json of the search's per-turn
+reasoning. This covers Ctrl-C and crashes too -- the battle room is gone once the process
+exits, so anything not written is lost.
+
+Those files are local. The first 5 games of each run are ALSO published as hosted,
+shareable replays on replay.pokemonshowdown.com via /savereplay (--upload-first N to
+change, 0 to disable) -- a public link, so only what you're happy to share.
 """
 
 import argparse
 import asyncio
+import json
+import logging
 import os
+import re
 import sys
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -61,6 +73,14 @@ if FORK_MODE:
 BATTLE_FORMAT = "gen9randombattle"
 SPECTATE_URL = "https://play.pokemonshowdown.com/"   # + battle room id = a watchable link
 
+# Replays land here, anchored to the project root -- NOT the cwd, so `python
+# path\to\src\ladder.py` from anywhere still writes to the one replay archive.
+REPLAY_DIR = os.path.join(_ROOT, "replays", "ladder")
+
+# Showdown-hosted (shareable) replays, uploaded via /savereplay -- see request_upload().
+REPLAY_UPLOAD_URL = "https://replay.pokemonshowdown.com/"
+UPLOAD_FIRST_N = 5          # upload this many games per run; --upload-first overrides
+
 # .env lives in the project root, one level up from this src/ file.
 _ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
 
@@ -78,9 +98,14 @@ def load_dotenv(path=_ENV_PATH):
             os.environ.setdefault(key.strip(), value.strip())
 
 
-def build_agent(account, fork=False):
+def build_agent(account, fork=False, cls=EnginePlayer, **extra):
     """The Laplace bot (poke-engine MCTS over determinized opponent teams), pointed at the
-    official server under the given account."""
+    official server under the given account.
+
+    `cls` / `extra` exist so another entry point can run the SHIPPED ladder config with a
+    different player subclass or one extra kwarg (analyze_battle.py passes the live-analysis
+    player) without forking this config -- it is the one place the ladder settings live, and
+    a copy of it would silently drift."""
     # poke-engine needs no trained model; it searches the position directly. Ladder is one
     # game at a time on the official server, so we spend a generous per-turn budget (more
     # determinizations + threads than the throughput-tuned benchmark default) -- ~1-2s/turn,
@@ -103,7 +128,7 @@ def build_agent(account, fork=False):
     # strength where the stock eval provably can't (budget falsified twice for stock;
     # fork600-vs-stock120 = 71.7%/60). ~5s/turn at det8 sequential -- inside the move
     # timer, but with less bank cushion in very long games.
-    return EnginePlayer(
+    kwargs = dict(
         account_configuration=account,
         server_configuration=ShowdownServerConfiguration,
         battle_format=BATTLE_FORMAT,
@@ -113,9 +138,128 @@ def build_agent(account, fork=False):
         value_boost_margin=0,
         robust_vote=False, mix_root=True, mix_frac=0.9,
     )
+    kwargs.update(extra)
+    return cls(**kwargs)
 
 
-async def report_progress(agent, total, poll=3.0):
+def replay_url(battle_tag):
+    """The public URL /savereplay will publish this battle at.
+
+    Derived, not guessed. Server side (rooms.ts getReplayData + replays.ts add): the replay
+    id is the room id minus the leading 'battle-', and a password room's full id is
+    id + '-' + password + 'pw' -- which reassembles to exactly the same string. So for both
+    plain and '-...pw' rooms the id is just the tag with 'battle-' stripped. The upload
+    popup is the authoritative confirmation (see PopupWatcher); this is what we print
+    immediately so the link is in the log even if the popup is missed."""
+    replay_id = battle_tag[len("battle-"):] if battle_tag.startswith("battle-") else battle_tag
+    return REPLAY_UPLOAD_URL + replay_id
+
+
+class PopupWatcher(logging.Handler):
+    """Print the upload confirmation Showdown sends back after /savereplay.
+
+    The server answers /savereplay with a popup -- either a link to the uploaded replay or
+    an error -- and poke_env only logs it ('Popup message received'). Rather than patch
+    poke_env's message loop, we tap its logger: worst case we miss a confirmation, and the
+    local .html archive is unaffected."""
+
+    _URL = re.compile(r"https?://replay\.pokemonshowdown\.com/[^\s\"'<>]+")
+
+    def __init__(self):
+        super().__init__()
+        self.seen = set()
+
+    def emit(self, record):
+        try:
+            msg = record.getMessage()
+            if "opup" not in msg:
+                return
+            for url in self._URL.findall(msg):
+                url = url.rstrip("\\")
+                if url not in self.seen:
+                    self.seen.add(url)
+                    print(f"    uploaded -> {url}", flush=True)
+            if "could not be saved" in msg:
+                print(f"    WARNING: Showdown refused the replay upload: {msg}", flush=True)
+        except Exception:       # a logging handler must never break the client loop
+            pass
+
+
+async def request_upload(agent, tag):
+    """Ask Showdown to publish this battle as a hosted replay.
+
+    Sent at battle START, not end, for two reasons found in the server/client source:
+    poke_env sends '/leave' the moment a battle ends (player.py), so a save on the 'finished'
+    poll races the room teardown; and once a battle has been saved once, the server
+    re-uploads the COMPLETE log automatically when the game ends (room-battle.ts), silently
+    overwriting the partial one. So saving early is both the safe order and the complete
+    one -- the link below ends up pointing at the full game."""
+    try:
+        await agent.ps_client.send_message("/savereplay", room=tag)
+        print(f"    /savereplay sent -> {replay_url(tag)}", flush=True)
+    except Exception as exc:
+        print(f"    WARNING: /savereplay failed for {tag}: {exc!r}", flush=True)
+
+
+def result_label(battle):
+    """won / lost / tie / unfinished, for the replay filename and the progress line.
+
+    battle.won is True (win) / False (loss) / None (genuine tie). NOTE: `battle.tied` is a
+    *method*, so the old `getattr(battle, "tied", False)` returned the truthy bound method
+    and mislabeled every LOSS as a tie. Check `won is None` instead."""
+    if not battle.finished:
+        return "unfinished"
+    if battle.won:
+        return "won"
+    if battle.won is None:
+        return "tie"
+    return "lost"
+
+
+def save_battle(agent, tag, battle, saved, warned):
+    """Write <result>-<tag>.html (+ .trace.json) for one battle. Returns True if it wrote.
+
+    Saving EVERY game matters because the live battle room vanishes once the game ends --
+    an unsaved game is gone for good, and ties especially need a replay to diagnose
+    (Endless Battle Clause / sim-KO). `saved` dedupes across the poll loop and the exit
+    sweep; a failure is reported once per battle and left unsaved so a later pass retries
+    it (the old code swallowed every exception, so a broken archive looked healthy)."""
+    if tag in saved:
+        return False
+    label = result_label(battle)
+    try:
+        os.makedirs(REPLAY_DIR, exist_ok=True)
+        agent.save_replay(tag, os.path.join(REPLAY_DIR, f"{label}-{tag}.html"))
+        # Per-turn decision traces (what the search considered), for loss analysis.
+        traces = getattr(agent, "traces", {}).get(tag)
+        if traces:
+            with open(os.path.join(REPLAY_DIR, f"{label}-{tag}.trace.json"),
+                      "w", encoding="utf-8") as f:
+                json.dump(traces, f, indent=1)
+    except Exception as exc:
+        if tag not in warned:
+            warned.add(tag)
+            print(f"  WARNING: could not save replay for {tag}: {exc!r}", flush=True)
+        return False
+    saved.add(tag)
+    return True
+
+
+def sweep_replays(agent, saved, warned):
+    """Save every battle the agent still holds that the poll loop didn't get to.
+
+    Two gaps the loop alone can't cover: the last game of a run (agent.ladder() returns as
+    soon as it ends, and the monitor is cancelled before its next tick), and a Ctrl-C or
+    crash mid-session. An in-progress battle is saved too -- its partial log is still worth
+    reading, and 'unfinished-' in the name keeps it out of the won/lost stats."""
+    n = sum(save_battle(agent, tag, battle, saved, warned)
+            for tag, battle in list(agent.battles.items()))
+    if n:
+        print(f"  Saved {n} replay(s) on exit -> {REPLAY_DIR}", flush=True)
+    return n
+
+
+async def report_progress(agent, total, saved, warned, upload_first=UPLOAD_FIRST_N, poll=3.0):
     """Print queue/start/finish updates while the play coroutine runs in parallel.
 
     Polls the agent's battle state rather than hooking events: agent.battles grows as games
@@ -129,34 +273,13 @@ async def report_progress(agent, total, poll=3.0):
                 announced_search = False
                 print(f"  Battle {len(started)}/{total} started  ->  watch: {SPECTATE_URL}{tag}",
                       flush=True)
+                # First N games of the run get a hosted, shareable replay.
+                if len(started) <= upload_first:
+                    await request_upload(agent, tag)
             if battle.finished and tag not in finished:
                 finished.add(tag)
-                # battle.won is True (win) / False (loss) / None (genuine tie). NOTE: `battle.tied`
-                # is a *method*, so the old `getattr(battle, "tied", False)` returned the truthy
-                # bound method and mislabeled every LOSS as a tie. Check `won is None` instead.
-                if battle.won:
-                    result = "WON "
-                elif battle.won is None:
-                    result = "TIE "
-                else:
-                    result = "LOST"
-                # Save every finished game as a replay so post-hoc analysis is possible (the
-                # live battle room vanishes once it ends). Ties especially -- they're frequent
-                # vs humans and we need a replay to see why (Endless Battle Clause / sim-KO).
-                try:
-                    os.makedirs(os.path.join("replays", "ladder"), exist_ok=True)
-                    rpath = os.path.join("replays", "ladder", f"{result.strip().lower()}-{tag}.html")
-                    agent.save_replay(tag, rpath)
-                    # Per-turn decision traces (what the search considered), for loss analysis.
-                    traces = getattr(agent, "traces", {}).get(tag)
-                    if traces:
-                        import json
-                        tpath = os.path.join("replays", "ladder",
-                                             f"{result.strip().lower()}-{tag}.trace.json")
-                        with open(tpath, "w", encoding="utf-8") as f:
-                            json.dump(traces, f, indent=1)
-                except Exception:
-                    pass
+                save_battle(agent, tag, battle, saved, warned)
+                result = {"won": "WON ", "lost": "LOST", "tie": "TIE "}[result_label(battle)]
                 print(f"  Battle {len(finished)}/{total} {result} in {battle.turn} turns  "
                       f"(running {agent.n_won_battles}W / {agent.n_lost_battles}L)", flush=True)
         # No unfinished battle and not done yet -> sitting in the matchmaking queue.
@@ -177,6 +300,10 @@ async def main():
     parser.add_argument("--opponent", default=None, help="username to challenge (challenge mode)")
     parser.add_argument("--username", default=os.environ.get("SHOWDOWN_USERNAME"))
     parser.add_argument("--password", default=os.environ.get("SHOWDOWN_PASSWORD"))
+    parser.add_argument("--upload-first", type=int, default=UPLOAD_FIRST_N, metavar="N",
+                        help=f"publish the first N games of the run as hosted Showdown "
+                             f"replays via /savereplay (default {UPLOAD_FIRST_N}, 0 = none). "
+                             f"Every game is archived locally regardless.")
     parser.add_argument("--fork", action="store_true",
                         help="run the Phase-2 fork engine (net-at-leaf, 600ms/world); "
                              "handled at import time, this flag just documents it")
@@ -211,8 +338,23 @@ async def main():
         print(f"Challenging {args.opponent} to {args.battles} game(s)...", flush=True)
         play = agent.send_challenges(args.opponent, args.battles)
 
-    # Run the games alongside a monitor that prints start/finish/queue updates.
-    monitor = asyncio.ensure_future(report_progress(agent, args.battles))
+    print(f"Replays -> {REPLAY_DIR}", flush=True)
+    if args.upload_first > 0:
+        print(f"  first {args.upload_first} game(s) also published to "
+              f"{REPLAY_UPLOAD_URL}", flush=True)
+        # The upload popup is the only confirmation Showdown sends, and poke_env logs it at
+        # WARNING. If something raised the client's log level above that we'd never see it,
+        # so lower it back (no-op at poke_env's default, which leaves the level unset).
+        if agent.ps_client.logger.getEffectiveLevel() > logging.WARNING:
+            agent.ps_client.logger.setLevel(logging.WARNING)
+        agent.ps_client.logger.addHandler(PopupWatcher())
+
+    # Run the games alongside a monitor that prints start/finish/queue updates and saves
+    # each replay as it lands. `saved`/`warned` are shared with the exit sweep below so
+    # nothing is written twice and nothing is dropped.
+    saved, warned = set(), set()
+    monitor = asyncio.ensure_future(
+        report_progress(agent, args.battles, saved, warned, args.upload_first))
     try:
         await play
     finally:
@@ -221,6 +363,9 @@ async def main():
             await monitor
         except asyncio.CancelledError:
             pass
+        # Runs on the normal path AND on Ctrl-C / exception: catches the final game and
+        # anything the last poll tick missed.
+        sweep_replays(agent, saved, warned)
 
     won = agent.n_won_battles
     total = len(agent.battles)
@@ -229,4 +374,8 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # main()'s finally has already swept the replays out by this point; no traceback.
+        print("\nInterrupted.", flush=True)

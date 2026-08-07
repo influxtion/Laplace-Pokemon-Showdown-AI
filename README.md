@@ -142,8 +142,65 @@ needed):
 .\.venv\Scripts\python.exe -u src\ladder.py --battles 40     # a full cohort
 ```
 
-Every game is saved to `replays/ladder/` as an `.html` replay plus a `.trace.json` of the
-per-turn decisions — the raw material for the loss-mining loop.
+Every game is saved to `replays/ladder/` as `<result>-<battle-tag>.html` plus a
+`.trace.json` of the per-turn decisions — the raw material for the loss-mining loop. The
+archive is complete: the last game of a run and anything in flight when you Ctrl-C are
+flushed on exit (an interrupted game is saved as `unfinished-…`), and a replay that can't
+be written prints a warning instead of failing silently. Open the `.html` in a browser to
+watch the game back.
+
+The first 5 games of each run are additionally published as hosted replays on
+`replay.pokemonshowdown.com` (`/savereplay`), and the shareable link is printed as each one
+starts — handy for sharing a game without shipping an HTML file. Use `--upload-first N` to
+change the count, `--upload-first 0` to publish nothing. Note these links are **public**.
+
+### Watching a game being played
+
+`analyze_battle.py` plays **one** ladder game and turns the terminal into a live analysis
+board for it — same bot, same shipped config (it imports `ladder.py`'s `build_agent`, so the
+settings can't drift), but narrated:
+
+```powershell
+.\.venv\Scripts\python.exe -u src\analyze_battle.py            # one rated game, narrated
+.\.venv\Scripts\python.exe -u src\analyze_battle.py --upload    # + a public shareable replay
+.\.venv\Scripts\python.exe -u src\analyze_battle.py --local --mode challenge --opponent SomeBot
+```
+
+Each turn prints the position (both actives with HP bars, boosts, status, hazards, weather),
+then the search working — determinized worlds completing one at a time with visits and the
+engine's own win estimate firming up — then the candidate table:
+
+```
+== Turn 2 ==========================================================================
+  us   Iron Hands        82% ##########.. 6/6  quarkdrive · assaultvest
+  opp  Scrafty          100% ############ 6/6  intimidate · ?item
+  search   8/8 worlds x 150ms x 8t  ·  2.43M visits  ·  1.8s
+     candidate                  share          worlds  eval
+  -> Heavy Slam                 ####....  0.27  4/8     0.57
+     Close Combat               ###.....  0.19  2/8     0.54
+     Volt Switch                ###.....  0.19  1/8     0.53
+  value    net agrees: Heavy Slam 0.53, Close Combat 0.50, Volt Switch 0.50
+  guessed  item unknownitem x8  ·  ability intimidate x8  ·  tera poison x8
+  inferred used since switch-in: Drain Punch
+  >> plays Heavy Slam  [1.8s, eval 0.55]   expects switch Misdreavus 10%
+   T2    opp Scrafty used Drain Punch -> Iron Hands 82% -> 64%
+   T2    us  Iron Hands used Heavy Slam -> Scrafty 100% -> 69%
+```
+
+`share` is the pooled MCTS visit share across worlds, `worlds` how many worlds made that move
+their outright winner, `eval` the engine's own win estimate. `guessed` is the determinizer:
+which item / ability / Tera type the sampled hidden sets drew this turn. Any guard or
+reranker that moves the front-runner prints its own line (`absorb`, `futility`, `tiebreak`,
+`value`, `noop`, `deadlock`, `mix`), as do Choice-lock and Scarf inferences.
+
+The game ends with a post-game block: time spent thinking, MCTS volume, which guards fired
+and what they vetoed, how often the search called the opponent's move, the luck ledger, the
+eval curve with its biggest swings, and the revealed opponent team. The transcript is saved
+next to the replay as `<result>-<battle-tag>.analysis.txt`.
+
+Useful flags: `--local` plays on the local server instead (for trying it out without
+spending a rated game), `--ascii` / `--no-color` for dumb terminals and redirects,
+`--no-worlds` to drop the hidden-set tally, `--fork` for the Phase-2 engine.
 
 Other entry points:
 
@@ -166,6 +223,7 @@ current level, not an older one.
 | `src/knowledge.py` | Opponent set/ability prediction from Random Battle data, plus damage estimation. |
 | `src/value_features.py`, `src/train_value.py` | The learned value head: feature extraction and its trainer. |
 | `src/ladder.py` | Plays ranked games on the official ladder (the shipped config lives here). |
+| `src/analyze_battle.py`, `src/live_analysis.py` | One ladder game, narrated live: the play-by-play plus the search's candidates, guards, hidden-set guesses and eval, then a post-game report. |
 | `src/eval_engine.py` | Fast benchmark vs the built-in heuristic. |
 | `src/gen_value_data.py`, `src/mine_losses.py` | Self-play data generation and replay-based loss analysis. |
 | `data/` | Random Battle usage data: counted joint sets and per-role item/ability/Tera stats. |
