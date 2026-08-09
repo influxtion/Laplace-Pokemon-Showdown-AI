@@ -1,18 +1,19 @@
-r"""Benchmark the poke-engine search bot (engine_search.EnginePlayer), fast.
+r"""Fast benchmark: EnginePlayer vs SimpleHeuristicsPlayer.
 
-poke-engine holds the Python GIL during a search, so battles inside one process serialize even
-with max_concurrent_battles>1. To use all cores we shard the battles across worker *processes*
-(this is also why Foul Play uses a ProcessPoolExecutor). Each worker plays its share against a
-fresh opponent on the local server and reports its wins; we sum them. With W workers the wall
-clock is ~(battles / W) x per-battle-time.
+poke-engine holds the GIL during a search, so battles inside one process serialize even
+with max_concurrent_battles>1. To use all cores we shard battles across worker PROCESSES
+(Foul Play uses a ProcessPoolExecutor for the same reason). Wall clock with W workers is
+~(battles / W) x per-battle-time.
 
-`threads` is search threads *per turn* (more = stronger search in the same time budget, not
-faster eval); `workers` is the cross-battle parallelism. Keep workers x threads near the core
-count. This vs-heuristic yardstick is saturated (~92%) -- it's a fast sanity check; the real
-strength test is bench_foulplay.py.
+Two knobs, easy to confuse: `threads` is search threads PER TURN (stronger search in the
+same budget, not faster eval); `workers` is cross-battle parallelism. Keep
+workers x threads near the core count.
 
-Run from the project root, with the local Showdown server running:
-    python -u src\eval_engine.py                                   # vs heuristic, default budget
+This yardstick is SATURATED at ~92% -- it's a regression check, not a strength test. The
+real one is bench_foulplay.py.
+
+From the project root, with the local server running:
+    python -u src\eval_engine.py
     python -u src\eval_engine.py --battles 100 --workers 10
     python -u src\eval_engine.py --determinizations 8 --time-ms 150 --threads 2
 """
@@ -27,7 +28,7 @@ BATTLE_FORMAT = "gen9randombattle"
 
 
 def _play_share(n, det, time_ms, threads, idx):
-    """Worker process: play `n` battles and return wins. Top-level so it pickles on Windows."""
+    """Worker process: play `n` battles, return wins. Top-level so it pickles on Windows."""
     import sys
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -50,7 +51,7 @@ def _play_share(n, det, time_ms, threads, idx):
 
 
 def _split(total, workers):
-    """Divide `total` battles as evenly as possible into `workers` shares (drop empty shares)."""
+    """Divide `total` battles as evenly as possible into `workers` shares, dropping empties."""
     base, extra = divmod(total, workers)
     return [base + (1 if i < extra else 0) for i in range(workers) if base + (1 if i < extra else 0) > 0]
 
@@ -62,7 +63,7 @@ def main():
     parser.add_argument("--time-ms", type=int, default=120)
     parser.add_argument("--threads", type=int, default=2, help="search threads per turn")
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) // 2),
-                        help="parallel worker processes (cross-battle parallelism)")
+                        help="worker processes (cross-battle parallelism)")
     args = parser.parse_args()
 
     shares = _split(args.battles, args.workers)

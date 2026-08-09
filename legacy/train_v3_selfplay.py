@@ -1,22 +1,20 @@
-r"""Self-play on top of the v3 agent.
+r"""Self-play, this time starting from the bigger agent.
 
-The v3 agent plateaus around 40% vs SimpleHeuristicsPlayer because, once it has solved that one
-opponent, there's nothing left to learn. Self-play replaces the fixed heuristic with a
-periodically-refreshed snapshot of the agent itself, so the target keeps rising as the agent
-does.
+The bigger agent stalls around 40% against the fixed opponent, because once you've solved
+one opponent there's nothing left to learn from it. Self-play swaps that for a copy of the
+agent itself, refreshed as it improves, so the target keeps rising.
 
-Two differences from the earlier train_selfplay.py:
-  - Warm-starts from the v3 model (net [256,256], gamma 0.997, win-focused reward), not the
-    small heuristic-trained net. Loading preserves architecture, gamma, and reward scale, so
-    the value function stays calibrated.
-  - Adds hygiene the plain v3 run lacked (and which let it overtrain into a worse policy):
-    target_kl early-stopping, LR decaying to zero, and best-model checkpointing so we keep the
-    peak rather than the drifted-downhill tail.
+Two things differ from the earlier self-play attempt:
+  - It starts from the big network rather than the small one, keeping its shape, discount
+    and reward scale intact so its judgement stays calibrated.
+  - It adds the safeguards the earlier big run was missing, and whose absence let that run
+    quietly train itself into a worse policy: a cap on how far the policy can move at once,
+    a learning rate winding down to zero, and keeping the best version rather than the last.
 
-Still benchmarks vs SimpleHeuristicsPlayer every EVAL_FREQ steps, so the number stays
-comparable. At test time, layer search.py on the saved model (eval_search.py).
+It still measures itself against the fixed heuristic throughout, so the numbers remain
+comparable to everything before.
 
-Run from the project root, with the local Showdown server running:
+Run from the project root, with the local server going:
     python -u src\train_v3_selfplay.py
 """
 
@@ -38,28 +36,27 @@ from train_selfplay import SnapshotCallback
 
 BATTLE_FORMAT = "gen9randombattle"
 
-# --- hygiene (the part plain train_v3 was missing) ----------------------------
-TARGET_KL = 0.03           # early-stop a batch if it moves the policy too far (v3's approx_kl
-                           # crept to 0.06 and the policy drifted downhill)
-LR_START = 3e-4            # SB3 default; decays linearly to 0 across this run
+# --- the safeguards the previous run lacked -----------------------------------
+TARGET_KL = 0.03           # stop a batch early if it's moving the policy too far. Last time
+                           # this crept up and the policy drifted downhill for hours.
+LR_START = 3e-4            # winds down to zero over the run
 
 TRAIN_STEPS = 3_000_000
-REFRESH_FREQ = 50_000      # how often to copy the learner's weights into the opponent
-EVAL_FREQ = 25_000         # how often to benchmark vs the heuristic (live graph)
-EVAL_BATTLES = 200         # battles for the before/after benchmark
-LIVE_EVAL_BATTLES = 100    # battles per live benchmark point
+REFRESH_FREQ = 50_000      # how often the opponent catches up with the learner
+EVAL_FREQ = 25_000
+EVAL_BATTLES = 200         # for the before-and-after comparison
+LIVE_EVAL_BATTLES = 100    # per point on the live graph
 SAVE_FREQ = 100_000
 
-# Warm-start from the v3 agent; save progress and the peak under their own names.
 WARM_START_PATH = f"ppo_v3_obs{N_FEATURES}.zip"
-MODEL_PATH = f"ppo_v3_selfplay_obs{N_FEATURES}.zip"          # latest, for resuming
-BEST_PATH = f"ppo_v3_selfplay_best_obs{N_FEATURES}.zip"      # highest win rate, for eval
-SNAPSHOT_PATH = "ppo_v3_selfplay_snapshot.zip"              # scratch file to seed the opponent
+MODEL_PATH = f"ppo_v3_selfplay_obs{N_FEATURES}.zip"          # the latest, to resume from
+BEST_PATH = f"ppo_v3_selfplay_best_obs{N_FEATURES}.zip"      # the best, to actually use
+SNAPSHOT_PATH = "ppo_v3_selfplay_snapshot.zip"              # scratch file for the opponent
 TB_LOG_NAME = f"ppo_v3_selfplay_obs{N_FEATURES}"
 
 
 def linear_schedule(start):
-    """progress_remaining goes 1 -> 0 over the run, so this decays the LR from `start` to 0."""
+    """Wind the learning rate down to zero as the run progresses."""
     return lambda progress_remaining: progress_remaining * start
 
 
@@ -72,8 +69,8 @@ def make_self_opponent():
 
 
 def build_train_env(opponent):
-    """Agent vs a snapshot of itself, on the v3 win-focused reward (train_rl.REWARD_WEIGHTS)
-    so the value function stays on the scale it warm-starts on."""
+    """The agent against a copy of itself, using the same rewards it was trained on, so its
+    sense of what a position is worth doesn't suddenly change scale."""
     showdown = ShowdownSinglesEnv(
         reward_weights=base.REWARD_WEIGHTS,
         account_configuration1=AccountConfiguration.generate("v3spA", rand=True),
@@ -85,7 +82,7 @@ def build_train_env(opponent):
 
 
 def build_eval_env():
-    """A separate env that plays the heuristic, for the comparable benchmark."""
+    """A separate game against the fixed heuristic, so the numbers stay comparable."""
     showdown = ShowdownSinglesEnv(
         account_configuration1=AccountConfiguration.generate("v3spEvA", rand=True),
         account_configuration2=AccountConfiguration.generate("v3spEvB", rand=True),
@@ -104,7 +101,7 @@ def main():
     env, _ = build_train_env(opponent)
     eval_env, eval_inner = build_eval_env()
 
-    # Start from a saved self-play agent (continue), else warm-start from the v3 model.
+    # Carry on from a saved self-play agent if there is one, otherwise start from the big one.
     resuming = os.path.exists(MODEL_PATH)
     if resuming:
         print(f"CONTINUING v3 self-play from {MODEL_PATH}.", flush=True)
@@ -118,11 +115,11 @@ def main():
             f"Train the v3 agent first: python -u src\\train_v3.py")
     model = MaskablePPO.load(start_path, env=env, tensorboard_log=base.TB_DIR)
 
-    # Loading preserves net_arch, gamma, and reward scale; we only override the optimizer here.
+    # Loading keeps the network, discount and reward scale; we only change the optimiser.
     model.target_kl = TARGET_KL
     model.lr_schedule = linear_schedule(LR_START)
 
-    # Seed the opponent with a copy of the learner so it starts as an equal mirror.
+    # Give the opponent a copy of the learner, so it starts out as an exact mirror.
     model.save(SNAPSHOT_PATH)
     opponent.model = MaskablePPO.load(SNAPSHOT_PATH)
 

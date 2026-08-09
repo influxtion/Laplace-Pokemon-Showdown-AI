@@ -1,11 +1,11 @@
-r"""Benchmark our EnginePlayer against Foul Play head-to-head on the local server.
+r"""Head-to-head against Foul Play on the local server.
 
-Foul Play (pmariglia/foul-play) is the strongest open-source Showdown bot and the
-project our architecture descends from -- beating it answers "is this the strongest
-open bot?". Both bots get matched compute (states x time x threads).
+Foul Play (pmariglia/foul-play) is the strongest open-source Showdown bot and the project
+ours descends from, so beating it answers "is this the strongest open bot?". Both sides get
+matched compute (states x time x threads) -- the result is about the ideas, not the box.
 
-Setup (once): the foul-play/ clone with its own fp-venv (its pinned deps conflict
-with ours). Start the pieces in this order:
+Setup (once): clone foul-play/ with its own fp-venv; its pinned deps conflict with ours.
+Start the pieces in this order:
   1. local server:  cd server && node pokemon-showdown start --no-security
   2. Foul Play (accepts our challenges):
      foul-play\fp-venv\Scripts\python.exe foul-play\run.py ^
@@ -45,11 +45,11 @@ async def main():
     ap.add_argument("--mix-frac", type=float, default=0.75,
                     help="mix window as a fraction of the top score")
     ap.add_argument("--username", default="influxbench",
-                    help="account name (use a distinct one per config for mining)")
+                    help="account name; use a distinct one per config so mining can split runs")
     ap.add_argument("--net", default=None,
                     help="value net path override (default models/value_net.pt)")
     ap.add_argument("--boost-margin", type=float, default=0,
-                    help="value_boost_margin (0 = ladder config; 26 = pre-cohort-2 arm)")
+                    help="value_boost_margin (0 = ladder config; 26 = the pre-cohort-2 arm)")
     args = ap.parse_args()
 
     value_path = args.net or os.path.join(
@@ -71,9 +71,9 @@ async def main():
           f"avg={args.avg})...", flush=True)
     os.makedirs(OUT_DIR, exist_ok=True)
     saved = set()
-    # One challenge at a time with a pause: Foul Play only accepts while it is back in
-    # its 'waiting for challenge' state, so back-to-back challenges get dropped and both
-    # sides deadlock (observed live). Saving replays per game also survives interruption.
+    # One challenge at a time with a pause: Foul Play only accepts while it's back in its
+    # 'waiting for challenge' state, so back-to-back challenges get dropped and both sides
+    # deadlock (observed live). Saving replays per game also survives interruption.
     for i in range(args.battles):
         if i:
             await asyncio.sleep(8)

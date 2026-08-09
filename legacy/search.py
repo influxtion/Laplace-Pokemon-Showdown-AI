@@ -1,25 +1,24 @@
-r"""Test-time search: a 1-ply lookahead layered on the trained policy.
+r"""Think one turn ahead, using the trained network only as a hint.
 
-This isn't MCTS. True MCTS needs a forward simulator to roll the game out, and we don't have
-one: the dynamics live in the server, the opponent's set/HP/item are hidden, and there's no
-cheap clone-and-sim. Building a battle simulator is a separate project, and a bad one would
-hurt.
+This is not MCTS. Real MCTS needs to be able to play the game forward in its head, and at
+this point in the project we couldn't: the rules live on the server, the opponent's set and
+item are hidden, and there's no cheap way to clone a battle and simulate it. Writing a
+battle engine is a whole project of its own, and a bad one is worse than none.
 
-So instead, for every legal action we compute a one-turn outcome from our damage calculator
-and opponent set-prediction (knowledge.py) -- net HP swing, who KOs first, whether a switch
-escapes a losing matchup -- and pick the best. The policy is kept only as a small prior to
-break ties among comparable actions, so the damage model can override a clearly bad choice.
+So instead, for every legal thing we could do, we work out roughly how the turn goes using
+our own damage calculator and set predictions: how much health each side loses, who lands a
+kill first, whether switching escapes a bad matchup. Then we take the best one. The trained
+network only nudges between options that are already close.
 
-Scoring every action matters. The old version only re-ranked the policy's top-k, so if the
-policy never proposed a switch the searcher couldn't switch and would sit in a losing matchup
-clicking a resisted move. Evaluating all legal actions lets it switch, finish with priority,
-and skip bad attacks on its own.
+Scoring every option matters. An earlier version only re-ranked the network's top few
+suggestions, which meant that if the network never suggested switching, the bot simply
+couldn't switch, and would sit in a hopeless matchup clicking a resisted move forever.
 
-It also handles Terastallization (action ids 22-25 are move + terastallize). Tera changes your
-typing, hence your STAB and what hits you super-effectively; a tera action is scored under the
-tera typing and only preferred when it actually helps, so the agent won't tera into a weakness.
+Terastallizing is handled too. Tera changes your typing, so it changes both what you hit
+hard and what hits you hard. A Tera option is scored under the new typing and only wins if
+it genuinely helps, so the bot won't Tera itself into a weakness.
 
-It's a poke-env Player, used at test time -- see eval_search.py / play.py.
+Used at test time by eval_search.py and play.py.
 """
 
 import numpy as np
@@ -33,9 +32,8 @@ from poke_env.environment.singles_env import SinglesEnv
 from rl_env import build_observation, _eff_speed
 from knowledge import KNOWLEDGE, estimate_damage_fraction, safe_priority, TYPE_NAMES
 
-# Type chart for Tera reasoning (an attacking type's effectiveness against a defending type).
-# Guarded so a poke-env API change degrades to no tera modelling instead of crashing; the
-# all-action evaluation is the main win regardless.
+# The type chart, for reasoning about Tera. Wrapped in a try so that if the library changes
+# underneath us we just lose the Tera modelling rather than crashing outright.
 try:
     from poke_env.battle import PokemonType
     from poke_env.data import GenData
@@ -48,7 +46,7 @@ except Exception:
 
 
 def _type_eff(attacking_type, defending_types):
-    """Effectiveness multiplier of one attacking type against a list of defending types."""
+    """How effective one attacking type is against a defending typing."""
     defs = [t for t in defending_types if t is not None]
     if attacking_type is None or _TYPE_CHART is None or not defs:
         return 1.0
@@ -58,9 +56,9 @@ def _type_eff(attacking_type, defending_types):
         return 1.0
 
 
-# Abilities granting a full immunity to one attacking type (ability id -> type name). Clicking
-# such a move into a holder does nothing, and several of these heal or boost it, so it's
-# actively bad. Ids are to_id_str form, matching knowledge.predicted_abilities keys.
+# Abilities that make something completely immune to a type. Attacking into one of these
+# doesn't just waste the turn; several of them heal or boost the target, so it's worse than
+# doing nothing.
 IMMUNITY_ABILITIES = {
     "levitate": "GROUND", "eartheater": "GROUND",
     "flashfire": "FIRE", "wellbakedbody": "FIRE",
@@ -71,9 +69,9 @@ IMMUNITY_ABILITIES = {
 
 
 def _immunity_chance(opp, move_type):
-    """Probability the opponent's ability makes it immune to this move's type. Reads the
-    set-narrowed prediction (knowledge.predicted_abilities), so an unrevealed Orthworm (always
-    Earth Eater) reads ~1.0 against Ground and a coin-flip ability reads ~0.5."""
+    """How likely their ability is to make this move do nothing. Based on which sets they
+    could still be running, so an Orthworm, which always has Earth Eater, reads as a certain
+    Ground immunity even before it shows, while a fifty-fifty ability reads as a half."""
     if opp is None or move_type is None:
         return 0.0
     chance = sum(p for aid, p in KNOWLEDGE.predicted_abilities(opp).items()
@@ -82,9 +80,9 @@ def _immunity_chance(opp, move_type):
 
 
 def _own_immune_types(mon):
-    """The type our own mon is immune to via its known ability, as a set, so the opponent's
-    moves of that type don't scare us (Levitate vs Ground). None if no such immunity. Type-based
-    immunities (Flying vs Ground) already read 0 from the type chart."""
+    """Any type our own Pokemon's ability makes it immune to, so we don't flinch at moves
+    that can't touch us. Ordinary type immunities already read as zero from the chart; this
+    is only for the ability-based ones like Levitate."""
     if mon is None or not getattr(mon, "ability", None):
         return None
     t = IMMUNITY_ABILITIES.get(to_id_str(mon.ability))
@@ -92,35 +90,31 @@ def _own_immune_types(mon):
 
 
 def _is_seeded(mon):
-    """True if Leech Seed is sapping this Pokemon. Switching out is the only cure (the seed
-    doesn't follow to the next mon)."""
+    """Is this Pokemon Leech Seeded? Switching out is the only way to shake it off."""
     return mon is not None and any(e.name == "LEECH_SEED" for e in mon.effects)
 
 
 class SearchPlayer(Player):
-    """Scores every legal action with a 1-turn lookahead, using the policy as a prior."""
+    """Scores everything we could legally do this turn, with the network as a tiebreaker."""
 
-    # How much the policy's probability counts. Action scores are in HP-fraction units
-    # (~[-2, 2.5]); at 0.3 a confident policy only shifts ties, so a clear matchup difference
-    # (>1.0) still wins. The policy advises, the damage model decides.
+    # How much the network's opinion counts. Scores are measured in health, roughly -2 to
+    # 2.5, so at 0.3 even a very confident network only shifts genuinely close calls. A
+    # clear matchup difference still wins. The network advises; the damage model decides.
     POLICY_PRIOR_WEIGHT = 0.3
-    # Tera is a one-per-game resource. A tera action must beat its plain twin by at least this
-    # much (extra damage + reduced incoming, in HP fractions) or it's penalised, so the agent
-    # saves tera instead of wasting it or tera-ing into a weakness.
+    # Tera is once per game. A Tera option has to beat its plain version by at least this
+    # much, or it gets charged for the privilege, so the bot saves it rather than throwing
+    # it away or Teraing into a weakness.
     TERA_MIN_BENEFIT = 0.10
     TERA_COST = 0.50
-    # Extra penalty (on top of lost damage) for a move the opponent's ability might nullify,
-    # scaled by that probability: a wasted turn, and many immunity abilities heal/boost the
-    # holder. Makes an immunity-type move too risky unless the chance is low or nothing's better.
+    # An extra penalty, on top of the lost damage, for attacking into a possible immunity.
+    # It's a wasted turn, and plenty of those abilities heal or boost their holder.
     IMMUNITY_RISK = 0.60
-    # How much a switch-in's best damage into the opponent counts. Lets the agent switch for
-    # offense -- bail on a mon whose moves are all resisted -- discounted since that damage only
-    # lands next turn.
+    # How much a switch-in's own offence counts. This is what lets the bot bail out of a
+    # Pokemon whose every move is resisted. Discounted, since that damage only lands next turn.
     SWITCH_OFFENSE_WEIGHT = 0.7
-    # Leech Seed drains our active ~1/8 HP a turn and heals the opponent; only switching cures
-    # it. When our active is seeded we nudge toward switching: a bonus on switches and a penalty
-    # on staying in -- unless staying lands a KO or a hit at least LEECH_SEED_STAY_DMG of max HP,
-    # where finishing the opponent beats running.
+    # Leech Seed drains us every turn and heals them, and switching is the only cure. So we
+    # lean towards switching when seeded, unless staying in lands a kill or a big hit, in
+    # which case finishing the job beats running away.
     LEECH_SEED_SWITCH_BONUS = 0.35
     LEECH_SEED_STAY_PENALTY = 0.35
     LEECH_SEED_STAY_DMG = 0.5
@@ -129,10 +123,10 @@ class SearchPlayer(Player):
         super().__init__(**kwargs)
         self.model = model
 
-    # --- the learned prior --------------------------------------------------
+    # --- asking the network -----------------------------------------------
 
     def _policy_probs(self, obs, mask):
-        """Action probabilities from the masked policy, or None on any failure."""
+        """What the trained network would do here, or None if anything goes wrong."""
         try:
             obs_t, _ = self.model.policy.obs_to_tensor(obs)
             with torch.no_grad():
@@ -141,15 +135,15 @@ class SearchPlayer(Player):
         except Exception:
             return None
 
-    # --- Terastallization-aware damage helpers ------------------------------
+    # --- damage, with Tera taken into account -------------------------------
 
     @staticmethod
     def _tera_offense(me, move, opp, tera_type):
-        """Our move's damage if we Terastallize: as normal but with the tera STAB.
+        """What this move would do if we Terastallized first.
 
-        After tera you keep 1.5x STAB on moves matching your original types and gain 1.5x on
-        the tera type (2x if the tera type matches an original type). So a Flying move on a
-        Psychic/Flying mon that tera's to Fighting gets no boost."""
+        After Teraing you keep the usual bonus on moves matching your original types and
+        gain one on your Tera type, doubled up if they're the same type. So a Flying move on
+        a Psychic/Flying Pokemon that Teras into Fighting loses its bonus entirely."""
         base = estimate_damage_fraction(me, move, opp)
         if base <= 0 or move.type is None:
             return base
@@ -164,9 +158,9 @@ class SearchPlayer(Player):
         return base / orig_stab * tera_stab
 
     def _tera_incoming(self, me, opp, tera_type, base_incoming):
-        """Scariest incoming hit if our typing became just the tera type. Scales the normal
-        estimate by how the opponent's predicted coverage hits tera vs our current types, so
-        tera-ing into a weakness (Fighting vs a Fairy attacker) reads as more danger."""
+        """How hard we'd get hit if our typing became the Tera type. Compares how well their
+        likely attacks line up against the new typing versus the old one, so Teraing into
+        Fighting in front of a Fairy attacker correctly reads as more dangerous."""
         cur_vuln = self._coverage_vuln(opp, [t for t in me.types if t])
         tera_vuln = self._coverage_vuln(opp, [tera_type])
         if cur_vuln <= 0:
@@ -175,8 +169,8 @@ class SearchPlayer(Player):
 
     @staticmethod
     def _coverage_vuln(opp, defending_types):
-        """Expected effectiveness of the opponent's predicted attacking coverage into the given
-        defending types (probability-weighted over the types it likely carries)."""
+        """How well their likely attacks line up against a given typing, weighted by how
+        likely they are to actually have each of them."""
         if _TYPE_BY_INDEX is None:
             return 1.0
         total = 0.0
@@ -187,22 +181,23 @@ class SearchPlayer(Player):
 
     @staticmethod
     def _self_drop_penalty(move):
-        """Small penalty for moves that lower the user's own stats (Overheat, Draco Meteor,
-        Close Combat): a real cost the raw damage number misses."""
+        """A nudge against moves that weaken you when you use them, like Overheat or Close
+        Combat. That's a real cost the damage number alone doesn't show."""
         drops = 0
         for v in (getattr(move, "self_boost", None) or {}).values():
             if v < 0:
                 drops += -v
         return 0.08 * drops
 
-    # --- the 1-turn lookahead score ----------------------------------------
+    # --- scoring one turn ahead ---------------------------------------------
 
     def _move_score(self, me, move, opp, tera=False, seeded=False):
-        """Higher = better 1-turn exchange. Net HP swing (damage we deal minus the
-        probability-weighted hit back), plus bonuses for who secures the KO given turn order, a
-        penalty for self-stat-drops, and for tera actions the tera typing and a cost for
-        spending tera without a clear payoff. `seeded` penalizes staying in under Leech Seed
-        unless this move is a big hit."""
+        """How good this move looks over the coming turn. Higher is better.
+
+        Mostly it's the health we take off them minus the health we expect to lose, with
+        bonuses for landing a kill (bigger if we move first), a nudge against moves that
+        weaken us, the Tera accounting described above, and a push to switch out if we're
+        being drained by Leech Seed and this move isn't going to end things."""
         if me is None or opp is None:
             return 0.0
         base_dmg = min(estimate_damage_fraction(me, move, opp), 1.0)
@@ -214,46 +209,46 @@ class SearchPlayer(Player):
             dmg = min(self._tera_offense(me, move, opp, tera_type), 1.0)
             incoming = self._tera_incoming(me, opp, tera_type, base_incoming)
 
-        # Ability immunity: discount damage by the chance it does nothing (so it can't "KO")
-        # and penalise the risk separately. Tera doesn't change the move's type, so this is
-        # keyed off move.type either way.
+        # Scale the damage down by the chance their ability just eats it, so a move that
+        # probably does nothing can't be credited with a kill, then charge for the risk
+        # separately. Teraing doesn't change the move's type, so this applies either way.
         immunity = _immunity_chance(opp, move.type)
         dmg *= (1.0 - immunity)
 
-        # Turn order: our move's priority, else raw speed. We can't see the opponent's move, so
-        # this ignores their priority -- a 1-ply approximation.
+        # Who goes first: our priority if we have any, otherwise speed. We can't see their
+        # move, so their priority is invisible to us here.
         i_move_first = safe_priority(move) > 0 or _eff_speed(me) > _eff_speed(opp)
         i_ko = dmg >= opp.current_hp_fraction
         they_ko = incoming >= me.current_hp_fraction
 
-        score = dmg - incoming                               # net HP traded this turn
+        score = dmg - incoming                               # net health traded this turn
         if i_ko and i_move_first:
-            score += 1.5                                     # clean KO, take nothing back
+            score += 1.5                                     # clean kill, no damage taken
         elif i_ko:
-            score += 1.0                                     # KO, but we eat a hit first
+            score += 1.0                                     # kill, but we take a hit first
             if they_ko:
-                score -= 1.0                                 # and might be KO'd before it lands
+                score -= 1.0                                 # and we might not survive it
         elif they_ko and not i_move_first:
-            score -= 1.0                                     # KO'd without securing one
+            score -= 1.0                                     # we die and get nothing for it
         score -= self._self_drop_penalty(move)
-        score -= immunity * self.IMMUNITY_RISK               # risk of clicking into an immunity
+        score -= immunity * self.IMMUNITY_RISK
 
         if tera and tera_type is not None:
             benefit = (dmg - base_dmg) + (base_incoming - incoming)
             if benefit <= self.TERA_MIN_BENEFIT:
-                score -= self.TERA_COST     # don't waste tera or tera into a weakness
+                score -= self.TERA_COST     # not worth burning Tera on
 
-        # Seeded and this move isn't a KO or a big hit -> staying lets the seed keep draining.
+        # Seeded, and this move won't finish things, so staying just feeds the seed.
         if seeded and not (i_ko or dmg >= self.LEECH_SEED_STAY_DMG):
             score -= self.LEECH_SEED_STAY_PENALTY
         return score
 
     @staticmethod
     def _switch_score(mon, opp, seeded=False):
-        """Score a switch by the matchup it gives us: the switch-in's best damage into the
-        opponent (its moves are known, it's our bench) minus the hit it eats coming in and a flat
-        tempo cost. Lets the agent bail on a mon that can't hurt the opponent for one that can.
-        `seeded` adds a bonus, since switching is what cures our active's Leech Seed."""
+        """How good a matchup this switch gets us: the best damage the incoming Pokemon can
+        deal, minus the hit it takes on the way in, minus a flat cost for spending the turn.
+        This is what lets the bot abandon something that can't hurt anything. If our current
+        Pokemon is Leech Seeded, switching also gets a bonus, since that's the cure."""
         if mon is None or opp is None:
             return 0.0
         moves = list(getattr(mon, "moves", {}).values())
@@ -264,13 +259,13 @@ class SearchPlayer(Player):
                 default=0.0,
             )
         else:
-            # No move data yet: fall back to a type-effectiveness proxy (1x->0.25 ... 4x->1.0).
+            # We haven't seen its moves yet, so fall back to raw type effectiveness.
             eff = max((opp.damage_multiplier(t) for t in mon.types if t), default=1.0)
             best_offense = 0.25 * eff
         incoming = KNOWLEDGE.predicted_incoming(opp, mon, immune_types=_own_immune_types(mon))
         score = SearchPlayer.SWITCH_OFFENSE_WEIGHT * best_offense - 0.5 * incoming - 0.15
         if seeded:
-            score += SearchPlayer.LEECH_SEED_SWITCH_BONUS   # switching clears the seed
+            score += SearchPlayer.LEECH_SEED_SWITCH_BONUS   # switching shakes off the seed
         return score
 
     def _action_score(self, action, battle, me, opp):
@@ -284,7 +279,7 @@ class SearchPlayer(Player):
                                     tera=bool(getattr(order, "terastallize", False)), seeded=seeded)
         return 0.0
 
-    # --- decision -----------------------------------------------------------
+    # --- picking the move ---------------------------------------------------
 
     def choose_move(self, battle):
         try:
@@ -298,9 +293,9 @@ class SearchPlayer(Player):
             obs = {"observation": build_observation(battle), "action_mask": mask}
             probs = self._policy_probs(obs, mask)
 
-            # Score every legal action with the 1-ply model; add the policy prob as a small
-            # prior so it only tips comparable actions and breaks ties, never trapping us in a
-            # losing line the policy happens to like.
+            # Score everything, then add a little of the network's opinion. Kept small on
+            # purpose, so it only settles close calls and can never drag us into a losing
+            # line just because the network happens to like it.
             def total(i):
                 prior = probs[i] if probs is not None else 0.0
                 return self._action_score(i, battle, me, opp) + self.POLICY_PRIOR_WEIGHT * prior

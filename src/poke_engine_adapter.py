@@ -1,23 +1,22 @@
-r"""Convert a live poke-env battle into a poke-engine `State`, and sample (determinize)
-the opponent's hidden set so the engine can search a concrete game.
+r"""poke-env Battle -> poke-engine State, with the opponent's hidden set determinized.
 
-Background. The strongest open-source Showdown bot, Foul Play, doesn't hand-roll a forward
-simulator (the dead end this project hit in deep_search.py). It feeds the position into
-`poke-engine` -- a fast Rust battle engine with a real MCTS / expectiminimax search -- and
-handles hidden information by *determinization*: sample several full opponent teams consistent
-with what's been revealed, search each, and pool the results. This module is the bridge:
-poke-env `Battle`/`Pokemon` objects in, a poke-engine `State` out.
+The engine wants a fully specified position: every stat, item and ability on both sides.
+Half of that is hidden, so this module samples it. Call build_state N times and you get N
+opponent teams, all consistent with what's actually been revealed; search them all and
+pool. Same approach Foul Play uses.
 
-What's known vs. guessed:
-  * Our side is fully known (stats, moves, item, ability) from the request the server sends us.
-  * The opponent's species and revealed moves are known; the rest of their set (the other
-    moves, ability, tera type, item) and any not-yet-seen bench Pokemon are *sampled* from the
-    gen9 randbats set sheet (server/data/random-battles/gen9/sets.json) -- the same public pool
-    knowledge.py already uses. Items aren't in that sheet, so they're guessed by role/moves.
+Known vs sampled:
+  * Our side is fully known (stats, moves, item, ability) from the server's request.
+  * The opponent's species and revealed moves are known. The rest of the set -- other
+    moves, ability, tera type, item -- plus any unseen bench mon is sampled from the
+    gen9 randbats data. Two sources: complete counted joint sets (preferred, see
+    _JointSets) and the set sheet + a marginal usage feed (fallback).
 
-The engine's Pokemon constructor takes explicit stats; we pass the real ones for our side and
-the standard randbats estimate (base + level, 85 EVs / 31 IVs / neutral) for the opponent --
-exactly what knowledge.estimate uses, so damage numbers stay consistent across the project.
+Opponent stats use the standard randbats estimate (base + level, 85 EVs / 31 IVs /
+neutral), same as knowledge._estimate_stat, so damage numbers agree project-wide.
+
+The sampling is where most of the inference lives: Choice-lock and Scarf deduction,
+Illusion detection, real turns-remaining on timed conditions.
 """
 
 import json
@@ -40,7 +39,7 @@ _SETS_PATH = os.path.join(
     "server", "data", "random-battles", "gen9", "sets.json",
 )
 
-# --- status / weather / terrain / hazard name maps (poke-env -> poke-engine strings) --------
+# --- status / weather / terrain name maps (poke-env -> poke-engine strings) ---------------
 
 _STATUS = {"BRN": "Burn", "PSN": "Poison", "TOX": "Toxic",
            "PAR": "Paralyze", "SLP": "Sleep", "FRZ": "Freeze"}
@@ -70,7 +69,7 @@ def _types_tuple(mon):
 
 
 def _base_types_tuple(mon):
-    """The species' original (pre-Tera) types, from the dex, padded to 2."""
+    """Pre-Tera species types from the dex, padded to 2."""
     entry = _POKEDEX.get(to_id_str(mon.species)) or {}
     ts = [t.lower() for t in entry.get("types", [])]
     if not ts:
@@ -81,8 +80,7 @@ def _base_types_tuple(mon):
 
 
 def _stat(mon, key, own):
-    """A single stat: the real value for our side (from the request), else the randbats
-    estimate used everywhere else in the project."""
+    """Real value for our side (from the request), else the randbats estimate."""
     if own:
         real = (getattr(mon, "stats", None) or {}).get(key)
         if real:
@@ -103,15 +101,16 @@ def _hp(mon, maxhp):
     return max(0, min(maxhp, round(maxhp * frac)))
 
 
-# --- opponent set determinization -----------------------------------------------------------
+# --- opponent set determinization ---------------------------------------------------------
 
 class _SetSheet:
-    """The gen9 randbats sets, with level / ordered movepool / abilities / tera types kept
-    (knowledge.py drops these). Used to sample a concrete opponent set."""
+    """gen9 randbats sets, keeping level / movepool / abilities / tera types.
+
+    knowledge.py drops those; we need them to build a concrete mon."""
 
     def __init__(self, path=_SETS_PATH):
-        self.by_species = {}      # species_id -> {"level": int, "sets": [ {...} ]}
-        self._pools = {}          # species_id -> union of its sets' movepools (lazy cache)
+        self.by_species = {}      # species_id -> {"level": int, "sets": [...]}
+        self._pools = {}          # species_id -> union of its sets' movepools (lazy)
         try:
             raw = json.load(open(path, encoding="utf-8"))
         except (OSError, ValueError):
@@ -131,7 +130,7 @@ class _SetSheet:
         return (self.by_species.get(species_id) or {}).get("level", 100)
 
     def movepool(self, species_id):
-        """Union of every set's movepool for a species (cached), or None if unknown."""
+        """Union of every set's movepool for a species (cached), None if unknown."""
         pool = self._pools.get(species_id)
         if pool is None:
             info = self.by_species.get(species_id)
@@ -142,7 +141,7 @@ class _SetSheet:
         return pool
 
     def sample_set(self, species_id, revealed_ids):
-        """Pick a set consistent with the revealed moves (uniform over the survivors)."""
+        """Uniform pick among the sets consistent with the revealed moves."""
         info = self.by_species.get(species_id)
         if not info or not info["sets"]:
             return None
@@ -152,10 +151,11 @@ class _SetSheet:
 
     @staticmethod
     def sample_moves(revealed_ids, pool, k=4):
-        """A plausible concrete moveset: the revealed moves plus a random draw from the rest of
-        the role's movepool. 56% of gen9 randbats movepools exceed 4 moves, so truncating the
-        pool (what this used to do) fixed the opponent's unrevealed moves to the same sheet-order
-        prefix in every determinization -- the search could never anticipate the rest."""
+        """Revealed moves + a random draw from the rest of the role's movepool.
+
+        56% of gen9 randbats movepools exceed 4 moves, so truncating the pool (what this
+        used to do) pinned the opponent's unrevealed moves to the same sheet-order prefix
+        in every determinization -- the search could never anticipate the rest."""
         moves = list(dict.fromkeys(revealed_ids))[:k]
         rest = [m for m in pool if m not in moves]
         need = k - len(moves)
@@ -171,12 +171,13 @@ class _SetSheet:
 SETS = _SetSheet()
 
 
-# --- joint set data (complete sets with observed counts) ------------------------------------
-# Aggregated real generated randbats sets: "level,item,ability,move1..move4,teraType" -> count
-# (from foul-play's public dataset, data.foulplay.cc). Sampling complete JOINT sets weighted
-# by count preserves the move/item/ability/tera correlations that marginal probabilities lose
-# and matches the true generator distribution. Validated need: at compute-matched settings we
-# lost 1-11 to Foul Play, whose only relevant structural edge was this sampling.
+# --- joint set data (complete sets with observed counts) ----------------------------------
+# Aggregated real generated randbats sets, from foul-play's public dataset
+# (data.foulplay.cc): "level,item,ability,move1..move4,teraType" -> count. Sampling complete
+# JOINT sets weighted by count preserves the move/item/ability/tera correlations that
+# marginals lose, and matches the true generator distribution. Validated need: at
+# compute-matched settings we lost 1-11 to Foul Play, and this was its only relevant
+# structural edge.
 _JOINT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            "data", "joint_sets_gen9.json")
 
@@ -213,9 +214,8 @@ class _JointSets:
                item_exclude=(), force_scarf=False):
         """One complete set consistent with the evidence, weighted by observed count.
 
-        Filters are applied as a ladder that never empties the pool: each constraint
-        narrows the candidates only if survivors remain (a stale dataset must degrade
-        to 'less informed', never to 'no set')."""
+        Filters are a ladder that never empties the pool: each constraint narrows only if
+        survivors remain. A stale dataset must degrade to 'less informed', never 'no set'."""
         cands = self.by_species.get(species_id)
         if not cands:
             return None
@@ -241,9 +241,9 @@ class _JointSets:
 JOINT = _JointSets()
 
 
-# Real per-role item/ability/tera probabilities from the pkmn randbats *stats* feed (the set
-# sheet has no items, so we previously guessed -> under-estimated Choice/Life Orb/weather damage
-# and stayed in fatal matchups). Cached locally; refresh with the curl in the module docstring.
+# Per-role item/ability/tera probabilities from the pkmn randbats stats feed. The set sheet
+# has no items at all, so we used to guess -> under-estimated Choice/Life Orb/weather damage
+# and stayed in fatal matchups. Cached locally; refresh from the feed when it drifts.
 _STATS_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            "data", "randbats_stats_gen9.json")
 
@@ -263,8 +263,8 @@ def _weighted(dist):
 
 
 class _StatsFeed:
-    """pkmn randbats stats: species_id -> role -> {items/abilities/tera: {id: prob}} (+ a
-    species-level marginal fallback for when the role isn't listed)."""
+    """species_id -> role -> {items/abilities/tera: {id: prob}}, plus a species-level
+    marginal to fall back on when the role isn't listed."""
 
     def __init__(self, path=_STATS_PATH):
         self.by_species = {}
@@ -315,8 +315,8 @@ STATS = _StatsFeed()
 
 
 def _guess_item(set_dict, ability_id):
-    """Cheap item prior from role / ability (the set sheet has no items). Most gen9 randbats
-    leads run Heavy-Duty Boots, so that's the default."""
+    """Cheap item prior from role/ability, for when the stats feed has nothing. Most gen9
+    randbats leads run Heavy-Duty Boots, hence the default."""
     role = set_dict.get("role", "")
     if ability_id in ("protosynthesis", "quarkdrive"):
         return "boosterenergy"
@@ -329,7 +329,7 @@ def _guess_item(set_dict, ability_id):
     return "heavydutyboots"
 
 
-# --- Pokemon construction -------------------------------------------------------------------
+# --- Pokemon construction -------------------------------------------------------------
 
 _CHOICE_ITEMS = ("choiceband", "choicespecs", "choicescarf")
 
@@ -345,9 +345,9 @@ def _moves_from_objs(move_objs, limit=4):
 
 
 def _moves_from_ids(move_ids, limit=4, only_enabled=None):
-    """PEMove list; if only_enabled is a move id, every other move is disabled (choice lock --
-    poke-engine does NOT enforce the lock from item + last_used_move, verified empirically, so
-    we encode it in the move flags the search respects)."""
+    """PEMove list. only_enabled disables every other move -- that's how a Choice lock is
+    encoded. poke-engine does NOT derive the lock from item + last_used_move (verified
+    empirically), but it does respect the disabled flag, so we set it ourselves."""
     pem = [PEMove(id=mid, pp=16, disabled=(only_enabled is not None and mid != only_enabled))
            for mid in list(move_ids)[:limit]]
     while len(pem) < 4:
@@ -356,7 +356,7 @@ def _moves_from_ids(move_ids, limit=4, only_enabled=None):
 
 
 def _last_used_str(mon, pe_moves):
-    """poke-engine Side.last_used_move ('move:<index>' -- the engine panics on move names)."""
+    """Side.last_used_move as 'move:<index>'. The engine PANICS on move names."""
     last = getattr(mon, "last_move", None)
     if last is None:
         return "move:none"
@@ -367,7 +367,7 @@ def _last_used_str(mon, pe_moves):
 
 
 def _own_pokemon(mon, moves_override=None):
-    """Build an engine Pokemon for our side (everything known)."""
+    """Engine Pokemon for our side -- everything known, nothing sampled."""
     maxhp = _maxhp(mon, own=True)
     moves = moves_override if moves_override is not None else _moves_from_objs(mon.moves.values())
     item = to_id_str(mon.item) if mon.item else "none"
@@ -387,10 +387,10 @@ def _own_pokemon(mon, moves_override=None):
     )
 
 
-# --- Zoroark / Illusion inference ------------------------------------------------------------
+# --- Zoroark / Illusion inference -------------------------------------------------------
 
 _ILLUSION_FORMES = ("zoroarkhisui", "zoroark")
-_TELL_IGNORED_MOVES = {"struggle"}     # not part of any movepool; never evidence
+_TELL_IGNORED_MOVES = {"struggle"}     # not in any movepool; never evidence
 
 
 class _FakeType:
@@ -401,12 +401,13 @@ class _FakeType:
 
 
 class _ZoroShim:
-    """A poke-env-mon lookalike that re-skins a disguised opponent as the identified
-    Zoroark forme. Illusion copies the teammate's species/level/gender in the protocol
-    (gen9 randbats runs Illusion Level Mod, so even the displayed LEVEL is the
-    teammate's -- verified in server/config/formats.ts) but HP%, status and move usage
-    are the mon's own. So species-derived values (typing, base stats, level, set
-    sampling) come from the Zoroark forme; observed state proxies through."""
+    """poke-env-mon lookalike that re-skins a disguised opponent as the Zoroark forme.
+
+    Illusion copies the teammate's species/level/gender in the protocol -- gen9 randbats
+    runs Illusion Level Mod, so even the displayed LEVEL is the teammate's (verified in
+    server/config/formats.ts) -- but HP%, status and move usage are the mon's own. So
+    species-derived values (typing, base stats, level, set sampling) come from the Zoroark
+    forme; observed state proxies through."""
 
     def __init__(self, mon, zoro_id):
         self._mon = mon
@@ -425,14 +426,16 @@ class _ZoroShim:
 
 
 def _illusion_tell(mon):
-    """gen9 randbats Zoroark detection: Illusion fakes species/level/gender but cannot
-    fake MOVE USAGE. A revealed move outside the displayed species' full randbats
-    movepool means a disguised Zoroark (observed live 2026-07-04: 'Heracross' clicking
-    Dark Pulse kept its psychic-immunity hidden and cost the game). Returns a Zoroark
-    forme whose movepool covers every revealed move -- sampled per call when both fit,
-    so determinized worlds express the forme uncertainty -- else None. Conservative by
-    construction: never fires on missing sheet data, on Ditto (Transform shows foreign
-    moves), or once the Illusion is already broken (species is a Zoroark forme)."""
+    """gen9 randbats Zoroark detection. Illusion fakes species/level/gender but cannot fake
+    MOVE USAGE, so a revealed move outside the displayed species' full randbats movepool
+    means a disguised Zoroark. Observed live: a 'Heracross' clicking Dark Pulse kept its
+    psychic immunity hidden and cost the game.
+
+    Returns a Zoroark forme whose movepool covers every revealed move, sampled per call
+    when both fit so determinized worlds express the forme uncertainty. Else None.
+
+    Conservative by construction: never fires on missing sheet data, on Ditto (Transform
+    legitimately shows foreign moves), or once the Illusion is already broken."""
     species = to_id_str(mon.species)
     if species in _ILLUSION_FORMES or species == "ditto":
         return None
@@ -450,25 +453,25 @@ def _illusion_tell(mon):
 
 def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None, speed_hint=None,
                               use_joint=False):
-    """Build an engine Pokemon for a revealed opponent mon, sampling its hidden set.
-    use_stats toggles the real randbats item/ability/tera feed (for A/B testing it).
-    used_since_switch: move ids this mon has used since it last switched in (active mon only) --
-    2+ distinct moves rules out a Choice item, 1 move + a Choice item means it's locked.
-    speed_hint: 'scarf'/'noscarf' verdict from observed turn order (randbats speed spreads are
-    fixed, so outspeeding its known raw speed means Scarf) -- overrides item sampling.
-    use_joint: sample a complete counted joint set (see _JointSets) instead of composing
-    the set from marginals; falls through to the marginal path when no joint data exists."""
+    """Engine Pokemon for a revealed opponent mon, sampling its hidden set.
+
+    use_stats           -- use the real randbats item/ability/tera feed (kwarg exists to A/B it).
+    used_since_switch   -- move ids used since switch-in, active only. 2+ distinct rules out
+                           a Choice item; 1 move + a Choice item means locked.
+    speed_hint          -- 'scarf'/'noscarf' from observed turn order; overrides item sampling.
+    use_joint           -- sample a complete counted joint set instead of composing from
+                           marginals. Falls through to the marginal path if no joint data."""
     zoro = _illusion_tell(mon)
     if zoro:
         mon = _ZoroShim(mon, zoro)     # everything below now samples the Zoroark forme
     species = to_id_str(mon.species)
-    # Formes that appear mid-battle (Mimikyu-Busted, Ogerpon-*-Tera, etc.) aren't keys in the
-    # randbats sheet/stats feed; fall back to the base species so we still get real sets.
-    # (Observed live: mimikyubusted missed the sheet, got the no-set fallback with a 'typeless'
-    # tera, and the engine's opponent-tera branches then erased its Ghost immunity.)
+    # Mid-battle formes (Mimikyu-Busted, Ogerpon-*-Tera) aren't keys in the sheet or the
+    # stats feed; fall back to base species so we still get real sets. Observed live:
+    # mimikyubusted missed the sheet, hit the no-set fallback with a 'typeless' tera, and
+    # the engine's opponent-tera branches then erased its Ghost immunity.
     sheet_id = species if species in SETS.by_species else to_id_str(mon.base_species)
     revealed = list(mon.moves.keys())
-    # A mon that used two different moves without leaving the field can't be Choice-locked.
+    # Two distinct moves without leaving the field => can't be Choice-locked.
     multi_moved = bool(used_since_switch) and len(used_since_switch) >= 2
     item_exclude = _CHOICE_ITEMS if multi_moved else \
         ("choicescarf",) if speed_hint == "noscarf" else ()
@@ -521,25 +524,25 @@ def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None, speed
                    else st_ability or (random.choice(s["abilities"]) if s["abilities"] else "none"))
         tera = (mon.tera_type.name.lower() if getattr(mon, "tera_type", None)
                 else st_tera or random.choice(s["tera"]))
-        # Real item probability (Choice/Life Orb/etc.) -> correct incoming-damage estimate.
+        # Real item probability (Choice / Life Orb / etc.) -> correct incoming damage.
         item = to_id_str(mon.item) if mon.item else st_item or _guess_item(s, ability)
     else:
         move_ids = revealed
         ability = to_id_str(mon.ability) if mon.ability else "none"
-        # Never guess 'typeless' tera: the engine explores opponent-tera branches, and a
-        # typeless tera strips the mon's real typing (and its immunities) in those lines.
+        # Never guess a 'typeless' tera: the engine explores opponent-tera branches, and a
+        # typeless tera strips the mon's real typing (and immunities) in those lines.
         tera = (mon.tera_type.name.lower() if getattr(mon, "tera_type", None)
                 else _types_tuple(mon)[0])
         item = to_id_str(mon.item) if mon.item else "heavydutyboots"
 
-    # Turn-order evidence: outsped its known raw speed -> model it as Scarf'd in every world
-    # (unless the item is revealed, or it used 2+ moves without switching -- then the speed came
-    # from an ability we don't model, and a Choice item is impossible anyway).
+    # Turn-order evidence: outsped its known raw speed -> Scarf in every world. Skipped if
+    # the item is revealed, or it used 2+ moves without switching (then the speed came from
+    # an ability we don't model, and a Choice item is impossible anyway).
     if speed_hint == "scarf" and not mon.item and not multi_moved:
         item = "choicescarf"
 
-    # Choice lock: if this world's item is a Choice item (or the ability is Gorilla Tactics) and
-    # the mon has committed to a move since switching in, only that move is selectable.
+    # Choice lock: if this world's item is a Choice item (or the ability is Gorilla Tactics)
+    # and the mon has committed to a move since switch-in, only that move is selectable.
     locked = None
     last = getattr(mon, "last_move", None)
     if (last is not None and not multi_moved and last.id in move_ids
@@ -562,7 +565,7 @@ def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None, speed
 
 
 def _sampled_unrevealed_pokemon(species_id, use_stats=True, use_joint=False):
-    """A wholly-unseen opponent bench slot: pick a random set for this species."""
+    """A wholly-unseen bench slot: roll a random set for this species."""
     if use_joint:
         js = JOINT.sample(species_id)
         if js is not None:
@@ -630,16 +633,16 @@ def _sampled_unrevealed_pokemon(species_id, use_stats=True, use_joint=False):
     )
 
 
-# --- side / state assembly ------------------------------------------------------------------
+# --- side / state assembly ----------------------------------------------------------------
 
 def _dummy():
     return PEPokemon(id="pikachu", level=1, hp=0, maxhp=0)
 
 
 def _remaining(start_turn, now, base, extended):
-    """Turns remaining for a timed condition set on `start_turn`. If it has outlived its
-    base duration it must be item-extended (Light Clay / weather rocks / Terrain Extender),
-    so switch to the extended clock; never report less than 1 while it's still active."""
+    """Turns remaining for a timed condition set on `start_turn`. Outliving its base
+    duration means it's item-extended (Light Clay / weather rock / Terrain Extender), so
+    switch to the extended clock. Never reports < 1 while it's still active."""
     left = base - (now - start_turn)
     if left < 1:
         left = extended - (now - start_turn)
@@ -647,13 +650,15 @@ def _remaining(start_turn, now, base, extended):
 
 
 def _side_conditions(sc, now, protect=0):
-    """poke-env side_conditions dict -> engine SideConditions. Hazards carry layer counts;
-    timed conditions (screens/tailwind) carry real turns-remaining derived from the start
-    turn poke-env records (they used to be hard-coded as freshly set, so a Reflect about to
-    expire looked 5 turns strong). `protect` is the active mon's consecutive-protect count
-    (poke-env mon.protect_counter): the engine halves... rather, cubes the success odds per
-    consecutive use (verified: 100%/33%/11%), but only if it's told -- it was always 0, so
-    back-to-back Protects looked guaranteed (7 failed Protects mined in one 30-game run)."""
+    """poke-env side_conditions -> engine SideConditions.
+
+    Hazards carry layer counts. Timed conditions (screens/tailwind) carry real
+    turns-remaining derived from the start turn poke-env records -- they used to be
+    hard-coded as freshly set, so a Reflect about to expire looked 5 turns strong.
+
+    `protect` is the active's consecutive-protect count (mon.protect_counter). The engine
+    cubes the failure odds per consecutive use (verified 100%/33%/11%) but only if told,
+    and we always passed 0 -- 7 failed Protects mined in one 30-game run."""
     layers = {}
     starts = {}
     for cond, value in sc.items():
@@ -688,10 +693,10 @@ def _boosts(mon):
                 accuracy_boost=b.get("accuracy", 0), evasion_boost=b.get("evasion", 0))
 
 
-# poke-env Effect name -> poke-engine volatile-status string. Curated to persistent effects that
-# change the value of a position (chip, passive heal, trap, immunity). Taunt/Encore are handled
-# separately below because the engine also needs their duration counters (and Encore has a hard
-# consistency invariant); yawn/confusion stay excluded for now.
+# poke-env Effect -> poke-engine volatile string. Curated to persistent effects that change
+# the value of a position (chip, passive heal, trap, immunity). Taunt/Encore are handled
+# separately below because the engine also needs their duration counters, and Encore has a
+# hard consistency invariant. yawn/confusion stay excluded for now.
 _VOLATILE_MAP = {
     "SUBSTITUTE": "substitute", "LEECH_SEED": "leechseed", "SALT_CURE": "saltcure",
     "CURSE": "curse", "AQUA_RING": "aquaring", "INGRAIN": "ingrain", "MAGNET_RISE": "magnetrise",
@@ -706,13 +711,14 @@ def _volatile_set(mon):
 
 
 def _duration_volatiles(mon, last_used):
-    """(extra volatiles, VolatileStatusDurations) for Taunt/Encore on the active mon.
+    """(extra volatiles, VolatileStatusDurations) for Taunt/Encore on the active.
 
-    poke-env keeps a turns-elapsed counter for both (end_turn increments turn-countable
-    effects), and poke-engine's durations count up the same way, expiring at 3 -- so the
-    counter passes through, clamped so a stale count can't make the engine expire it on
-    the wrong side of a turn. HARD INVARIANT (verified: the engine panics otherwise):
-    'encore' may only be set when last_used_move is a real 'move:<i>'."""
+    poke-env keeps a turns-elapsed counter for both and poke-engine's durations count up the
+    same way, expiring at 3, so the counter passes through -- clamped so a stale count can't
+    expire it on the wrong side of a turn.
+
+    HARD INVARIANT (the engine panics otherwise): 'encore' may only be set when
+    last_used_move is a real 'move:<i>'."""
     vols = set()
     kw = {}
     for e, count in mon.effects.items():
@@ -726,8 +732,8 @@ def _duration_volatiles(mon, last_used):
 
 
 def _sub_health(mon, maxhp):
-    """Substitute is made at 1/4 max HP; we can't see its current HP, so use that as the
-    estimate (Foul Play does the same when it hasn't seen the sub take a hit)."""
+    """Substitute is made at 1/4 max HP and we can't see its current HP, so use that as the
+    estimate. Foul Play does the same when it hasn't seen the sub take a hit."""
     if any(e.name == "SUBSTITUTE" for e in mon.effects):
         return max(1, maxhp // 4)
     return 0
@@ -735,7 +741,7 @@ def _sub_health(mon, maxhp):
 
 def _delayed(pending, side, now):
     """Engine (wish, future_sight) tuples for one side from the tracked pending effects.
-    Wish heals at the end of the turn it 'lands on'; Future Sight hits one turn later."""
+    Wish heals at the end of the turn it lands on; Future Sight hits one turn later."""
     pending = pending or {}
     wish_turn, wish_amt = pending.get(f"{side}_wish", (0, 0))
     wish = (1, int(wish_amt)) if wish_turn == now else (0, 0)
@@ -783,7 +789,7 @@ def _opp_side(battle, use_stats=True, opp_used_since_switch=None, opp_speed_hint
                                                     use_joint=use_joint)
                           for m in bench]
 
-    # Fill unseen bench up to 6 with sampled species (so endgame / faint-count eval is sane).
+    # Fill the unseen bench to 6 with sampled species, so endgame / faint-count eval is sane.
     seen = {to_id_str(active.species)} | {to_id_str(m.species) for m in bench}
     while len(pkmn) < 6:
         sp = SETS.random_species(seen)
@@ -838,14 +844,16 @@ def _trick_room(battle):
 
 def build_state(battle, use_stats=True, opp_used_since_switch=None, opp_speed_hints=None,
                 pending=None, use_joint=False):
-    """A determinized poke-engine State for the current position. Call repeatedly to get
-    different opponent-set samples. use_stats toggles the real randbats item/ability/tera feed.
-    opp_used_since_switch: move ids the opponent's active has used since switching in (the
-    caller tracks this across turns) -- drives Choice-lock inference.
-    opp_speed_hints: {species_id: 'scarf'|'noscarf'} turn-order verdicts (see engine_search).
-    pending: tracked Wish/Future Sight effects ({'p1_wish': (turn, amt), 'p2_fs': turn, ...}).
-    use_joint: sample complete counted joint sets (distributionally correct) instead of
-    composing sets from marginals."""
+    """A determinized State for the current position. Call repeatedly for different samples.
+
+    use_stats             -- real randbats item/ability/tera feed.
+    opp_used_since_switch -- move ids the opponent's active has used since switching in;
+                             the caller tracks this across turns. Drives Choice-lock
+                             inference.
+    opp_speed_hints       -- {species_id: 'scarf'|'noscarf'} from turn order, see
+                             engine_search._infer_scarf.
+    pending               -- tracked Wish / Future Sight, {'p1_wish': (turn, amt), ...}.
+    use_joint             -- complete counted joint sets instead of marginals."""
     weather, weather_left = _weather_str(battle)
     terrain, terrain_left = _terrain_str(battle)
     tr, tr_left = _trick_room(battle)

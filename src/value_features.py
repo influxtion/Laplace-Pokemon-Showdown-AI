@@ -1,20 +1,20 @@
-r"""Featurize a poke-engine `State` for the value network.
+r"""Featurize a poke-engine State for the value net.
 
-The value net V(state) ~ P(side_one wins) must score states that only exist inside the
-engine -- positions reached by rolling candidate moves one ply forward with
-`generate_instructions` / `apply_instructions` -- so it reads engine State objects, not
-poke-env battles. At data-generation time we featurize the same determinized states the
-search runs on, so train and inference distributions match (including the sampled hidden
-sets' noise).
+V(state) ~ P(side_one wins). The states it scores mostly don't exist on any board: they're
+successors produced by rolling a candidate move one ply with generate_instructions /
+apply_instructions. So this reads engine State objects, not poke-env battles. Data
+generation featurizes the same determinized states the search runs on, so train and
+inference distributions match, sampled-set noise included.
 
 Layout (side_one = us, fixed by the adapter):
-  global   : weather one-hot(4) + turns, terrain one-hot(4) + turns, trick room flag + turns
-  per side : team aggregates, side conditions, active block (stats/status/boosts/items/
-             best damage vs opposing active/speed race), 5 bench blocks sorted canonically
-             (alive, hp, stats, status, item flags, STAB effectiveness both directions)
+  global   : weather one-hot(4) + turns, terrain one-hot(4) + turns, trick room + turns
+  per side : team aggregates, side conditions, active block (stats / status / boosts /
+             items / best damage vs the opposing active / speed race), then 5 bench blocks
+             sorted canonically (alive, hp, stats, status, item flags, STAB effectiveness
+             both directions)
 
-Damage features use poke_engine.calculate_damage on the actives (4 diagonal calls per
-state); bench matchups use the gen-9 type chart, which is cheap and switch-relevant.
+Active damage uses poke_engine.calculate_damage (4 diagonal calls per state). Bench
+matchups use the gen-9 type chart -- cheap, and switch-relevant is all it needs to be.
 """
 
 import numpy as np
@@ -45,8 +45,8 @@ _TERRAINS = ("electricterrain", "grassyterrain", "mistyterrain", "psychicterrain
 _BOOST_KEYS = ("attack_boost", "defense_boost", "special_attack_boost",
                "special_defense_boost", "speed_boost", "accuracy_boost", "evasion_boost")
 
-# Ability groups that swing a position's value (v2). Grouped by effect, not name, so one
-# flag generalizes across e.g. all the hit-absorbing immunity abilities.
+# Ability groups that swing a position's value. Grouped by EFFECT, not name, so one flag
+# generalizes across e.g. all the hit-absorbing immunity abilities.
 _ABILITY_FLAGS = (
     ("levitate",),
     ("unaware",),
@@ -64,12 +64,12 @@ _ABILITY_FLAGS = (
 _RECOVERY_MOVES = {"roost", "recover", "softboiled", "slackoff", "synthesis", "moonlight",
                    "morningsun", "shoreup", "milkdrink", "rest", "strengthsap", "wish"}
 
-# global 12 + 2 sides x (2 agg + 11 conditions + 45 active + 5*24 bench)
+# global 12 + 2 sides x (2 agg + 11 conditions + 45 active + 5*24 bench) = 368
 N_VALUE_FEATURES = 12 + 2 * (2 + 11 + 45 + 5 * 24)
 
 
 def _eff(atk_types, def_types):
-    """Best STAB effectiveness of atk_types attacking def_types (typeless = neutral)."""
+    """Best STAB effectiveness of atk_types into def_types (typeless = neutral)."""
     best = 0.0
     for at in atk_types:
         at = at.upper()
@@ -195,7 +195,7 @@ def _side_features(side, opp_side, best_dmg_frac, opp_best_dmg_frac, case_fix=Tr
     feats.append(1.0 if my_spe > opp_spe else 0.0)
     feats.append(min(my_spe / max(opp_spe, 1.0), 3.0))
 
-    # Bench, canonically sorted so slot order doesn't matter.
+    # Bench, canonically sorted so party slot order carries no signal.
     bench = [m for i, m in enumerate(mons) if i != int(side.active_index)]
     bench.sort(key=lambda m: (-_mon_alive(m), -(m.hp / max(m.maxhp, 1)), -m.speed, m.id))
     if case_fix:
@@ -219,14 +219,14 @@ def _side_features(side, opp_side, best_dmg_frac, opp_best_dmg_frac, case_fix=Tr
 def featurize(state, case_fix=True):
     """State -> float32 vector of length N_VALUE_FEATURES, from side_one's perspective.
 
-    case_fix (2026-07-05): states returned by apply_instructions round-trip through the
-    Rust engine and come back with UPPERCASE enum ids ('ROOST', 'SUBSTITUTE', 'TYPELESS'),
-    while adapter-built states (= all training data) are lowercase. The original
-    case-sensitive checks silently zeroed has_recovery and the volatile flags and broke
-    the 'typeless' filter (phantom neutral bench matchups) on every round-tripped state --
-    i.e. at every _value_rerank / gamble-veto inference. case_fix=True normalizes case so
-    inference matches training semantics; it is a no-op on lowercase adapter states.
-    False reproduces the legacy behavior (kept for the A/B arm)."""
+    case_fix: states returned by apply_instructions round-trip through the Rust engine and
+    come back with UPPERCASE enum ids ('ROOST', 'SUBSTITUTE', 'TYPELESS'), while
+    adapter-built states -- i.e. all training data -- are lowercase. The original
+    case-sensitive checks silently zeroed has_recovery and the volatile flags and broke the
+    'typeless' filter (phantom neutral bench matchups) on every round-tripped state, which
+    is to say at every _value_rerank / gamble-veto inference. Normalizing makes inference
+    match training semantics; it's a no-op on lowercase adapter states. False reproduces
+    the legacy behaviour for the A/B arm."""
     feats = []
     w = (state.weather or "none").lower()
     feats += [1.0 if w in group else 0.0 for group in _WEATHERS]

@@ -1,35 +1,31 @@
 r"""Play ONE ladder game and narrate it live in the terminal.
 
-Same bot, same shipped ladder config as `ladder.py` (this imports build_agent from it, so
-the settings cannot drift) -- the difference is that the terminal becomes a live analysis
-board instead of a progress log. Per turn you see:
+Same bot, same shipped ladder config -- it imports build_agent from ladder.py, so the
+settings can't drift. The difference is that the terminal becomes a live analysis board
+instead of a progress log. Per turn:
 
-  * the position: both actives with HP bars, boosts, status, hazards, weather, team counts;
-  * the search working: determinized worlds completing one by one, visits accumulating, the
-    engine's own win estimate firming up;
-  * the candidates: pooled visit share, how many worlds each move won, the engine's eval,
-    and which ones a guard vetoed;
-  * the hidden-information guesses: which item / ability / Tera type the worlds drew for the
-    opponent's active, plus Choice-Scarf verdicts inferred from turn order;
-  * the pipeline: which guard or reranker moved the front-runner, what the value net scored,
-    whether the mixed root sampled off the argmax, and the move finally sent;
-  * the resolution: what both sides actually did, with damage, crits, misses and faints.
+  * position: both actives with HP bars, boosts, status, hazards, weather, team counts
+  * the search working: worlds completing one by one, visits accumulating, the engine's own
+    win estimate firming up
+  * candidates: pooled visit share, worlds won, engine eval, and which a guard vetoed
+  * hidden-info guesses: which item / ability / tera the worlds drew, plus Scarf verdicts
+    inferred from turn order
+  * pipeline: which guard or reranker moved the front-runner, what the value net scored,
+    whether the mixed root sampled off the argmax, and the move finally sent
+  * resolution: what both sides actually did, with damage, crits, misses, faints
 
-Then a post-game block: time spent thinking, MCTS volume, guard/reranker activity, how often
-the search called the opponent's move correctly, the luck ledger, the eval curve with its
-biggest swings, and the replay path.
+Then a post-game block: search cost, MCTS volume, guard activity, how often the search
+called the opponent's move, the luck ledger, and the eval curve with its biggest swings.
 
-One game only, on purpose -- this is for watching and understanding, not for laddering. Use
-`ladder.py` for a cohort.
+ONE game, on purpose. This is for watching and understanding; ladder.py plays a cohort.
 
-    python -u src\analyze_battle.py                     # one rated ladder game, narrated
-    python -u src\analyze_battle.py --upload            # ... and publish a shareable replay
-    python -u src\analyze_battle.py --ascii --no-color  # dumb-terminal / redirect friendly
+    python -u src\analyze_battle.py                     # one rated game, narrated
+    python -u src\analyze_battle.py --upload            # + a public shareable replay
+    python -u src\analyze_battle.py --ascii --no-color  # dumb terminals / redirects
     python -u src\analyze_battle.py --mode challenge --opponent SomeUser
 
-Credentials come from .env / SHOWDOWN_USERNAME / --username, exactly as in ladder.py. The
-game is rated and archived to replays/ladder/ like any other ladder game; the transcript is
-saved next to the replay as <result>-<tag>.analysis.txt unless --no-save-log.
+Credentials as in ladder.py. The game is rated and archived like any other; the transcript
+goes next to the replay as <result>-<tag>.analysis.txt unless --no-save-log.
 """
 
 import argparse
@@ -38,8 +34,8 @@ import logging
 import os
 import sys
 
-# ladder first: its module-level --fork block has to run before poke_engine is imported
-# anywhere, and importing it here is also what keeps the shipped ladder config in one place.
+# ladder FIRST: its module-level --fork block has to run before poke_engine is imported
+# anywhere. Importing it is also what keeps the shipped config in one place.
 import ladder
 from live_analysis import AnalyzedPlayer, LiveAnalyzer, enable_ansi
 
@@ -49,9 +45,9 @@ from poke_env import AccountConfiguration
 async def announce(agent, analyzer, waiting, upload, local=False, poll=0.4):
     """Print the waiting/matched banner while the game coroutine runs.
 
-    Polls agent.battles rather than hooking events (same approach as
-    ladder.report_progress): the battle appears in it the moment the server pairs us. The
-    poll is short so the watch link lands above the first turn rather than inside it."""
+    Polls agent.battles rather than hooking events (same as ladder.report_progress): the
+    battle appears the moment the server pairs us. Short poll so the watch link lands above
+    the first turn rather than inside it."""
     said = False
     base = "http://localhost:8000/" if local else ladder.SPECTATE_URL
     while True:
@@ -67,7 +63,7 @@ async def announce(agent, analyzer, waiting, upload, local=False, poll=0.4):
 
 
 def print_header(agent, analyzer, args, fork):
-    """One block describing exactly what is about to play, read off the live agent so it
+    """One block describing exactly what's about to play, read off the live agent so it
     can't drift from build_agent()."""
     a = analyzer
     a.rule(a.c("hdr", "Laplace -- live analysis of one ladder game"), ch="═")
@@ -98,7 +94,7 @@ def print_header(agent, analyzer, args, fork):
 
 
 async def main():
-    ladder.load_dotenv()      # SHOWDOWN_* from .env before argparse reads them as defaults
+    ladder.load_dotenv()      # SHOWDOWN_* before argparse reads them as defaults
     ap = argparse.ArgumentParser(
         description="Play one ladder game with live search analysis in the terminal.")
     ap.add_argument("--mode", choices=("ladder", "accept", "challenge"), default="ladder",
@@ -108,18 +104,16 @@ async def main():
     ap.add_argument("--username", default=os.environ.get("SHOWDOWN_USERNAME"))
     ap.add_argument("--password", default=os.environ.get("SHOWDOWN_PASSWORD"))
     ap.add_argument("--local", action="store_true",
-                    help="play on the local server (localhost:8000) instead of the official "
-                         "one -- for trying the analysis out without spending a rated game; "
-                         "pair it with --mode challenge/accept, the local server has no "
-                         "ladder pool")
+                    help="play on localhost:8000 instead of the official server, to try the "
+                         "analysis without spending a rated game. No ladder pool locally, so "
+                         "pair it with --mode challenge/accept")
     ap.add_argument("--upload", action="store_true",
-                    help="also publish this game as a hosted Showdown replay "
-                         "(a PUBLIC link; off by default)")
+                    help="also publish this game as a hosted replay (a PUBLIC link; off by default)")
     ap.add_argument("--no-color", action="store_true", help="no ANSI colour")
     ap.add_argument("--ascii", action="store_true",
                     help="ASCII bars instead of block glyphs (auto-detected otherwise)")
     ap.add_argument("--no-worlds", action="store_true",
-                    help="hide the per-turn hidden-set guesses (item/ability/tera tally)")
+                    help="hide the per-turn hidden-set tally (item/ability/tera)")
     ap.add_argument("--no-save-log", action="store_true",
                     help="don't write the transcript next to the replay")
     ap.add_argument("--width", type=int, default=None, help="transcript width in columns")
@@ -180,8 +174,8 @@ async def main():
             await banner
         except asyncio.CancelledError:
             pass
-        # Runs on the normal path AND on Ctrl-C: the battle room is gone once we exit, so an
-        # unsaved game (or an unwritten transcript) is lost for good.
+        # Normal path AND Ctrl-C: the battle room is gone once we exit, so an unsaved game
+        # (or an unwritten transcript) is lost for good.
         tag, battle = next(iter(agent.battles.items()), (None, None))
         if battle is None:
             print("\nNo game was played.", flush=True)
@@ -205,5 +199,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        # main()'s finally has already saved the replay and printed the summary.
+        # main()'s finally already saved the replay and printed the summary.
         print("\nInterrupted.", flush=True)

@@ -1,19 +1,18 @@
 """Opponent set prediction and damage estimation.
 
-A good player knows the common sets, not just what's been revealed: you see a Haxorus
-and assume Outrage / Dragon Dance before it clicks them. This gives the agent that prior.
+A good player knows the common sets rather than waiting to be shown: you see a Haxorus and
+assume Outrage / Dragon Dance before it clicks them. This is that prior.
 
-It isn't cheating. The gen9randombattle sets come from the public pool shipped with the
-server (data/random-battles/gen9/sets.json) that any ladder player has seen, so this is a
-prior over the distribution, not the opponent's hidden choices. The damage estimate uses
-only the public gen-9 formula, our own known stats, and opponent stats estimated from
-public base stats + level + the standard randbats spread; poke-env never exposes the
-opponent's real stats anyway. It's a sharper version of the base_power x type_multiplier
-proxy the observation already carries.
+Not cheating, for the record. The gen9randombattle sets come from the public pool shipped
+with the server (data/random-battles/gen9/sets.json) that any ladder player has seen, so
+this is a prior over the distribution, not the opponent's hidden choices. The damage
+estimate uses only the public gen-9 formula, our own known stats, and opponent stats
+estimated from public base stats + level + the standard randbats spread -- poke-env never
+exposes the opponent's real stats anyway.
 
-Everything goes through RandbatsKnowledge, a table lookup. A future OU bot has no premade
-sets, so it can swap in a different predictor (priors from typing / base stats / usage)
-behind the same interface without touching the env.
+Everything goes through RandbatsKnowledge, which is a table lookup. A format without
+premade sets can swap in a different predictor (priors from typing / base stats / usage)
+behind the same interface without touching callers.
 """
 
 import json
@@ -25,7 +24,7 @@ from poke_env.data import to_id_str
 
 GEN = 9
 
-# Role vocabulary from gen9 randbats. Order is fixed so feature indices stay stable.
+# Role vocabulary from gen9 randbats. Order is FIXED -- feature indices depend on it.
 ROLE_NAMES = [
     "AV Pivot", "Bulky Attacker", "Bulky Setup", "Bulky Support", "Fast Attacker",
     "Fast Bulky Setup", "Fast Support", "Setup Sweeper", "Tera Blast user", "Wallbreaker",
@@ -49,7 +48,7 @@ N_THREAT_FLAGS = 6  # priority, recovery, hazard, setup, status, pivot
 
 @lru_cache(maxsize=None)
 def get_move(move_id):
-    """Build (and cache) a Move object from its id, or None if the id is unknown."""
+    """Build (and cache) a Move from its id. None if the id is unknown."""
     try:
         return Move(move_id, gen=GEN)
     except Exception:
@@ -57,7 +56,7 @@ def get_move(move_id):
 
 
 def safe_priority(move):
-    """move.priority, but 0 for pseudo-moves (Struggle/recharge) whose data omits it."""
+    """move.priority, but 0 for pseudo-moves (Struggle, recharge) whose data omits it."""
     try:
         return move.priority
     except (KeyError, AttributeError):
@@ -65,10 +64,10 @@ def safe_priority(move):
 
 
 def _estimate_stat(mon, key):
-    """A stat: the real value if known (our mons), else estimated from base + level.
+    """Real value if known (our mons), else estimated from base + level.
 
-    The estimate assumes 31 IVs, 85 EVs, neutral nature (the randbats convention) -- it
-    just needs to be consistent, since it's only a network feature."""
+    Assumes 31 IVs / 85 EVs / neutral nature -- the randbats convention. Being consistent
+    everywhere matters more than being exactly right."""
     known = (mon.stats or {}).get(key) if hasattr(mon, "stats") else None
     if known:
         return known
@@ -86,11 +85,10 @@ def _max_hp(mon):
     return _estimate_stat(mon, "hp")
 
 
-# Abilities that nullify a whole attack type (immunity or absorb-heal). The type chart
-# (damage_multiplier) misses these: an Earth Eater Orthworm reads as taking full Earthquake
-# damage, and the engine-side search only prices the absorb inside its own determinized
-# worlds -- when MCTS visit shares flatten in a bad position, the pooled argmax can land on
-# a move that literally heals the target (observed live 2026-07-04, game ...847095 T34).
+# Abilities that nullify a whole attacking type (immunity or absorb-heal). damage_multiplier
+# misses all of these -- an Earth Eater Orthworm reads as taking full Earthquake damage --
+# and the engine only prices the absorb inside its own worlds, so when visit shares flatten
+# in a bad position the pooled argmax can land on a move that literally heals the target.
 _ABSORB_ABILITY_TYPE = {
     "levitate": "GROUND", "eartheater": "GROUND",
     "waterabsorb": "WATER", "dryskin": "WATER", "stormdrain": "WATER",
@@ -108,9 +106,9 @@ _ABSORB_CHECK_SKIP = {"terablast", "thousandarrows"}
 
 
 def _ability_absorbs(attacker, move, defender):
-    """True iff the defender's ability CERTAINLY nullifies this move: the ability is
-    revealed, or every still-possible randbats set for the species runs an absorbing
-    ability for the move's type. Any uncertainty -> False (never veto on a guess)."""
+    """True iff the defender's ability CERTAINLY nullifies this move: revealed, or every
+    still-possible randbats set runs an absorbing ability for the move's type. Any
+    uncertainty -> False. Never veto on a guess."""
     if move.id in _ABSORB_CHECK_SKIP or move.type is None:
         return False
     if attacker is not None and to_id_str(attacker.ability or "") in _ABILITY_IGNORING:
@@ -124,9 +122,9 @@ def _ability_absorbs(attacker, move, defender):
 
 
 def move_nullified(attacker, move, defender):
-    """True iff an attacking `move` is CERTAIN to deal zero damage to `defender`:
-    type-chart immunity on the revealed typing, or an absorb ability per
-    _ability_absorbs. Deterministic hard knowledge only -- safe to demote on."""
+    """True iff an attacking move is CERTAIN to deal zero: type-chart immunity on the
+    revealed typing, or an absorb ability per _ability_absorbs. Deterministic hard
+    knowledge only, which is what makes it safe for a guard to demote on."""
     try:
         if move is None or defender is None or move.base_power <= 0:
             return False
@@ -140,9 +138,8 @@ def move_nullified(attacker, move, defender):
 
 
 def estimate_damage_fraction(attacker, move, defender):
-    """Estimated damage of `move` from `attacker` into `defender`, as a fraction of the
-    defender's max HP (0 for status/immune/certainly-absorbed, clamped to 1.5 for
-    overkill).
+    """Estimated damage as a fraction of the defender's max HP. 0 for status / immune /
+    certainly-absorbed, clamped to 1.5 for overkill.
 
     Runs in the hot loop on live moves, so it swallows errors: one odd move's data
     shouldn't crash a multi-hour run, and a missed estimate just reads 0.
@@ -170,7 +167,7 @@ def _estimate_damage_fraction(attacker, move, defender):
     stab = 1.5 if move.type in [t for t in attacker.types if t] else 1.0
     dmg = base * type_mult * stab * 0.925                   # average roll
 
-    # Burn halves physical damage (we ignore Guts).
+    # Burn halves physical damage. Guts not modelled.
     if physical and attacker.status is not None and attacker.status.name == "BRN":
         dmg *= 0.5
 
@@ -182,7 +179,7 @@ class RandbatsKnowledge:
     """Set predictor backed by the gen9 randbats sets file."""
 
     def __init__(self, path=_SETS_PATH):
-        self._sets = {}      # species_id -> list of {moves:set, role:str}
+        self._sets = {}      # species_id -> [{moves: set, role: str, abilities: set}]
         try:
             with open(path, encoding="utf-8") as f:
                 raw = json.load(f)
@@ -198,12 +195,12 @@ class RandbatsKnowledge:
         except (OSError, ValueError) as e:
             print(f"[knowledge] could not load randbats sets ({e}); predictions disabled.")
 
-    # --- prediction ---------------------------------------------------------
+    # --- prediction -----------------------------------------------------------
 
     def predict_sets(self, species, revealed_ids):
         """The sets consistent with the moves revealed so far.
 
-        Once Haxorus shows Outrage, only sets containing Outrage survive, and their other
+        Once Haxorus shows Outrage, only sets containing Outrage survive and their other
         moves become the prediction. If nothing matches (odd data), keep all sets."""
         sets = self._sets.get(to_id_str(species or ""), [])
         if not sets:
@@ -213,20 +210,20 @@ class RandbatsKnowledge:
         return consistent or sets
 
     def predict_moves(self, species, revealed_ids):
-        """Union of the candidate moves across the still-possible sets (as ids)."""
+        """Union of candidate moves across the still-possible sets."""
         ids = set()
         for s in self.predict_sets(species, revealed_ids):
             ids |= s["moves"]
         ids |= set(revealed_ids)  # always include what we've actually seen
         return ids
 
-    # --- feature vectors for the opponent's active Pokemon ------------------
+    # --- feature vectors for the opponent's active ----------------------------
     #
-    # These are probabilities, not flags: each value is the fraction of still-possible sets
-    # with the trait. Before Haxorus reveals anything, Outrage reads 0.5 (1 of its 2 sets)
-    # and Close Combat 1.0 (both). Revealing a move narrows the surviving sets -- the Bayesian
-    # update -- so P(Outrage) jumps to 1.0 once seen. (We treat each set's movepool as its
-    # moveset; a few list >4 options, which we don't model.)
+    # Probabilities, not flags: each value is the fraction of still-possible sets with the
+    # trait. Before Haxorus reveals anything, Outrage reads 0.5 (1 of its 2 sets) and Close
+    # Combat 1.0 (both). Revealing a move narrows the surviving sets -- the Bayesian update
+    # -- so P(Outrage) jumps to 1.0 once seen. We treat each set's movepool as its moveset;
+    # a few list >4 options, which we don't model.
 
     def _surviving_sets(self, opp):
         if opp is None:
@@ -234,7 +231,7 @@ class RandbatsKnowledge:
         return self.predict_sets(opp.species, set(opp.moves.keys()))
 
     def move_probs(self, opp):
-        """move_id -> probability the opponent's active is carrying it."""
+        """move_id -> P(the opponent's active is carrying it)."""
         sets = self._surviving_sets(opp)
         if not sets:
             return {mid: 1.0 for mid in (opp.moves.keys() if opp else [])}
@@ -248,12 +245,12 @@ class RandbatsKnowledge:
         return probs
 
     def predicted_abilities(self, opp):
-        """ability_id -> probability the opponent's active has it.
+        """ability_id -> P(the opponent's active has it).
 
-        1.0 for a revealed ability. Otherwise read off the still-possible sets (each lists
-        candidate abilities) narrowed by revealed moves, so an Orthworm -- always Earth
-        Eater -- reads as a certain Ground immunity before it shows. Falls back to the dex's
-        possible abilities (uniform) for a species with no set data."""
+        1.0 once revealed. Otherwise read off the still-possible sets narrowed by revealed
+        moves, so an Orthworm -- always Earth Eater -- reads as a certain Ground immunity
+        before it shows. Falls back to a uniform split over the dex's possible abilities
+        for a species with no set data."""
         if opp is None:
             return {}
         if opp.ability:                                  # revealed, so certain
@@ -274,7 +271,7 @@ class RandbatsKnowledge:
         return probs
 
     def predicted_coverage(self, opp):
-        """18-d: probability the opponent carries an attacking move of each type."""
+        """18-d: P(the opponent carries an attacking move of each type)."""
         vec = [0.0] * 18
         sets = self._surviving_sets(opp)
         if not sets:
@@ -292,7 +289,7 @@ class RandbatsKnowledge:
         return vec
 
     def role_flags(self, opp):
-        """Probability of each role across the still-possible sets."""
+        """P(each role) across the still-possible sets."""
         vec = [0.0] * len(ROLE_NAMES)
         sets = self._surviving_sets(opp)
         if not sets:
@@ -327,7 +324,7 @@ class RandbatsKnowledge:
         return [prio, recov, hazard, setup, status, pivot]
 
     def threat_flags(self, opp):
-        """Probability of each threat category across the still-possible sets."""
+        """P(each threat category) across the still-possible sets."""
         sets = self._surviving_sets(opp)
         if not sets:
             return [0.0] * N_THREAT_FLAGS
@@ -340,12 +337,12 @@ class RandbatsKnowledge:
         return acc
 
     def predicted_incoming(self, opp, my_active, immune_types=None):
-        """Scariest probability-weighted incoming hit (HP fraction): a 50%-likely nuke counts
-        as a discounted threat, not a guaranteed one.
+        """Scariest probability-weighted incoming hit, as an HP fraction. A 50%-likely nuke
+        counts as a discounted threat, not a guaranteed one.
 
-        immune_types (type names) lets a caller drop move types our active is immune to via
-        its ability -- a Levitate mon shouldn't fear Ground. Default None preserves the old
-        behaviour, so the observation features built on this are unchanged."""
+        immune_types drops move types our active is immune to via its ability -- a Levitate
+        mon shouldn't fear Ground. Default None preserves the old behaviour, so the
+        observation features built on this are unchanged."""
         if opp is None or my_active is None:
             return 0.0
         worst = 0.0

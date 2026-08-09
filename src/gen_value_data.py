@@ -1,18 +1,16 @@
-r"""Generate (engine-state features, outcome) training data for the value network.
+r"""Generate (engine-state features, outcome) training data for the value net.
 
-Two EnginePlayers battle on the local server; at every decision each player featurizes ONE
-determinized poke-engine state (built with its live trackers -- choice locks, scarf hints,
-pending Wish/Future Sight -- exactly like the search's worlds) and the sample is later
-labeled with that player's game outcome (1 win / 0 loss, ties dropped). This is the Track-A
-value-model data: V(state) ~ P(side_one wins | position, both sides playing like our bot).
+Two EnginePlayers battle on the local server. At every decision each player featurizes one
+determinized state -- built with its live trackers (choice locks, scarf hints, pending
+Wish/Future Sight), exactly like the search's worlds -- and the sample is later labelled
+with that player's game outcome. 1 win / 0 loss; ties dropped.
 
-The features live in engine-state space (value_features.py) rather than poke-env
-observation space so the same net can score states rolled one ply forward with
-generate_instructions/apply_instructions at decision time.
+Features live in engine-state space (value_features.py) rather than poke-env observation
+space, so the same net can score states rolled one ply forward with
+generate_instructions / apply_instructions at decision time.
 
 Sharded across worker processes (poke-engine holds the GIL). Each worker writes an .npz
-chunk (x features, y labels, g per-sample game index) to data_value/; chunks accumulate
-across runs, train_value.py globs them all.
+chunk to data_value2/; chunks accumulate across runs and train_value.py globs them all.
 
     python -u src\gen_value_data.py --battles 250 --workers 10
 """
@@ -25,7 +23,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 
 BATTLE_FORMAT = "gen9randombattle"
-# v2: 368-feat featurizer (ability/recovery/speed-race flags), 2 worlds per decision.
+# v2: 368-feature featurizer (ability/recovery/speed-race flags), 2 worlds per decision.
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "data_value2")
 WORLDS_PER_DECISION = 2
@@ -40,7 +38,7 @@ def _play_share(n, det, time_ms, idx, stamp, out_dir=None):
     from value_features import featurize, N_VALUE_FEATURES
 
     class DataPlayer(EnginePlayer):
-        """EnginePlayer that snapshots one determinized world's features per decision."""
+        """EnginePlayer that snapshots determinized world features per decision."""
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
@@ -61,10 +59,10 @@ def _play_share(n, det, time_ms, idx, stamp, out_dir=None):
             return super().choose_move(battle)
 
     # Players run the LADDER root config (share averaging + mixed strategy + the current
-    # value net), not the engine defaults: the net's target is P(win | both sides play
-    # like the deployed bot), so the data distribution must match deployment. v3's data
-    # predates the whole mixed-root era -- that mismatch is why its authority had to be
-    # cut (cohort-2 mining 2026-07-03). Bootstrapping on the previous net is intended.
+    # net), not the engine defaults. The net's target is P(win | both sides play like the
+    # DEPLOYED bot), so the data distribution has to match deployment. v3's data predates
+    # the whole mixed-root era, and that mismatch is exactly why its authority had to be cut.
+    # Bootstrapping on the previous net is intended.
     _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     _net = os.path.join(_root, "models", "value_net.pt")
     ladder_kw = dict(robust_vote=False, mix_root=True, mix_frac=0.9, value_boost_margin=0,
@@ -84,7 +82,7 @@ def _play_share(n, det, time_ms, idx, stamp, out_dir=None):
         for player in (a, b):
             for tag, feats in player.samples.items():
                 battle = player.battles.get(tag)
-                if battle is None or battle.won is None:   # drop ties/unfinished
+                if battle is None or battle.won is None:   # drop ties / unfinished
                     continue
                 label = 1.0 if battle.won else 0.0
                 xs.extend(feats)

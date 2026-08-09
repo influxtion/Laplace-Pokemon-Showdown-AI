@@ -1,15 +1,16 @@
-r"""Train the value network V(engine-state features) ~ P(side_one wins).
+r"""Train the value net: V(engine-state features) ~ P(side_one wins).
 
-Data: data_value/chunk_*.npz written by gen_value_data.py (x float16 features, y win
-labels, g per-sample game index within the chunk). Samples within a game are strongly
-correlated (same teams, same outcome), so the train/val split is BY GAME: every sample of
-a game lands on one side of the split, never both -- otherwise val is contaminated and
-early stopping overfits.
+Data: data_value2/chunk_*.npz from gen_value_data.py -- x float16 features, y win labels,
+g per-sample game index within the chunk.
 
-Model: small torch MLP, CPU-friendly at inference (the bot scores a handful of one-ply
-rollout states per decision, so latency budget is sub-millisecond per batch).
+Samples within a game are strongly correlated (same teams, same outcome), so the train/val
+split is BY GAME: every sample of a game lands on one side, never both. Otherwise val is
+contaminated and early stopping overfits into a great-looking number that means nothing.
 
-    python -u src\train_value.py                  # trains models/value_net.pt
+Model: small torch MLP, CPU-friendly at inference -- the bot scores a handful of one-ply
+rollout states per decision, so the latency budget is sub-millisecond per batch.
+
+    python -u src\train_value.py                  # -> models/value_net.pt
     python -u src\train_value.py --epochs 40
 """
 
@@ -42,7 +43,7 @@ class ValueNet(nn.Module):
 
 
 def load_split(val_frac=0.1, seed=7):
-    """All chunks -> (train_x, train_y, val_x, val_y), split by (chunk, game) pairs."""
+    """All chunks -> (train_x, train_y, val_x, val_y), split by (chunk, game) pair."""
     xs, ys, gids = [], [], []
     gid = 0
     for path in sorted(glob.glob(DATA_GLOB)):

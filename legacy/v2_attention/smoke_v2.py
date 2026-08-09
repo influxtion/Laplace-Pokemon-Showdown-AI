@@ -1,7 +1,7 @@
-"""Live smoke test for the v2 stack.
+"""A live check of the whole attention setup, end to end.
 
-Confirms the whole chain works on a real battle:
-    battle -> 854-feature observation -> attention network -> legal action -> step
+Runs a real battle through the whole chain: board, observation, attention network, a legal
+move, and back again.
 """
 import numpy as np
 from sb3_contrib import MaskablePPO

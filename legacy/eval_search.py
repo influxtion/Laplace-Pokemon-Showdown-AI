@@ -1,16 +1,16 @@
-r"""Benchmark the search agents against the raw policy.
+r"""How much does searching actually help?
 
-Runs three agents against SimpleHeuristicsPlayer over the same battle count and prints their
-win rates, to see how much search helps and which searcher is stronger:
-  - raw policy     : the network's move, no search (opponent.ModelPlayer)
-  - search (1-ply) : every action scored by the damage model (search.SearchPlayer)
-  - heuristic+     : SearchPlayer plus delayed-move fix and status/setup/hazard/recovery
-                     valuation (heuristic_search.HeuristicSearchPlayer)
-  - deep (2-ply)   : 2-turn search over a small forward simulator (deep_search.DeepSearchPlayer)
+Plays four versions of the bot against the same fixed opponent for the same number of
+games, and prints their win rates side by side:
 
-Uses poke-env's battle_against. Loads the best available model (see pick_model_path).
+  - the raw network, just picking a move
+  - the one-turn searcher, scoring every option with the damage model
+  - that, plus credit for status, setup, hazards and healing
+  - the two-turn searcher, playing the game out on a small simulator
 
-Run from the project root, with the local Showdown server running:
+All four use the same trained network, so the differences are down to the searching.
+
+Run from the project root, with the local server going:
     python -u src\eval_search.py
 """
 
@@ -33,10 +33,10 @@ N_BATTLES = 300
 
 
 def pick_model_path():
-    # Best first: the self-play agent, then plain v3, then the heuristic-trained fallback.
-    # Layering search on the best base measures the full stack.
+    # Best available first. Putting the search on top of the strongest network means we're
+    # measuring the whole stack rather than an artificially weak one.
     candidates = (
-        f"ppo_v3_anneal_selfplay_best_obs{N_FEATURES}.zip",   # Influxobot (final): anneal -> self-play
+        f"ppo_v3_anneal_selfplay_best_obs{N_FEATURES}.zip",   # the final one
         f"ppo_v3_anneal_selfplay_obs{N_FEATURES}.zip",
         f"ppo_v3_anneal_best_obs{N_FEATURES}.zip",
         f"ppo_v3_anneal_obs{N_FEATURES}.zip",
@@ -81,8 +81,8 @@ async def main():
     search_wr = await bench(searcher, "search", N_BATTLES)
     print(f"search (1-ply) vs heuristic: {search_wr:.0%}", flush=True)
 
-    # SearchPlayer + the added heuristics. Same model/prior as SearchPlayer, so the delta is the
-    # new scoring, not a different base.
+    # Same network and same prior as the plain searcher, so any difference here is down to
+    # the extra scoring and nothing else.
     heur = HeuristicSearchPlayer(
         model=model,
         account_configuration=AccountConfiguration.generate("heurbot", rand=True),
@@ -91,7 +91,7 @@ async def main():
     heur_wr = await bench(heur, "heur", N_BATTLES)
     print(f"heuristic+     vs heuristic: {heur_wr:.0%}", flush=True)
 
-    # 2-ply search over the forward simulator -- the depth lever.
+    # And the two-turn version, which is the test of whether depth is worth anything.
     deep = DeepSearchPlayer(
         model=model,
         account_configuration=AccountConfiguration.generate("deepbot", rand=True),

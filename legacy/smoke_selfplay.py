@@ -1,9 +1,9 @@
-r"""Quick check of the self-play loop before a long run.
+r"""A quick check of the self-play loop, before committing to a long run.
 
-Builds the self-play env (agent vs a model-driven opponent), plays a few dozen turns, and
-confirms the observation shape and that the opponent picks moves without error.
+Sets the agent against a network-driven opponent, plays a few dozen turns, and confirms the
+observation is the right shape and that the opponent can actually pick moves.
 
-Run from the project root, with the local Showdown server running:
+Run from the project root, with the local server going:
     python -u src\smoke_selfplay.py
 """
 
@@ -26,7 +26,7 @@ def main():
         print("No warm-start model; using a fresh one for the smoke test.", flush=True)
         model = MaskablePPO("MultiInputPolicy", env)
 
-    # Seed the opponent the same way training does.
+    # Set the opponent up exactly the way training does.
     model.save(t.SNAPSHOT_PATH)
     opponent.model = MaskablePPO.load(t.SNAPSHOT_PATH)
 

@@ -1,24 +1,21 @@
-r"""Mine saved ladder replays (+ decision traces) for recurring blunder signatures.
+r"""Mine saved replays (+ decision traces) for recurring blunder signatures.
 
-The improvement loop that actually moves ELO: play ladder games (ladder.py saves every
-replay to replays/ladder/ and, since the robust-vote commit, a .trace.json of what the
-search considered each turn), then run this to cluster losses into failure classes:
+The improvement loop that actually moved Elo: play ladder games (ladder.py saves every
+replay plus a .trace.json of what the search considered each turn), then run this to
+cluster losses into failure classes.
 
-  * immune_click   -- we used a move the active opponent was immune to (the Scale Shot class)
-  * fail_click     -- our move failed outright (e.g. Rest at full HP)
-  * died_no_act    -- our active fainted on a turn it neither moved nor was switched in
-                      (outsped + KO'd: the "stayed in on lethal" signature)
-  * opp_boosted    -- the opponent's active reached a net +3 or more boost stages
-                      (the setup-snowball signature: we let something set up)
-  * slept_hit      -- turns we spent asleep while taking damage (Rest-loop cost)
-  * tera_wasted    -- our Terastallized mon fainted within 2 turns of tera without a
-                      single opponent faint in between (burned the once-per-game
-                      resource for nothing; 48% of tera-losses vs 12% of tera-wins
-                      when first measured, 2026-07-02)
+  immune_click   we used a move the active opponent was immune to (the Scale Shot class)
+  fail_click     our move failed outright, e.g. Rest at full HP
+  died_no_act    our active fainted on a turn it neither moved nor was switched in --
+                 outsped + KO'd, i.e. the "stayed in on lethal" signature
+  opp_boosted    the opponent's active reached net +3 or more: we let something set up
+  slept_hit      turns spent asleep while taking damage (Rest-loop cost)
+  tera_wasted    our tera'd mon fainted within 2 turns of tera with no opponent faint in
+                 between. 48% of tera-losses vs 12% of tera-wins when first measured.
 
-Signatures are heuristics for *where to look*, not verdicts -- open the replay/trace for
-any flagged turn before calling it a bug. Wins are mined too, as a control: a signature
-that shows up equally in wins is background noise, not a loss cause.
+Signatures are heuristics for WHERE TO LOOK, not verdicts -- open the replay/trace for any
+flagged turn before calling it a bug. Wins are mined too, as a control: a signature that
+shows up equally in wins is background noise, not a loss cause. See classify_loss.
 
     python -u src\mine_losses.py                    # mine replays/ladder
     python -u src\mine_losses.py --dir some\dir --include-file extra-replay.html
@@ -37,7 +34,7 @@ BOT_USERNAME = "influxobot"
 
 
 def read_log(path, username=None):
-    """The protocol log lines of a saved replay, and which side (p1/p2) is the bot."""
+    """The protocol log lines of a saved replay, plus which side (p1/p2) is the bot."""
     username = (username or BOT_USERNAME).lower()
     with open(path, encoding="utf-8", errors="replace") as f:
         text = f.read()
@@ -53,7 +50,7 @@ def read_log(path, username=None):
 
 
 def mine_game(lines, me):
-    """Signature counts for one game, from the bot's (side `me`) perspective."""
+    """Signature -> turns it fired on, for one game, from side `me`'s perspective."""
     opp = "p2" if me == "p1" else "p1"
     sig = {"immune_click": [], "fail_click": [], "died_no_act": [],
            "opp_boosted": [], "slept_hit": [], "tera_wasted": []}
@@ -90,13 +87,13 @@ def mine_game(lines, me):
                 acted_this_turn = True
                 our_last_move_line = i
         elif tag == "cant" and len(p) > 3 and mine_prefix(p[2]) and p[3] == "slp":
-            acted_this_turn = True     # it "acted" (slept); died_no_act shouldn't double-count
+            acted_this_turn = True     # it "acted" (slept); don't double-count as died_no_act
             slept_this_turn = True
         elif tag == "-damage" and len(p) > 2 and mine_prefix(p[2]) and slept_this_turn:
             sig["slept_hit"].append(turn)
             slept_this_turn = False    # one per turn
         elif tag == "-immune" and len(p) > 2 and opp_prefix(p[2]):
-            # our attack was immune-d if our move was the most recent move line
+            # ours was the immune'd attack iff our move was the most recent move line
             if our_last_move_line >= 0 and i - our_last_move_line <= 3:
                 sig["immune_click"].append(turn)
         elif tag == "-fail" and len(p) > 2 and mine_prefix(p[2]):
@@ -126,9 +123,10 @@ def mine_game(lines, me):
     return sig
 
 
-# --- deeper per-game analyses (added 2026-07-04) ---------------------------------------------
-# These fill the miner's known blind spots: attrition losses (no blunder, just worse trades --
-# invisible to the signatures, cf. the Foul Play mining), luck accounting, and switch quality.
+# --- deeper per-game analyses -------------------------------------------------------------
+# These fill the signature miner's known blind spots. Plenty of losses contain no blunder at
+# all -- we just traded worse and ran out of team, which is invisible to everything above
+# (cf. the Foul Play mining). So: HP-curve divergence, luck accounting, switch quality.
 # Same caveat as the signatures: pointers for where to look, not verdicts.
 
 _HP_RE = re.compile(r"^(\d+)/(\d+)")
@@ -146,11 +144,12 @@ def _frac(token):
 
 
 def hp_curve(lines, me):
-    """Per-turn (our team fraction, opp team fraction), unrevealed mons counted full.
+    """Per-turn (our team fraction, opp team fraction). Unrevealed mons count as full.
 
-    Both sides' HP tokens are cur/max IN THEIR OWN UNITS (ours raw stats, theirs /100),
-    so per-mon FRACTIONS are exact and comparable; raw HP differencing would be garbage.
-    Returns (curve, first_behind_turn, recovered) with 'behind' = diff < -0.10."""
+    Both sides' HP tokens are cur/max IN THEIR OWN UNITS (ours raw stats, theirs /100), so
+    per-mon FRACTIONS are exact and comparable while raw HP differencing would be garbage.
+
+    Returns (curve, first_behind_turn, recovered), where 'behind' means diff < -0.10."""
     opp = "p2" if me == "p1" else "p1"
     mons = {"me": {}, "opp": {}}     # nickname -> last known frac
     curve = []
@@ -192,8 +191,9 @@ def hp_curve(lines, me):
 
 def hax_events(lines, me):
     """Luck ledger: crits, misses, full-para, flinch/frz stops, confusion self-hits.
-    Sleep is EXCLUDED (Rest makes it strategy, not luck). Reported symmetrically --
-    'for' = events that helped us, 'against' = events that hurt us."""
+
+    Sleep is EXCLUDED -- Rest makes it strategy, not luck. Reported symmetrically: 'for' =
+    events that helped us, 'against' = events that hurt us."""
     opp_pre = ("p2" if me == "p1" else "p1") + "a"
     me_pre = f"{me}a"
     ev = {"for": 0, "against": 0}
@@ -206,7 +206,7 @@ def hax_events(lines, me):
         tag = p[1] if len(p) > 1 else ""
         if tag == "-crit" and len(p) > 2:            # target got hurt
             bump(me_pre if p[2].startswith(me_pre) else opp_pre)
-        elif tag == "-miss" and len(p) > 2:          # attacker got hurt (wasted turn)
+        elif tag == "-miss" and len(p) > 2:          # attacker lost the turn
             bump(me_pre if p[2].startswith(me_pre) else opp_pre)
         elif tag == "cant" and len(p) > 3 and p[3] in ("par", "flinch", "frz"):
             bump(me_pre if p[2].startswith(me_pre) else opp_pre)
@@ -218,10 +218,12 @@ def hax_events(lines, me):
 def switch_punish(lines, me):
     """(voluntary healthy switch-ins, how many were punished).
 
-    Punished = the switched-in mon lost >=40% max HP to DIRECT opponent move damage,
-    or fainted, within its entry turn block. Deliberately excludes: forced post-faint
-    replacements (different decision class), hazard/passive chip ([from]-tagged --
-    priced by the search), and entries below 60% HP (endgame sacks are intentional)."""
+    Punished = the switched-in mon lost >=40% max HP to DIRECT opponent move damage, or
+    fainted, within its entry turn block.
+
+    Deliberately excludes: forced post-faint replacements (a different decision class),
+    hazard/passive chip ([from]-tagged -- already priced by the search), and entries below
+    60% HP (endgame sacks are intentional)."""
     opp = "p2" if me == "p1" else "p1"
     vol = punished = 0
     cur_mon = None
@@ -256,8 +258,10 @@ def switch_punish(lines, me):
 
 def tera_roi(lines, me):
     """Descriptive tera stats: (tera turn, opp faints while the tera mon lived, turns it
-    survived). OUTCOME-CONFOUNDED by construction (winners' teras look good) -- for
-    trend-watching only, never a gate."""
+    survived).
+
+    OUTCOME-CONFOUNDED by construction -- winners' teras always look good. Trend-watching
+    only, never a gate."""
     opp = "p2" if me == "p1" else "p1"
     turn = 0
     tera_turn = tera_mon = None
@@ -282,8 +286,8 @@ def tera_roi(lines, me):
 
 
 def opp_killers(lines, me):
-    """Opponent species credited with our faints (APPROXIMATE: passive damage credits
-    whatever is active). Aggregated across losses as a 'who beats us' pointer list."""
+    """Opponent species credited with our faints. APPROXIMATE -- passive damage credits
+    whatever happens to be active. Aggregated across losses as a 'who beats us' pointer."""
     opp = "p2" if me == "p1" else "p1"
     active = None
     credit = {}
@@ -305,13 +309,13 @@ def saw_illusion(lines, me):
 
 
 def classify_loss(sig, hax_net, first_behind, recovered, game_len, correlated):
-    """Coarse loss taxonomy, precedence-ordered (a game may qualify for several):
-    blundered > hax > out_traded > close. Pointer for where to spend reading time.
+    """Coarse loss taxonomy, precedence-ordered: blundered > hax > out_traded > close.
+    A game may qualify for several. Pointer for where to spend reading time.
 
-    'blundered' only counts signatures that are LOSS-CORRELATED in this cohort
-    (rate in losses > 2x wins) -- an immune_click that appears equally in wins is
-    hidden-set background noise, and labeling those losses 'blundered' would bury
-    the attrition story (caught on the 2026-07-04 FP cohort validation)."""
+    'blundered' only counts signatures that are LOSS-CORRELATED in this cohort (rate in
+    losses > 2x wins). An immune_click that appears equally in wins is hidden-set background
+    noise, and labelling those losses 'blundered' buries the attrition story -- caught on
+    the FP cohort validation."""
     blunder_sigs = {"immune_click", "fail_click", "tera_wasted"} & correlated
     if any(sig.get(k) for k in blunder_sigs):
         return "blundered"
@@ -324,7 +328,7 @@ def classify_loss(sig, hax_net, first_behind, recovered, game_len, correlated):
 
 
 def analyze_dir(directory, username, include=(), since=None):
-    """Aggregate every analysis over a replay dir; returns the totals dict."""
+    """Aggregate every analysis over a replay dir. Returns the totals dict."""
     games = []
     for path in sorted(glob.glob(os.path.join(directory, "*.html"))):
         if since is not None and os.path.getmtime(path) < since:
@@ -391,8 +395,8 @@ def analyze_dir(directory, username, include=(), since=None):
             for sp, n in opp_killers(lines, me).items():
                 agg["killers"][sp] = agg["killers"].get(sp, 0) + n
 
-    # Second pass: classification needs the whole cohort's win-control first --
-    # which signatures are actually loss-correlated here (same rule as the table marker).
+    # Second pass: classification needs the whole cohort's win-control first, i.e. which
+    # signatures are actually loss-correlated here. Same rule as the table marker below.
     nl, nw = max(agg["counts"]["lost"], 1), max(agg["counts"]["won"], 1)
     correlated = {k for k in set(agg["sig"]["lost"]) | set(agg["sig"]["won"])
                   if agg["sig"]["lost"].get(k, 0) / nl > 0.3
@@ -469,7 +473,7 @@ def report(agg, baseline=None):
         print(f"--- opponent Zoroark games: {agg['illusion']['won']}W / "
               f"{agg['illusion']['lost']}L ---")
     if any(agg["reorders"].values()):
-        print("--- reranker overrides per game (needs post-2026-07-04 traces) ---")
+        print("--- reranker overrides per game (needs traces with 'reorders') ---")
         keys = sorted(set(agg["reorders"]["lost"]) | set(agg["reorders"]["won"]))
         for k in keys:
             print(f"  {k:12s} L {agg['reorders']['lost'].get(k,0)/nl:.2f}"
@@ -481,12 +485,12 @@ def report(agg, baseline=None):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Mine ladder replays for blunder signatures.")
+    ap = argparse.ArgumentParser(description="Mine replays for blunder signatures.")
     ap.add_argument("--dir", default=os.path.join("replays", "ladder"))
     ap.add_argument("--include-file", action="append", default=[],
                     help="extra replay html(s) to mine (counted as losses)")
     ap.add_argument("--username", default=BOT_USERNAME,
-                    help="the bot's username in the replays (default influxobot)")
+                    help="the bot's username in the replays")
     ap.add_argument("--since", default=None,
                     help="only mine replays modified after 'YYYY-MM-DD HH:MM'")
     ap.add_argument("--baseline", default=None,

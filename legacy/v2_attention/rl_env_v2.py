@@ -1,22 +1,19 @@
-"""Phase 1 (v2): a structured, richer observation built for a team-attention network.
+"""A richer, structured observation, laid out for the attention network.
 
-The baseline (rl_env.py) flattens everything into one 141-number vector. Fine for a plain
-MLP, but it hides the structure of a battle: really 12 Pokemon (your 6 + their 6) plus global
-field state. A network that respects that -- a shared encoder per Pokemon, then attention
-across the team -- can learn better than a flat MLP rediscovering "these 64 numbers are one
-Pokemon."
+The normal version flattens everything into one long list of numbers. That's fine for a
+plain network, but it throws away the shape of a battle, which is really twelve Pokemon,
+six a side, plus the state of the field. The hope was that a network which knows about that
+structure would learn better than one rediscovering "these 64 numbers are one Pokemon".
 
-So the observation is a fixed grid:
+So the observation is a fixed grid instead:
 
-    [ mon_0 | mon_1 | ... | mon_11 | global ]
-      <-- 12 tokens of PER_MON each -->  <- GLOBAL ->
+    [ our six | their six | the field ]
 
-mon_0..5  = your team (always known)
-mon_6..11 = opponent's team (revealed mons filled, the rest zeros)
+Our own team is always fully known. Theirs is filled in as Pokemon are revealed, and the
+slots we haven't seen yet are left as zeroes.
 
-team_net reshapes the first 12*PER_MON numbers back into a (12, PER_MON) grid and runs
-attention over it, which is why the layout is fixed and documented here. Carries the
-win-weighted reward from the baseline.
+The network folds the first part back into a twelve-by-something grid, which is why the
+layout has to stay fixed and is spelled out here.
 """
 
 import numpy as np
@@ -24,50 +21,50 @@ from gymnasium.spaces import Box
 
 from poke_env.environment.singles_env import SinglesEnv
 
-# --- vocabularies ------------------------------------------------------------
+# --- the vocabulary ----------------------------------------------------------
 
 TYPE_NAMES = [
     "NORMAL", "FIRE", "WATER", "ELECTRIC", "GRASS", "ICE", "FIGHTING", "POISON",
     "GROUND", "FLYING", "PSYCHIC", "BUG", "ROCK", "GHOST", "DRAGON", "DARK", "STEEL", "FAIRY",
-]  # 18
-STAT_KEYS = ["hp", "atk", "def", "spa", "spd", "spe"]            # 6
-BOOST_KEYS = ["atk", "def", "spa", "spd", "spe", "accuracy", "evasion"]  # 7
-STATUS_NAMES = ["BRN", "PAR", "SLP", "FRZ", "PSN", "TOX"]        # 6
+]
+STAT_KEYS = ["hp", "atk", "def", "spa", "spd", "spe"]
+BOOST_KEYS = ["atk", "def", "spa", "spd", "spe", "accuracy", "evasion"]
+STATUS_NAMES = ["BRN", "PAR", "SLP", "FRZ", "PSN", "TOX"]
 
-# Curated high-impact items, grouped into categories (one flag each).
+# Items that change how a turn plays out, grouped by what they do.
 ITEM_CATEGORIES = [
-    {"leftovers", "blacksludge"},                 # passive healing
-    {"choiceband", "choicespecs", "choicescarf"}, # locked into one move (power/speed)
-    {"heavydutyboots"},                           # ignores entry hazards
-    {"lifeorb"},                                  # power boost + recoil
-    {"assaultvest"},                              # special bulk, no status moves
-    {"focussash"},                               # survive a KO at full HP
-    {"rockyhelmet"},                             # punishes contact
-    {"eviolite"},                                # bulk for not-fully-evolved
-    {"boosterenergy"},                           # triggers Proto/Quark
-    {"weaknesspolicy"},                          # boosts after super-effective hit
-]  # 10
+    {"leftovers", "blacksludge"},                 # heals a bit every turn
+    {"choiceband", "choicespecs", "choicescarf"}, # more power or speed, locked to one move
+    {"heavydutyboots"},                           # walks over hazards
+    {"lifeorb"},                                  # hits harder, hurts itself
+    {"assaultvest"},                              # tanky, but no status moves
+    {"focussash"},                               # survives one hit from full health
+    {"rockyhelmet"},                             # hurts anything that touches it
+    {"eviolite"},                                # bulk for the unevolved
+    {"boosterenergy"},                           # switches on a stat boost immediately
+    {"weaknesspolicy"},                          # gets stronger after a big hit
+]
 
-# Curated high-impact ability categories (one flag each).
+# Same idea for abilities.
 ABILITY_CATEGORIES = [
-    {"levitate"},                                       # immune to Ground
-    {"flashfire", "wellbakedbody"},                     # immune to Fire
-    {"waterabsorb", "stormdrain", "dryskin"},           # immune to Water
-    {"voltabsorb", "lightningrod", "motordrive"},       # immune to Electric
-    {"sapsipper"},                                      # immune to Grass
-    {"multiscale", "shadowshield"},                     # halves damage at full HP
-    {"intimidate"},                                     # drops attack on switch-in
-    {"regenerator"},                                    # heals on switch
-    {"magicguard"},                                     # no indirect damage
-    {"unaware"},                                        # ignores stat boosts
-    {"hugepower", "purepower"},                         # doubles attack
-    {"speedboost", "protosynthesis", "quarkdrive",      # speed enablers
+    {"levitate"},                                       # can't be hit by Ground
+    {"flashfire", "wellbakedbody"},                     # can't be hit by Fire
+    {"waterabsorb", "stormdrain", "dryskin"},           # can't be hit by Water
+    {"voltabsorb", "lightningrod", "motordrive"},       # can't be hit by Electric
+    {"sapsipper"},                                      # can't be hit by Grass
+    {"multiscale", "shadowshield"},                     # takes half damage at full health
+    {"intimidate"},                                     # weakens whatever it faces
+    {"regenerator"},                                    # heals every time it switches out
+    {"magicguard"},                                     # ignores poison, hazards, weather
+    {"unaware"},                                        # ignores the opponent's boosts
+    {"hugepower", "purepower"},                         # double attack
+    {"speedboost", "protosynthesis", "quarkdrive",      # gets faster, one way or another
      "swiftswim", "chlorophyll", "sandrush", "unburden"},
-]  # 12
+]
 
-N_MON = 12          # 6 ours + 6 theirs
-# PER_MON layout: active(1) fainted(1) hp(1) known(1) types(18) base_stats(6)
-#                 boosts(7) status(6) items(10) abilities(12) terastallized(1)
+N_MON = 12          # six each side
+# What we record per Pokemon: whether it's out, whether it's fainted, its health, whether
+# we've seen it at all, then typing, base stats, boosts, status, items, abilities and Tera.
 PER_MON = 1 + 1 + 1 + 1 + 18 + 6 + 7 + 6 + len(ITEM_CATEGORIES) + len(ABILITY_CATEGORIES) + 1  # = 64
 
 
@@ -83,7 +80,7 @@ def _onehot(name, vocab):
 
 
 def _category_flags(value_id, categories, possible_ids=None):
-    """1.0 if value_id is in a category; else 0.5 if any possible_id is (for hidden info)."""
+    """Full marks if we know it's in a category, half if it merely could be."""
     vec = [0.0] * len(categories)
     if value_id:
         for i, ids in enumerate(categories):
@@ -97,7 +94,7 @@ def _category_flags(value_id, categories, possible_ids=None):
 
 
 def _mon_token(mon, is_active):
-    """Fixed-length PER_MON feature block for one Pokemon (all zeros if unknown)."""
+    """Everything we record about one Pokemon. All zeroes if we've never seen it."""
     if mon is None:
         return [0.0] * PER_MON
 
@@ -116,7 +113,7 @@ def _mon_token(mon, is_active):
         [1.0 if is_active else 0.0]
         + [1.0 if mon.fainted else 0.0]
         + [mon.current_hp_fraction]
-        + [1.0]                                  # "known": this slot holds a real Pokemon
+        + [1.0]                                  # yes, there's really a Pokemon here
         + type_vec + base_stats + boosts + status_vec
         + item_vec + ability_vec
         + [1.0 if mon.is_terastallized else 0.0]
@@ -125,7 +122,7 @@ def _mon_token(mon, is_active):
 
 
 def _eff_speed(mon):
-    """Rough effective speed: base * boost multiplier, halved if paralyzed."""
+    """Roughly how fast something is, counting boosts and paralysis."""
     if mon is None:
         return 0.0
     boost = mon.boosts.get("spe", 0)
@@ -211,7 +208,7 @@ def _global_features(battle):
     opp = battle.opponent_active_pokemon
     tr = _trick_room(battle)
 
-    # The agent's available moves (action-relevant).
+    # The moves we can actually click this turn.
     move_power = [0.0] * 4
     move_mult = [0.0] * 4
     move_acc = [0.0] * 4
@@ -231,29 +228,29 @@ def _global_features(battle):
     opp_remaining = (6 - sum(1 for m in battle.opponent_team.values() if m.fainted)) / 6.0
 
     faster = _eff_speed(me) > _eff_speed(opp)
-    if tr:                      # Trick Room reverses the speed order
+    if tr:                      # Trick Room turns the speed order upside down
         faster = not faster
 
     feats = (
-        _weather(battle) + _terrain(battle) + [1.0 if tr else 0.0]                       # 11
-        + _hazards(battle.side_conditions) + _hazards(battle.opponent_side_conditions)   # 6
-        + _screens(battle.side_conditions) + _screens(battle.opponent_side_conditions)   # 8
-        + [my_remaining, opp_remaining]                                                  # 2
-        + [1.0 if battle.can_tera else 0.0]                                              # 1
-        + _tera_type_vec(me) + _tera_type_vec(opp)                                       # 36
-        + move_power + move_mult + move_acc + move_phys + move_status                    # 20
-        + [1.0 if faster else 0.0]                                                       # 1
-        + [min(battle.turn / 30.0, 1.0)]                                                 # 1
+        _weather(battle) + _terrain(battle) + [1.0 if tr else 0.0]
+        + _hazards(battle.side_conditions) + _hazards(battle.opponent_side_conditions)
+        + _screens(battle.side_conditions) + _screens(battle.opponent_side_conditions)
+        + [my_remaining, opp_remaining]
+        + [1.0 if battle.can_tera else 0.0]
+        + _tera_type_vec(me) + _tera_type_vec(opp)
+        + move_power + move_mult + move_acc + move_phys + move_status
+        + [1.0 if faster else 0.0]
+        + [min(battle.turn / 30.0, 1.0)]
     )
     return feats
 
 
-GLOBAL = 11 + 6 + 8 + 2 + 1 + 36 + 20 + 1 + 1   # = 86
-N_FEATURES = N_MON * PER_MON + GLOBAL           # 12*64 + 86 = 854
+GLOBAL = 11 + 6 + 8 + 2 + 1 + 36 + 20 + 1 + 1
+N_FEATURES = N_MON * PER_MON + GLOBAL
 
 
 def structured_observation(battle):
-    """Build the full [12 Pokemon tokens | global] observation vector."""
+    """Assemble the whole thing: twelve Pokemon, then the field."""
     tokens = []
     my_team = list(battle.team.values())[:6]
     for mon in my_team:
@@ -278,7 +275,7 @@ class ShowdownTeamEnv(SinglesEnv):
         return structured_observation(battle)
 
     def calc_reward(self, battle):
-        # High victory_value encourages winning, but too high prevents learning
+        # A big win bonus pushes towards winning, but make it too big and nothing learns.
         return self.reward_computing_helper(
             battle, fainted_value=2.0, hp_value=1.0, status_value=0.1, victory_value=40.0,
         )

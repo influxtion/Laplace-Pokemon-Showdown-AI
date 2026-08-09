@@ -1,24 +1,22 @@
-r"""Fresh agent for the 70% push, trained from scratch vs the heuristic.
+r"""A bigger agent, trained from scratch, in an attempt to break the plateau.
 
-Bundles the improvements that need a clean start (they change the architecture or learning
-dynamics, so they can't be bolted onto an existing model):
+Everything here needs a clean start, because it changes the shape of the network or how it
+learns, and you can't bolt that onto an existing model:
 
-  - Bigger network: net_arch [256, 256] (SB3 defaults to ~[64, 64]) for more capacity on the
-    215-feature observation.
-  - Higher gamma: 0.997 (default 0.99) so the terminal win is discounted less over a ~30-turn
-    game -> better credit assignment for closing games.
-  - Win-focused reward, parallel envs, and 200-battle evals reused from train_rl.
+  - A much bigger network, since the default is tiny next to a 215-number observation.
+  - A higher discount, so a win 30 turns away still counts for something and the agent
+    learns which early decisions led to it.
+  - The win-focused rewards, parallel games and large evaluations from the main trainer.
 
-Rescaled experiment (toggle below): train_rl's value targets reach ~150 with no reward
-normalization, a suspect for the mediocre ~0.4 explained_variance. RESCALED=True divides every
-reward term by 10 -- same win/trade ratio, value targets ~10x smaller -- which should let the
-value loss behave if scale was the cause. The value net would be mis-calibrated if reused, so
-the rescaled run starts fresh under its own "_rescaled" name, alongside the untouched original.
-(Concluded: it didn't help; the ~0.4 ceiling is partial observability, not reward scale.)
+There's also a rescaled-reward experiment behind a switch below. The theory was that reward
+values running into the hundreds were making the value estimates hard to fit. Dividing
+everything by ten keeps the same balance between winning and trading while shrinking the
+numbers. It didn't help. The ceiling turned out to be that the agent can't see the
+opponent's hidden information, not the reward scale.
 
-Built for millions of steps; re-run to add more (it resumes).
+Built for millions of steps. Re-run it to add more; it picks up where it stopped.
 
-Run from the project root, with the local Showdown server running:
+Run from the project root, with the local server going:
     python -u src\train_v3.py
 """
 
@@ -28,28 +26,26 @@ from sb3_contrib import MaskablePPO
 from stable_baselines3.common.callbacks import CallbackList
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 
-# Reuse the env factories, eval, callbacks, and constants from the main trainer, keeping the
-# reward and parallel-env machinery in one place.
+# Borrow the game setup, evaluation and callbacks from the main trainer, so the rewards and
+# the parallel-game machinery only exist in one place.
 import train_rl as base
 from rl_env import N_FEATURES
 
-NET_ARCH = [256, 256]      # bigger policy/value network
-GAMMA = 0.997              # value the win more over a long game
+NET_ARCH = [256, 256]      # a much bigger network than the default
+GAMMA = 0.997              # care more about the eventual win
 ENT_COEF = 0.01
 TRAIN_STEPS = 2_000_000
 
-# Rescaled-reward experiment (see docstring). When True, every term is train_rl's divided by
-# 10 (hp 0.25->0.025, victory 150->15, fainted 1.0->0.1, status 0.1->0.01). All four must be
-# listed, or the env fills the unset one from rl_env.DEFAULT_REWARD (unscaled) and breaks the
-# ratio. None -> train_rl's REWARD_WEIGHTS.
-RESCALED = False    # concluded: didn't lift explained_variance. Left as a documented toggle;
-                    # the original v3 config is canonical.
+# The rescaled-reward experiment. Every value is the normal one divided by ten. All four
+# have to be listed: leave one out and it gets filled in at full size, which wrecks the
+# balance the experiment was testing.
+RESCALED = False    # it made no difference. Left here as a documented dead end.
 RESCALED_REWARD = {"hp_value": 0.025, "fainted_value": 0.1,
                    "status_value": 0.01, "victory_value": 15.0}
 REWARD_OVERRIDE = RESCALED_REWARD if RESCALED else None
 
-# "_rescaled" in the name keeps this run's model and logs separate from the original v3 so the
-# two can train and be compared side by side.
+# Tagging the filename keeps the two variants' models and logs apart, so they can be trained
+# and compared side by side.
 TAG = "_rescaled" if RESCALED else ""
 MODEL_PATH = f"ppo_v3{TAG}_obs{N_FEATURES}.zip"
 TB_LOG_NAME = f"ppo_v3{TAG}_obs{N_FEATURES}"

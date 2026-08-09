@@ -1,10 +1,10 @@
-r"""Quick check that parallel (SubprocVecEnv) training starts without errors.
+r"""A quick check that parallel training starts up properly.
 
-Builds N_ENVS training envs in separate processes and runs a few learning steps with a
-FRESH model (it does NOT touch your saved models). If this completes, the parallel setup
-works on your machine and the real run will too.
+Spins up the training games in separate processes and runs a handful of learning steps on a
+brand new model. It won't touch anything you've saved. If this finishes, the real run will
+work on this machine too.
 
-Run from the project root, with the local Showdown server running:
+Run from the project root, with the local server going:
     python -u src\smoke_parallel.py
 """
 

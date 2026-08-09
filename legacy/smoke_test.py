@@ -1,9 +1,9 @@
-"""Quick sanity check that the RL env builds, resets, and steps without errors."""
+"""A quick check that the training setup starts up and takes a few turns without falling over."""
 import numpy as np
 from train_rl import build_env
 from rl_env import N_FEATURES
 
-env, _inner = build_env()  # returns (masked_env, inner_env)
+env, _inner = build_env()
 obs, _ = env.reset()
 print("Observation keys:", list(obs.keys()))
 print("observation shape:", obs["observation"].shape, "action_mask shape:", obs["action_mask"].shape)

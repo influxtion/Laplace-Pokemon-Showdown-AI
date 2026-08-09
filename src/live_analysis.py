@@ -1,31 +1,31 @@
 r"""Live terminal commentary for one battle: the play-by-play plus what the search was
 actually thinking when it picked each move.
 
-The bot is normally a black box -- ladder.py prints one line per game, and the reasoning
-only surfaces later, in the .trace.json that mine_losses.py reads. This module renders that
-reasoning AS THE GAME HAPPENS, so a single ladder game can be watched and understood live
-instead of reconstructed afterwards.
+The bot is normally a black box -- ladder.py prints one line per game and the reasoning
+only surfaces later in the .trace.json that mine_losses.py reads. This renders it AS THE
+GAME HAPPENS, so a single ladder game can be watched and understood live instead of
+reconstructed afterwards.
 
 Two feeds, interleaved into one transcript:
 
   * The BATTLE, from the Showdown protocol (LiveAnalyzer.feed): moves, switches, HP swings,
-    crits/misses, status, boosts, hazards, weather, Tera, faints. Parsed from the raw
-    protocol lines rather than read off poke-env's battle object, because the lines carry
-    their own HP numbers -- which is what lets the commentary print BEFORE poke-env
-    processes the payload, and so keeps "what happened" above "what we decided next".
+    crits/misses, status, boosts, hazards, weather, tera, faints. Parsed from raw protocol
+    lines rather than read off poke-env's battle object, because the lines carry their own
+    HP numbers -- that's what lets the commentary print BEFORE poke-env processes the
+    payload, keeping "what happened" above "what we decided next".
 
-  * The SEARCH, from EnginePlayer's observer hook (LiveAnalyzer.__call__): determinized
-    worlds completing one at a time, pooled candidate shares with per-world win counts and
-    the engine's own eval, which hidden sets the sampler drew for the opponent, which guard
-    or reranker moved the front-runner, and whether the mixed root sampled off the argmax.
+  * The SEARCH, via EnginePlayer's observer hook (LiveAnalyzer.__call__): worlds completing
+    one at a time, pooled candidate shares with per-world win counts and the engine's eval,
+    which hidden sets the sampler drew, which guard moved the front-runner, and whether the
+    mixed root sampled off the argmax.
 
-Everything here is read-only instrumentation: the observer never feeds a value back into a
-decision, so a game played with the analyzer attached is the same game it would have played
-without it. Nothing here may raise into the client loop either -- EnginePlayer._emit
-swallows observer errors and the protocol feed is wrapped the same way, because a broken
-renderer must never cost a rated game.
+Read-only instrumentation throughout: the observer never feeds a value back into a
+decision, so a game played with the analyzer attached is the same game. Nothing here may
+raise into the client loop either -- EnginePlayer._emit swallows observer errors and the
+protocol feed is wrapped the same way, because a broken renderer must never cost a rated
+game. Renderer failures are counted and reported in summary() instead of dying quietly.
 
-Used by analyze_battle.py (one ladder game, fully narrated).
+Consumer: analyze_battle.py.
 """
 
 import re
@@ -41,10 +41,10 @@ from knowledge import get_move
 _DEX = GenData.from_gen(9).pokedex
 
 
-# --- terminal capability -------------------------------------------------------------------
+# --- terminal capability ------------------------------------------------------------------
 
 def enable_ansi():
-    """Turn on VT escape processing on a Windows console (no-op elsewhere, or if it fails).
+    """Turn on VT escape processing on a Windows console. No-op elsewhere, or if it fails.
 
     Windows 11 terminals normally have this on already; older conhost does not, and without
     it every colour code prints as literal garbage."""
@@ -63,8 +63,8 @@ def enable_ansi():
 
 
 def stdout_can(text):
-    """Can stdout actually encode this text? A cp1252 console cannot print block glyphs, and
-    one UnicodeEncodeError inside a print would take the game down with it."""
+    """Can stdout actually encode this text? A cp1252 console cannot print block glyphs,
+    and one UnicodeEncodeError inside a print would take the game down with it."""
     enc = getattr(sys.stdout, "encoding", None) or "ascii"
     try:
         text.encode(enc)
@@ -82,10 +82,10 @@ _COLORS = {
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
 # Every non-ASCII glyph this module can print, and its plain-ASCII stand-in. Applied at the
-# last moment (LiveAnalyzer.line / _progress) rather than at each call site: a redirected
-# stdout on Windows is cp1252, and one stray block glyph would raise UnicodeEncodeError
-# mid-game -- inside an observer callback, where EnginePlayer._emit silently swallows it and
-# the turn's output just vanishes. One-to-one by construction, so column widths survive.
+# LAST moment (line / _progress) rather than at each call site: a redirected stdout on
+# Windows is cp1252, and one stray block glyph raises UnicodeEncodeError mid-game -- inside
+# an observer callback, where _emit silently swallows it and the turn's output just
+# vanishes. One-to-one by construction, so column widths survive the substitution.
 _ASCII_FALLBACK = str.maketrans({
     "·": "|", "═": "=", "─": "-", "█": "#", "░": ".", "●": "+", "○": ".", "✕": "x",
     "▁": ".", "▂": ":", "▃": "-", "▄": "=", "▅": "+", "▆": "*", "▇": "#", "▉": "%",
@@ -93,7 +93,7 @@ _ASCII_FALLBACK = str.maketrans({
 
 
 def _vislen(text):
-    """Printed width, ignoring colour escapes (naive padding would break every column)."""
+    """Printed width, ignoring colour escapes. Naive padding breaks every column."""
     return len(_ANSI_RE.sub("", text))
 
 
@@ -104,7 +104,7 @@ def _pad(text, width):
 # --- naming ---------------------------------------------------------------------------------
 
 def _species_name(species):
-    """'greattusk' -> 'Great Tusk' (via the shipped pokedex; ids are unreadable in a log)."""
+    """'greattusk' -> 'Great Tusk' via the shipped pokedex. Ids are unreadable in a log."""
     entry = _DEX.get(to_id_str(species or ""))
     return entry["name"] if entry else str(species or "?").capitalize()
 
@@ -123,8 +123,8 @@ def _move_name(move_id):
 
 
 def _pretty(choice):
-    """A poke-engine move_choice as a human would say it: 'switch greattusk' ->
-    'switch Great Tusk', 'closecombat-tera' -> 'Close Combat +TERA'."""
+    """A move_choice as a human would say it: 'switch greattusk' -> 'switch Great Tusk',
+    'closecombat-tera' -> 'Close Combat +TERA'."""
     if not choice:
         return "-"
     if choice.startswith("switch "):
@@ -144,7 +144,7 @@ def _mmss(seconds):
 
 
 def _si(n):
-    """1980000 -> '1.98M'; visit counts get big and the exact digits never matter."""
+    """1980000 -> '1.98M'. Visit counts get big and the exact digits never matter."""
     if n >= 1_000_000:
         return f"{n / 1_000_000:.2f}M"
     if n >= 1_000:
@@ -156,8 +156,8 @@ class LiveAnalyzer:
     """Renders the battle and the search into one terminal transcript.
 
     Wired up two ways (AnalyzedPlayer does both):
-      agent.observer = analyzer        # search internals, via EnginePlayer._emit
-      analyzer.feed(split_messages)    # protocol lines, before poke-env parses them
+        agent.observer = analyzer        # search internals, via EnginePlayer._emit
+        analyzer.feed(split_messages)    # protocol lines, before poke-env parses them
     """
 
     N_CANDIDATES = 4        # candidate moves shown per turn
@@ -167,8 +167,8 @@ class LiveAnalyzer:
         term = shutil.get_terminal_size((100, 30)).columns
         self.width = max(64, min(width or term, 108))
         self.color = bool(color) and sys.stdout.isatty()
-        # Block glyphs make the bars readable, but only where the console can encode them;
-        # the ASCII fallback carries the same information.
+        # Block glyphs make the bars readable, but only where the console can encode them.
+        # The ASCII fallback carries the same information.
         self.unicode = stdout_can("█░▁▇●·✕") if unicode is None else bool(unicode)
         self.show_worlds = show_worlds
         self.log = []                    # every line printed, for --save-log
@@ -181,7 +181,7 @@ class LiveAnalyzer:
         self._world_fails = 0
         self._budget = (0, 0, 0)         # (worlds, ms each, threads each)
         self._pooled_order = []          # candidate order before any guard/reranker
-        self._stages = []                # (stage name, changed the front-runner?, was, now)
+        self._stages = []                # (stage, changed the front-runner?, was, now)
         self._vetoed = {}                # choice -> the stage that vetoed it
         self._value = None               # [(choice, P(win))] from the value net
         self._mix = None                 # (eligible, pick, suppressed)
@@ -215,7 +215,7 @@ class LiveAnalyzer:
         self._action = None              # the move currently being narrated
         self._post_faint = set()         # sides whose next switch is a forced replacement
 
-    # --- output ---------------------------------------------------------------
+    # --- output -----------------------------------------------------------------
 
     def c(self, name, text):
         if not self.color:
@@ -272,7 +272,7 @@ class LiveAnalyzer:
     def _stamp(self):
         return self.c("dim", _pad(f"T{self.turn}", 5))
 
-    # --- observer protocol (EnginePlayer._emit) --------------------------------
+    # --- observer protocol (EnginePlayer._emit) ---------------------------------
 
     def __call__(self, event, **data):
         handler = getattr(self, "_on_" + event, None)
@@ -280,11 +280,11 @@ class LiveAnalyzer:
             handler(**data)
 
     def attach(self, agent):
-        """Remember the agent: the transcript also shows inference state it keeps across
-        turns (Choice-Scarf verdicts, moves seen since switch-in) and its world results."""
+        """Remember the agent. The transcript also shows inference state it keeps across
+        turns (Scarf verdicts, moves seen since switch-in) and its raw world results."""
         self.agent = agent
 
-    # --- the decision, rendered ------------------------------------------------
+    # --- the decision, rendered -------------------------------------------------
 
     def _on_turn_start(self, battle):
         self._t_turn = time.perf_counter()
@@ -330,9 +330,9 @@ class LiveAnalyzer:
                   f"{frac:4.0%} {self.bar(frac)} {alive}/6  "
                   + self.c("dim", " · ").join(bits))
 
-    #: poke-env stores a layer count for these and the START TURN for everything else, so
-    #: only these may be rendered as 'xN' (the adapter's _side_conditions splits them the
-    #: same way -- printing 'stealth_rock x5' for a rock set on turn 5 would be a lie).
+    #: poke-env stores a LAYER COUNT for these and the START TURN for everything else, so
+    #: only these may be rendered as 'xN'. The adapter's _side_conditions splits them the
+    #: same way. Printing 'stealth_rock x5' for rocks set on turn 5 would be a lie.
     _LAYERED = ("SPIKES", "TOXIC_SPIKES")
 
     def _field_line(self, battle):
@@ -354,9 +354,9 @@ class LiveAnalyzer:
         best = max(res.side_one, key=lambda o: o.visits, default=None)
         reply = max((o for o in res.side_two if o.move_choice != "No Move"),
                     key=lambda o: o.visits, default=None)
-        # total_score/visits is the engine's own mean outcome for a root move -- i.e. its win
-        # probability estimate for us. The parallel-worlds path drops it (results cross a
-        # process boundary as plain tuples), hence the getattr.
+        # total_score/visits is the engine's own mean outcome for a root move, i.e. its win
+        # estimate for us. The parallel-worlds path drops it (results cross a process
+        # boundary as plain tuples), hence the getattr.
         score = getattr(best, "total_score", None) if best else None
         self._worlds.append({
             "visits": res.total_visits,
@@ -381,9 +381,10 @@ class LiveAnalyzer:
 
     @staticmethod
     def _sampled_set(state):
-        """(item, ability, tera) this world guessed for the opponent's active. Determinization
-        is how the bot copes with hidden information, so the spread of these guesses across
-        worlds is the most informative thing in the turn."""
+        """(item, ability, tera) this world guessed for the opponent's active.
+
+        Determinization is how the bot copes with hidden information, so the SPREAD of
+        these across worlds is usually the most informative thing in the turn."""
         try:
             side = state.side_two
             mon = side.pokemon[int(str(side.active_index))]
@@ -508,8 +509,10 @@ class LiveAnalyzer:
 
     def _pooled_shares(self):
         """Pooled visit share and world-win count per candidate, recomputed from the raw
-        world results. Deliberately independent of the score encoding the search uses
-        (robust vote vs plain averaging), so the table reads the same under either."""
+        world results.
+
+        Deliberately independent of whichever score encoding the search is using (robust
+        vote vs plain averaging), so the table reads the same under either."""
         worlds = list(getattr(self.agent, "_worlds", []) or [])
         shares, wins, n = {}, {}, len(worlds) or 1
         for _state, res in worlds:
@@ -534,8 +537,8 @@ class LiveAnalyzer:
         return {k: num[k] / den[k] for k in num if den.get(k)}
 
     def _expected_reply(self):
-        """The opponent move the worlds spent most of their search on: our predicted reply,
-        and how much of the opponent's visit mass it held."""
+        """The opponent move the worlds spent most of their search on -- our predicted
+        reply -- and how much of the opponent's visit mass it held."""
         tally = {}
         for w in self._worlds:
             if w["reply"]:
@@ -546,7 +549,7 @@ class LiveAnalyzer:
         return best, tally[best] / max(len(self._worlds), 1)
 
     def _sampling_line(self):
-        """What the determinizer guessed about the opponent's active, across worlds."""
+        """What the determinizer guessed about the opponent's active, tallied over worlds."""
         sets = [w["set"] for w in self._worlds if w["set"]]
         if not sets or not self.show_worlds:
             return
@@ -562,8 +565,8 @@ class LiveAnalyzer:
                                 f"ability {tally(1)}  ·  tera {tally(2)}"))
 
     def _inference_line(self, battle):
-        """Hard inferences the adapter feeds the search: Choice-Scarf verdicts read off turn
-        order, and what this opponent has shown since switching in (Choice-lock evidence)."""
+        """Hard inferences the adapter feeds the search: Scarf verdicts read off turn order,
+        and what this opponent has shown since switching in (Choice-lock evidence)."""
         if self.agent is None:
             return
         bits = []
@@ -579,7 +582,7 @@ class LiveAnalyzer:
             self.line("  " + self.c("dim", _pad("inferred", 9))
                       + self.c("dim", " · ").join(bits))
 
-    # --- protocol feed (the battle itself) ------------------------------------
+    # --- protocol feed (the battle itself) --------------------------------------
 
     def feed(self, split_messages):
         """Narrate one protocol payload. Called BEFORE poke-env processes it, so the events
@@ -589,9 +592,9 @@ class LiveAnalyzer:
                 if len(msg) > 1:
                     self._event(msg)
         except Exception:
-            # Commentary must never break the client loop -- but silent swallowing hides
-            # renderer bugs (it hid a Unicode crash during development), so it is counted
-            # and reported in summary() instead.
+            # Commentary must never break the client loop. But silent swallowing hides
+            # renderer bugs -- it hid a Unicode crash during development -- so count it and
+            # report in summary() instead.
             self.feed_errors += 1
 
     _HANDLERS = {
@@ -804,17 +807,17 @@ class LiveAnalyzer:
         self.line(text)
 
     def _hax(self, kind, hurt_ident):
-        """Luck ledger, same convention as mine_losses.hax_events: a crit hurts its target, a
-        miss / full-para / flinch hurts the mon that lost its turn -- in both cases the mon
-        named on the line. Sleep is excluded (Rest makes it strategy, not luck)."""
+        """Luck ledger, same convention as mine_losses.hax_events: a crit hurts its target,
+        a miss / full-para / flinch hurts the mon that lost its turn -- in both cases the
+        mon named on the line. Sleep excluded (Rest makes it strategy, not luck)."""
         key = "against" if self._mine(hurt_ident) else "for"
         self.hax[key] += 1
         tag = f"{kind} {key}"
         self.hax["detail"][tag] = self.hax["detail"].get(tag, 0) + 1
 
     def _resolve_prediction(self, actual):
-        """Score the search's guess at the opponent's reply. Approximate by construction: one
-        prediction per decision, resolved against the first thing that opponent does."""
+        """Score the search's guess at the opponent's reply. Approximate by construction:
+        one prediction per decision, resolved against the first thing that opponent does."""
         _turn, predicted = self._pending_pred
         self._pending_pred = None
         self.predictions[1] += 1
@@ -823,11 +826,11 @@ class LiveAnalyzer:
         if hit:
             self.predictions[0] += 1
 
-    # --- end-of-game report ---------------------------------------------------
+    # --- end-of-game report -----------------------------------------------------
 
     def summary(self, battle=None, result=None, replay_path=None, diag=None):
-        """The post-game block: what the search cost, what the pipeline did, how well we read
-        the opponent, the luck ledger, and where the game actually turned."""
+        """The post-game block: what the search cost, what the pipeline did, how well we
+        read the opponent, the luck ledger, and where the game actually turned."""
         self.line()
         self.rule(self.c("hdr", "Game analysis"), ch="═")
         wall = time.time() - self.t_start
@@ -889,8 +892,8 @@ class LiveAnalyzer:
             self.line(f"  their team  {', '.join(revealed)}  ({len(revealed)}/6 revealed)")
         if self.feed_errors:
             self.line("  " + self.c("bad", f"renderer    {self.feed_errors} protocol "
-                                           f"payload(s) failed to render (a bug in the "
-                                           f"commentary, not in the bot)"))
+                                           f"payload(s) failed to render -- a bug in the "
+                                           f"commentary, not in the bot"))
         if replay_path:
             self.line(f"  replay      {replay_path}")
         if diag:
@@ -903,7 +906,7 @@ class LiveAnalyzer:
                        for _t, v in self.evals)
 
     def _swings(self, n=2, floor=0.12):
-        """The decisions where the search's own estimate fell the most -- where to look first
+        """The decisions where the search's own estimate moved most -- where to look first
         in the replay. Descriptive: a swing is as often their good play as our bad one."""
         deltas = [(self.evals[i][0], self.evals[i][1] - self.evals[i - 1][1])
                   for i in range(1, len(self.evals))]

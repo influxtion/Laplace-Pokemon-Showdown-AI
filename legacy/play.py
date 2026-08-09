@@ -1,20 +1,19 @@
-r"""Watch the trained agent play a battle.
+r"""Watch a game instead of just counting wins.
 
-Where eval_search.py runs hundreds of battles for a win-rate number, this plays a few and
-saves each as a Showdown replay you can open in a browser and watch move by move. By default
-it plays the agent we'd ship: the policy wrapped in the 1-ply search (search.py). Pass --raw
-for the bare policy.
+eval_search.py plays hundreds of games to get a number. This plays a couple and saves each
+one as a replay you can open in a browser and watch turn by turn. By default it uses the
+best agent of the era: the network wrapped in the one-turn searcher.
 
-A replay is a self-contained .html with the full battle log embedded; opening it loads
-Showdown's replay viewer (needs internet for the viewer script, but the battle is in the file)
-and plays back with sprites, HP bars, and animations.
+Each replay is a single .html file with the whole battle log inside it. Opening it loads
+Showdown's own replay viewer and plays the game back with sprites and animations. The
+viewer needs internet, but the game itself is in the file.
 
-Run from the project root, with the local Showdown server running:
-    python -u src\play.py                       # 1 battle, search agent vs the heuristic
-    python -u src\play.py --battles 3           # 3 battles
-    python -u src\play.py --raw                 # bare policy, no search
-    python -u src\play.py --opponent random     # vs RandomPlayer instead of the heuristic
-    python -u src\play.py --model ppo_v3_obs215.zip   # a specific model file
+Run from the project root, with the local server going:
+    python -u src\play.py                       # one game against the heuristic
+    python -u src\play.py --battles 3
+    python -u src\play.py --raw                 # just the network, no searching
+    python -u src\play.py --opponent random
+    python -u src\play.py --model ppo_v3_obs215.zip
 """
 
 import argparse
@@ -34,14 +33,13 @@ from engine_search import EnginePlayer
 from opponent import ModelPlayer
 
 BATTLE_FORMAT = "gen9randombattle"
-REPLAY_DIR = "replays"          # where the .html replays are written (project root)
+REPLAY_DIR = "replays"          # where the .html files land
 
 OPPONENTS = {"heuristic": SimpleHeuristicsPlayer, "random": RandomPlayer}
 
 
 def build_agent(model, agent, debug=False):
-    """The agent to watch: the poke-engine MCTS bot (--engine), the 1-ply searcher (default),
-    heuristic+ (--heuristic), the 2-ply deep searcher (--deep), or the bare policy (--raw)."""
+    """Build whichever generation of bot we've been asked to watch."""
     if agent == "engine":
         return EnginePlayer(
             debug=debug,
@@ -74,13 +72,13 @@ def build_agent(model, agent, debug=False):
 
 
 def save_replays(agent, opp_label):
-    """Write each battle the agent just played to an .html replay and report the result."""
+    """Save every game just played as a replay file, and say how they went."""
     os.makedirs(REPLAY_DIR, exist_ok=True)
     wins = 0
     for i, (tag, battle) in enumerate(agent.battles.items(), start=1):
         result = "WON " if battle.won else "lost"
         wins += 1 if battle.won else 0
-        # tag is like "battle-gen9randombattle-NN", already a safe filename.
+        # The battle tag is already a perfectly good filename.
         path = os.path.join(REPLAY_DIR, f"{tag}.html")
         agent.save_replay(tag, path)
         print(f"  Battle {i}: {result} in {battle.turn} turns  ->  {path}", flush=True)
@@ -89,29 +87,29 @@ def save_replays(agent, opp_label):
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Watch the trained agent play a battle.")
-    parser.add_argument("--battles", type=int, default=1, help="how many battles to play")
+    parser = argparse.ArgumentParser(description="Watch one of the bots play a game.")
+    parser.add_argument("--battles", type=int, default=1, help="how many games to play")
     parser.add_argument("--opponent", choices=OPPONENTS, default="heuristic",
                         help="who to play against")
     parser.add_argument("--raw", action="store_true",
-                        help="use the bare policy instead of the 1-ply search wrapper")
+                        help="just the trained network, with no searching on top")
     parser.add_argument("--heuristic", action="store_true",
-                        help="use heuristic+ (SearchPlayer + status/setup/hazard/recovery)")
+                        help="the one-turn searcher plus status, setup, hazards and healing")
     parser.add_argument("--deep", action="store_true",
-                        help="use the 2-ply deep searcher (deep_search.py)")
+                        help="the two-turn searcher")
     parser.add_argument("--engine", action="store_true",
-                        help="use the poke-engine MCTS bot (engine_search.py)")
+                        help="the real engine bot")
     parser.add_argument("--debug", action="store_true",
-                        help="(engine/heuristic/deep only) print the top scored actions each turn")
+                        help="print the top-scoring options each turn")
     parser.add_argument("--model", default=None,
-                        help="model .zip to load (default: best available, see eval_search)")
+                        help="a specific saved model to load")
     args = parser.parse_args()
 
     which = ("engine" if args.engine else "deep" if args.deep else "heuristic" if args.heuristic
              else "raw" if args.raw else "search")
     labels = {"engine": "poke-engine MCTS bot", "deep": "2-ply deep searcher",
               "heuristic": "heuristic+ agent", "raw": "raw policy", "search": "search agent"}
-    # The engine agent is model-free; the others load a trained policy.
+    # The engine bot needs no trained network; everything else does.
     model = None
     if which != "engine":
         model_path = args.model or pick_model_path()

@@ -1,13 +1,12 @@
-"""Phase 1 (v2) training: structured observation + team-attention network, vs the heuristic.
+"""Training for the attention experiment.
 
-Ties the v2 pieces together:
-  - rl_env_v2.ShowdownTeamEnv      : the 854-feature observation + win-weighted reward
-  - team_net.TeamAttentionExtractor: per-Pokemon encoder + self-attention (with padding mask)
-  - MaskablePPO                    : only picks legal actions
+Bolts the three pieces together: the structured observation, the attention network that
+reads it, and the usual learning algorithm.
 
-Benchmarked vs SimpleHeuristicsPlayer to compare against the flat-MLP baseline (~41%).
+Measured against the same fixed opponent as everything else, so it can be compared directly
+with the plain network that reached about 41%.
 
-Prereq: local Showdown server running (see README). Then:
+Needs the local server running. Then:
     python -u train_v2.py
 """
 
@@ -27,11 +26,10 @@ from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
 from rl_env_v2 import ShowdownTeamEnv, N_FEATURES
 from team_net import TeamAttentionExtractor
 
-# Diagnostic toggle. When False, the 854-feature obs goes through SB3's default extractor
-# (v1's architecture, which reached 41%) instead of the attention net, to isolate the v2
-# regression: if win rate / explained_variance climb with this off, the attention net is the
-# culprit; if they still stall, the 854 obs is. Separate model file + tb run so it never
-# clobbers the attn model.
+# A switch for working out what went wrong. This experiment changed two things at once: the
+# observation and the network. Turning this off feeds the new observation through the old
+# plain network, which separates them. If it improves, the attention network is the problem.
+# If it still stalls, the observation is. Saves under its own name so the two don't collide.
 USE_ATTENTION = False
 
 BATTLE_FORMAT = "gen9randombattle"
@@ -67,7 +65,7 @@ def build_env():
 
 
 def win_rate(model, env, inner, n_battles):
-    """Play n_battles with the model and return the fraction it won."""
+    """Play a batch of games and report how many the agent won."""
     wins = 0
     for _ in range(n_battles):
         obs, _ = env.reset()
@@ -83,7 +81,7 @@ def win_rate(model, env, inner, n_battles):
 
 
 class WinRateCallback(BaseCallback):
-    """Every eval_freq steps, play some battles and log win rate to TensorBoard."""
+    """Every so often, stop and play some games to see how the agent is doing."""
 
     def __init__(self, eval_env, eval_inner, n_battles, eval_freq, verbose=1):
         super().__init__(verbose)
@@ -102,7 +100,7 @@ class WinRateCallback(BaseCallback):
 
 
 class SaveCallback(BaseCallback):
-    """Save the model every save_freq steps so an interrupt keeps progress."""
+    """Save periodically, so an interrupted run doesn't lose everything."""
 
     def __init__(self, path, save_freq, verbose=1):
         super().__init__(verbose)
@@ -121,8 +119,8 @@ def main():
     env, inner = build_env()
     eval_env, eval_inner = build_env()
 
-    # Plug in the attention net as the feature extractor, unless the diagnostic is on
-    # (USE_ATTENTION=False), which uses SB3's default extractor -- v1's architecture on the v2 obs.
+    # Use the attention network, unless we're running the comparison, in which case fall
+    # back to the plain one.
     if USE_ATTENTION:
         policy_kwargs = dict(
             features_extractor_class=TeamAttentionExtractor,
@@ -137,7 +135,7 @@ def main():
         print(f"Found {MODEL_PATH} -> CONTINUING.", flush=True)
         model = MaskablePPO.load(MODEL_PATH, env=env, tensorboard_log=TB_DIR)
     else:
-        kind = "attention net" if USE_ATTENTION else "PLAIN MLP (diagnostic)"
+        kind = "attention net" if USE_ATTENTION else "plain network (for comparison)"
         print(f"Starting a FRESH v2 agent ({kind}, {N_FEATURES} features).", flush=True)
         model = MaskablePPO(
             "MultiInputPolicy", env, verbose=1, ent_coef=0.01,
@@ -165,7 +163,7 @@ def main():
     print("\n=== Win rate vs SimpleHeuristicsPlayer AFTER this run ===", flush=True)
     after = win_rate(model, env, inner, EVAL_BATTLES)
     print(f"After: {after:.0%}", flush=True)
-    print(f"\nResult vs heuristic: {before:.0%} -> {after:.0%}  (flat-MLP baseline was ~41%)", flush=True)
+    print(f"\nResult vs heuristic: {before:.0%} -> {after:.0%}  (the plain network got ~41%)", flush=True)
     env.close()
     eval_env.close()
 

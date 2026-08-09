@@ -1,23 +1,21 @@
-r"""Phase 2: self-play. Train the agent against periodically-refreshed copies of itself.
+r"""Train the agent against copies of itself.
 
-Against a single fixed opponent (the heuristic) the agent plateaued near 40%: once it has the
-opponent figured out, there's nothing left to learn. Self-play gives it a moving target that
-gets stronger as it does, which pushes past a fixed opponent's ceiling.
+Against one fixed opponent the agent stalled around 40%. Once it has that opponent figured
+out there's nothing left to learn. Self-play gives it a target that gets better as it does,
+which in theory pushes past that ceiling.
 
-The opponent (opponent.ModelPlayer) runs a snapshot of the agent's network. Every REFRESH_FREQ
-steps we copy the learner's weights in, so it lags slightly behind and stays a stable rising
-target -- training against the exact live policy tends to oscillate.
+The opponent runs a snapshot of the agent's own network, refreshed every so often. Keeping
+it slightly behind the live version is deliberate: training against your exact current self
+tends to oscillate rather than improve.
 
-Curriculum:
-  Phase A: leave VICTORY_VALUE at 100 and train. Learn the mirror match on the normal reward.
-  Phase B: raise VICTORY_VALUE (e.g. 200) and re-run. The script resumes the saved model, so
-           it keeps its skills but now values closing games over even trades. Only the one
-           constant below changes between phases.
+Meant to be run in two passes. First with the normal win bonus, to learn the mirror match.
+Then again with it raised, so the agent starts valuing closing games out over trading
+evenly. Only the one constant below changes between the two.
 
-Still benchmarks vs SimpleHeuristicsPlayer every EVAL_FREQ steps so progress stays comparable
-to the earlier runs (~41% baseline).
+It still measures itself against the fixed heuristic opponent throughout, so the numbers
+stay comparable to the earlier runs.
 
-Run from the project root, with the local Showdown server running:
+Run from the project root, with the local server going:
     python -u src\train_selfplay.py
 """
 
@@ -34,26 +32,25 @@ from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
 
 from rl_env import ShowdownSinglesEnv, N_FEATURES
 from opponent import ModelPlayer
-# Reuse the generic benchmarking + saving helpers from the main trainer.
+# Borrow the benchmarking and saving machinery from the main trainer.
 from train_rl import win_rate, WinRateCallback, SaveCallback, mask_fn
 
 BATTLE_FORMAT = "gen9randombattle"
 
-# The one curriculum knob. Phase A: 100. Phase B: raise it (e.g. 200) and re-run.
+# The one thing that changes between the two passes. Start at 100, then raise it.
 VICTORY_VALUE = 100.0
 
 TRAIN_STEPS = 100_000
-REFRESH_FREQ = 50_000     # how often to copy the learner's weights into the opponent
-EVAL_FREQ = 10_000        # how often to benchmark vs the heuristic (live graph)
-EVAL_BATTLES = 200         # battles for the before/after benchmark
-LIVE_EVAL_BATTLES = 50    # battles per live benchmark point
+REFRESH_FREQ = 50_000     # how often the opponent catches up with the learner
+EVAL_FREQ = 10_000        # how often to check ourselves against the heuristic
+EVAL_BATTLES = 200        # games in the before-and-after comparison
+LIVE_EVAL_BATTLES = 50    # games per point on the live graph
 SAVE_FREQ = 100_000
 TB_DIR = "tb_logs"
 
-# Files live in the project root (paths relative to where you run from).
 MODEL_PATH = f"ppo_selfplay_obs{N_FEATURES}.zip"
-WARM_START_PATH = f"ppo_vs_heuristic_obs{N_FEATURES}.zip"  # the heuristic-trained agent
-SNAPSHOT_PATH = "ppo_selfplay_snapshot.zip"               # scratch file to seed the opponent
+WARM_START_PATH = f"ppo_vs_heuristic_obs{N_FEATURES}.zip"  # what to start from
+SNAPSHOT_PATH = "ppo_selfplay_snapshot.zip"               # scratch file for the opponent
 
 
 def make_self_opponent():
@@ -74,7 +71,7 @@ def build_train_env(opponent):
 
 
 def build_eval_env():
-    """A separate env that plays the heuristic, for the honest benchmark."""
+    """A separate game against the fixed heuristic, which is the honest measurement."""
     showdown = ShowdownSinglesEnv(
         battle_format=BATTLE_FORMAT, strict=False, log_level=logging.ERROR,
     )
@@ -87,7 +84,7 @@ def build_eval_env():
 
 
 class SnapshotCallback(BaseCallback):
-    """Every refresh_freq steps, copy the learner's weights into the self-play opponent."""
+    """Periodically bring the self-play opponent up to date with the learner."""
 
     def __init__(self, opponent, refresh_freq, verbose=1):
         super().__init__(verbose)
@@ -107,8 +104,8 @@ def main():
     env, inner = build_train_env(opponent)
     eval_env, eval_inner = build_eval_env()
 
-    # Starting weights: a saved self-play agent (continue), else the heuristic-trained agent
-    # (warm start), else fresh.
+    # Pick up where we left off if possible, otherwise start from the heuristic-trained
+    # agent, otherwise from nothing.
     resuming = os.path.exists(MODEL_PATH)
     start_path = MODEL_PATH if resuming else (WARM_START_PATH if os.path.exists(WARM_START_PATH) else None)
     if start_path:
@@ -121,7 +118,7 @@ def main():
             "MultiInputPolicy", env, verbose=1, ent_coef=0.01, tensorboard_log=TB_DIR,
         )
 
-    # Seed the opponent with a copy of the learner so it starts as an equal mirror.
+    # Give the opponent a copy of the learner, so it starts out as an exact mirror.
     model.save(SNAPSHOT_PATH)
     opponent.model = MaskablePPO.load(SNAPSHOT_PATH)
 
