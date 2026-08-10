@@ -24,9 +24,12 @@ Every game is archived to replays/ladder/ as <result>-<tag>.html plus a .trace.j
 search's per-turn reasoning. Covers Ctrl-C and crashes too -- the battle room is gone once
 the process exits, so anything unwritten is lost.
 
-Those are local. The first N games of each run are ALSO published to
-replay.pokemonshowdown.com via /savereplay (--upload-first N, 0 to disable). Those links
-are PUBLIC.
+Those are local and always written. Hosted, shareable replays on
+replay.pokemonshowdown.com are OFF by default and opt-in per run:
+
+    python -u src\ladder.py --upload-first        # first 5 games, PUBLIC links
+    python -u src\ladder.py --upload-first 20     # first 20
+
 """
 
 import argparse
@@ -57,9 +60,13 @@ if FORK_MODE:
     os.environ.setdefault("LAPLACE_UCT_C2", "0.1")
 
 from poke_env import AccountConfiguration, ShowdownServerConfiguration
+# poke_env drives its websocket from POKE_LOOP, a loop running in its own thread; this is
+# the hop every public Player method takes to get onto it. See request_upload().
+from poke_env.concurrency import handle_threaded_coroutines
 
 from engine_search import EnginePlayer
 
+# Checks if fork actually loaded
 if FORK_MODE:
     import poke_engine
     if not hasattr(poke_engine, "featurize_state"):
@@ -76,8 +83,10 @@ SPECTATE_URL = "https://play.pokemonshowdown.com/"   # + battle room id = watcha
 REPLAY_DIR = os.path.join(_ROOT, "replays", "ladder")
 
 # Showdown-hosted (shareable) replays, uploaded via /savereplay. See request_upload().
+# OFF unless --upload-first is passed: the links are public, so publishing is a deliberate
+# act, not a side effect of laddering. UPLOAD_FIRST_N is what a bare --upload-first means.
 REPLAY_UPLOAD_URL = "https://replay.pokemonshowdown.com/"
-UPLOAD_FIRST_N = 5          # per run; --upload-first overrides
+UPLOAD_FIRST_N = 5
 
 # .env lives in the project root, one level up from src/.
 _ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
@@ -116,11 +125,6 @@ def build_agent(account, fork=False, cls=EnginePlayer, **extra):
     # worse moves -- Freezing Glare over Hurricane x4 into a +6 Calm Mind sweep, every pick
     # inside the 0.26 margin. The net keeps its A/B-supported base tie-break authority
     # (value_margin=11). Re-widen only after a retrain earns it.
-    #
-    # robust_vote=False + mix_frac 0.9 is the FP recipe: plain share averaging plus a mixed
-    # strategy in a wide window. vs Foul Play 57% (17-13) against 28.3% (17-43) for robust
-    # argmax; mirror gate 47.5%/120. The small mirror tax buys unexploitability the mirror
-    # structurally can't price -- humans switch immunity absorbers into deterministic clicks.
     #
     # Fork mode spends 600ms/world vs 150 stock: informed search converts time into strength
     # where the stock eval provably can't (budget falsified twice for stock; fork600 vs
@@ -190,11 +194,22 @@ async def request_upload(agent, tag):
     poke_env sends '/leave' the moment a battle ends (player.py), so saving on the
     'finished' poll races the room teardown; and once a battle has been saved once, the
     server re-uploads the COMPLETE log automatically at game end (room-battle.ts), silently
-    overwriting the partial. Saving early is both the safe order and the complete one."""
+    overwriting the partial. Saving early is both the safe order and the complete one.
+
+    MUST go through handle_threaded_coroutines. The websocket belongs to poke_env's
+    POKE_LOOP, which runs in ITS OWN THREAD; our callers (report_progress here,
+    announce in analyze_battle) are tasks on the main asyncio.run loop. Awaiting
+    ps_client.send_message directly therefore drove websocket.send from the wrong thread,
+    writing into the SSL transport concurrently with POKE_LOOP's own writes. That corrupts
+    sslproto's _write_backlog deque -- 'IndexError: deque index out of range' out of
+    _do_write, then 'no close frame received or sent' as the connection dies and the whole
+    run ends mid-battle. Hopping onto POKE_LOOP serialises this send with every other one."""
     try:
-        await agent.ps_client.send_message("/savereplay", room=tag)
+        await handle_threaded_coroutines(
+            agent.ps_client.send_message("/savereplay", room=tag), agent.ps_client.loop)
         print(f"    /savereplay sent -> {replay_url(tag)}", flush=True)
     except Exception as exc:
+        # Never fatal: the local .html archive is written either way.
         print(f"    WARNING: /savereplay failed for {tag}: {exc!r}", flush=True)
 
 
@@ -258,7 +273,7 @@ def sweep_replays(agent, saved, warned):
     return n
 
 
-async def report_progress(agent, total, saved, warned, upload_first=UPLOAD_FIRST_N, poll=3.0):
+async def report_progress(agent, total, saved, warned, upload_first=0, poll=3.0):
     """Print queue/start/finish updates while the play coroutine runs alongside.
 
     Polls agent.battles rather than hooking events: it grows as games start, and each
@@ -271,7 +286,8 @@ async def report_progress(agent, total, saved, warned, upload_first=UPLOAD_FIRST
                 announced_search = False
                 print(f"  Battle {len(started)}/{total} started  ->  watch: {SPECTATE_URL}{tag}",
                       flush=True)
-                # First N games of the run also get a hosted, shareable replay.
+                # Opt-in only (--upload-first): the first N games of the run also get a
+                # hosted, shareable replay.
                 if len(started) <= upload_first:
                     await request_upload(agent, tag)
             if battle.finished and tag not in finished:
@@ -298,10 +314,12 @@ async def main():
     parser.add_argument("--opponent", default=None, help="username to challenge (challenge mode)")
     parser.add_argument("--username", default=os.environ.get("SHOWDOWN_USERNAME"))
     parser.add_argument("--password", default=os.environ.get("SHOWDOWN_PASSWORD"))
-    parser.add_argument("--upload-first", type=int, default=UPLOAD_FIRST_N, metavar="N",
+    parser.add_argument("--upload-first", type=int, nargs="?", const=UPLOAD_FIRST_N,
+                        default=0, metavar="N",
                         help=f"publish the first N games as hosted Showdown replays via "
-                             f"/savereplay (default {UPLOAD_FIRST_N}, 0 = none). Every game "
-                             f"is archived locally regardless.")
+                             f"/savereplay -- PUBLIC links. Off unless passed; bare "
+                             f"--upload-first means {UPLOAD_FIRST_N}. Every game is archived "
+                             f"locally to replays/ladder either way.")
     parser.add_argument("--fork", action="store_true",
                         help="run the Phase-2 fork engine (net-at-leaf, 600ms/world); "
                              "handled at import time, this flag just documents it")
@@ -338,7 +356,7 @@ async def main():
 
     print(f"Replays -> {REPLAY_DIR}", flush=True)
     if args.upload_first > 0:
-        print(f"  first {args.upload_first} game(s) also published to "
+        print(f"  first {args.upload_first} game(s) ALSO published as public replays on "
               f"{REPLAY_UPLOAD_URL}", flush=True)
         # The popup is the only confirmation Showdown sends, and poke_env logs it at
         # WARNING. If something raised the client's level above that we'd never see it, so

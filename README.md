@@ -150,10 +150,11 @@ flushed on exit (an interrupted game is saved as `unfinished-…`), and a replay
 be written prints a warning instead of failing silently. Open the `.html` in a browser to
 watch the game back.
 
-The first 5 games of each run are additionally published as hosted replays on
-`replay.pokemonshowdown.com` (`/savereplay`), and the shareable link is printed as each one
-starts — handy for sharing a game without shipping an HTML file. Use `--upload-first N` to
-change the count, `--upload-first 0` to publish nothing. Note these links are **public**.
+Games can additionally be published as hosted replays on `replay.pokemonshowdown.com`
+(`/savereplay`), with the shareable link printed as each one starts — handy for sharing a
+game without shipping an HTML file. These links are **public**, so it's opt-in per run:
+`--upload-first` publishes the first 5 games, `--upload-first N` the first N. Off by
+default; the local archive above is written either way.
 
 ### Watching a game being played
 
