@@ -334,25 +334,99 @@ def _guess_item(set_dict, ability_id):
 _CHOICE_ITEMS = ("choiceband", "choicespecs", "choicescarf")
 
 
-def _moves_from_objs(move_objs, limit=4):
+_MAX_PP = {}
+
+
+def _max_pp(move_id):
+    """Randbats-legal max PP for a move id (PP Ups included), cached.
+
+    Everything unrevealed used to be handed to the engine as a flat pp=16, which is wrong
+    in both directions and wrong in the direction that matters: Recover / Roost / Soft-Boiled
+    cap at 8, so a flat 16 tells the search a staller can heal twice as many times as it
+    can. Losses in this project average ~30 turns, which is exactly the length where that
+    starts deciding games."""
+    pp = _MAX_PP.get(move_id)
+    if pp is None:
+        try:
+            from poke_env.battle.move import Move
+            pp = int(Move(move_id, gen=GEN).max_pp)
+        except Exception:
+            pp = 16          # unknown move id: the old default, no worse than before
+        _MAX_PP[move_id] = pp
+    return pp
+
+
+def _moves_from_objs(move_objs, limit=4, disabled_ids=()):
+    """PEMove list from poke-env Move objects, keeping their real remaining PP.
+
+    `pp if pp else 16` was the old expression, which turned a move with ZERO PP left into a
+    full one -- the one case where PP actually changes the decision. `is None` is the test.
+
+    disabled_ids marks moves that are legal to own but not selectable right now (Choice
+    lock, Taunt, Disable, Encore). See _our_side for why they belong in the list at all."""
     pem = []
     for mv in list(move_objs)[:limit]:
         pp = getattr(mv, "current_pp", None)
-        pem.append(PEMove(id=mv.id, pp=int(pp) if pp else 16, disabled=False))
+        pem.append(PEMove(id=mv.id, pp=int(pp) if pp is not None else _max_pp(mv.id),
+                          disabled=mv.id in disabled_ids))
     while len(pem) < 4:
         pem.append(PEMove(id="none", pp=0, disabled=True))
     return pem
 
 
-def _moves_from_ids(move_ids, limit=4, only_enabled=None):
+def _moves_from_ids(move_ids, limit=4, only_enabled=None, pp_by_id=None):
     """PEMove list. only_enabled disables every other move -- that's how a Choice lock is
     encoded. poke-engine does NOT derive the lock from item + last_used_move (verified
-    empirically), but it does respect the disabled flag, so we set it ourselves."""
-    pem = [PEMove(id=mid, pp=16, disabled=(only_enabled is not None and mid != only_enabled))
+    empirically), but it does respect the disabled flag, so we set it ourselves.
+
+    pp_by_id supplies observed remaining PP for moves the opponent has actually revealed;
+    anything else falls back to the move's real maximum rather than a flat 16."""
+    pp_by_id = pp_by_id or {}
+    pem = [PEMove(id=mid, pp=int(pp_by_id.get(mid, _max_pp(mid))),
+                  disabled=(only_enabled is not None and mid != only_enabled))
            for mid in list(move_ids)[:limit]]
     while len(pem) < 4:
         pem.append(PEMove(id="none", pp=0, disabled=True))
     return pem
+
+
+def _observed_pp(mon):
+    """{move_id: remaining PP} for the moves this opponent has actually shown us.
+
+    poke-env creates the Move on reveal at full PP and decrements it on every observed use
+    (Move.use, including the Pressure double-decrement), so for a revealed move this is
+    exact -- a use IS the reveal, so there are no uses it could have missed."""
+    out = {}
+    for mid, mv in (getattr(mon, "moves", None) or {}).items():
+        pp = getattr(mv, "current_pp", None)
+        if pp is not None:
+            out[mid] = int(pp)
+    return out
+
+
+def _sleep_turns(mon):
+    """Turns this Pokemon has already spent asleep, clamped to the engine's range.
+
+    poke-env counts this in Pokemon.status_counter (incremented from moved() and
+    cant_move(), reset on switch-out -- the same reset the engine does). Left at the
+    default 0 the engine gives a sleeping Pokemon a 0% chance of waking THIS turn, then
+    33% / 50% / 100% on the plies after, so a mon that has already slept two turns is
+    modelled as one that just fell asleep and the guaranteed wake-up at 3 is never seen.
+    Measured on the shipped stock build, not inferred from the fork's source."""
+    if mon is None or mon.status is None or mon.status.name != "SLP":
+        return 0
+    return max(0, min(3, int(getattr(mon, "status_counter", 0) or 0)))
+
+
+def _toxic_count(mon):
+    """Turns of Toxic already accumulated, for SideConditions.toxic_count.
+
+    The engine deals (1/16)*toxic_count + 1/16 per turn, so leaving this at 0 re-models a
+    badly-poisoned Pokemon as freshly poisoned on every single search. Measured on the
+    stock build: a 300 HP mon loses 18 HP at count 0 and 150 at count 7."""
+    if mon is None or mon.status is None or mon.status.name != "TOX":
+        return 0
+    return max(0, min(15, int(getattr(mon, "status_counter", 0) or 0)))
 
 
 def _last_used_str(mon, pe_moves):
@@ -382,7 +456,7 @@ def _own_pokemon(mon, moves_override=None):
         attack=_stat(mon, "atk", True), defense=_stat(mon, "def", True),
         special_attack=_stat(mon, "spa", True), special_defense=_stat(mon, "spd", True),
         speed=_stat(mon, "spe", True),
-        status=_status_str(mon), moves=moves,
+        status=_status_str(mon), moves=moves, sleep_turns=_sleep_turns(mon),
         tera_type=tera, terastallized=bool(getattr(mon, "is_terastallized", False)),
     )
 
@@ -509,7 +583,9 @@ def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None, speed
                 special_attack=_stat(mon, "spa", False),
                 special_defense=_stat(mon, "spd", False),
                 speed=_stat(mon, "spe", False),
-                status=_status_str(mon), moves=_moves_from_ids(move_ids, only_enabled=locked),
+                status=_status_str(mon), sleep_turns=_sleep_turns(mon),
+                moves=_moves_from_ids(move_ids, only_enabled=locked,
+                                      pp_by_id=_observed_pp(mon)),
                 tera_type=tera, terastallized=bool(getattr(mon, "is_terastallized", False)),
             )
 
@@ -559,7 +635,8 @@ def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None, speed
         attack=_stat(mon, "atk", False), defense=_stat(mon, "def", False),
         special_attack=_stat(mon, "spa", False), special_defense=_stat(mon, "spd", False),
         speed=_stat(mon, "spe", False),
-        status=_status_str(mon), moves=_moves_from_ids(move_ids, only_enabled=locked),
+        status=_status_str(mon), sleep_turns=_sleep_turns(mon),
+        moves=_moves_from_ids(move_ids, only_enabled=locked, pp_by_id=_observed_pp(mon)),
         tera_type=tera, terastallized=bool(getattr(mon, "is_terastallized", False)),
     )
 
@@ -649,7 +726,7 @@ def _remaining(start_turn, now, base, extended):
     return max(1, left)
 
 
-def _side_conditions(sc, now, protect=0):
+def _side_conditions(sc, now, protect=0, toxic_count=0):
     """poke-env side_conditions -> engine SideConditions.
 
     Hazards carry layer counts. Timed conditions (screens/tailwind) carry real
@@ -658,7 +735,11 @@ def _side_conditions(sc, now, protect=0):
 
     `protect` is the active's consecutive-protect count (mon.protect_counter). The engine
     cubes the failure odds per consecutive use (verified 100%/33%/11%) but only if told,
-    and we always passed 0 -- 7 failed Protects mined in one 30-game run."""
+    and we always passed 0 -- 7 failed Protects mined in one 30-game run.
+
+    `toxic_count` is the same class of omission and the larger one -- see _toxic_count. The
+    engine keeps it per SIDE (it resets on switch-out), so it belongs here rather than on
+    the Pokemon, and it is the ACTIVE's counter that matters."""
     layers = {}
     starts = {}
     for cond, value in sc.items():
@@ -683,6 +764,7 @@ def _side_conditions(sc, now, protect=0):
         safeguard=timed("SAFEGUARD", 5),
         mist=timed("MIST", 5),
         protect=max(0, int(protect)),
+        toxic_count=int(toxic_count),
     )
 
 
@@ -750,9 +832,41 @@ def _delayed(pending, side, now):
     return wish, fs
 
 
+def _active_own_moves(battle, active):
+    """Our active's FULL move list, with the currently-unselectable ones flagged disabled.
+
+    This used to be _moves_from_objs(battle.available_moves), and available_moves is what
+    the SERVER will accept this turn -- it has already dropped everything a Choice lock,
+    Taunt, Disable, Encore or Torment forbids. Padding the rest away as 'none' does not
+    just restrict this turn's root, it deletes those moves from the position for every ply
+    of the search: a Choice-locked Pokemon is modelled as a one-move Pokemon forever.
+
+    The engine already gives us the right primitive, and the adapter already uses it for
+    the opponent's Choice locks. Verified on the shipped stock build: a Pokemon with three
+    disabled moves offers only the enabled one at the root, and gets all four back after
+    switching out and in. So this encoding restricts the current turn exactly as before
+    while letting the search see what pivoting out actually buys -- which is the whole
+    reason a human pivots out of a bad lock.
+
+    Falls back to leaving everything enabled when the mask would disable every move
+    (force-switch turns, where available_moves is empty, and Struggle, which is not one of
+    the mon's own moves) -- a Pokemon with four dead moves is a worse model than the one
+    this replaces."""
+    known = list(active.moves.values()) if active is not None else []
+    enabled = {mv.id for mv in battle.available_moves}
+    if not known:
+        return _moves_from_objs(battle.available_moves)
+    if not any(mv.id in enabled for mv in known):
+        return _moves_from_objs(known)
+    # Keep the selectable ones if truncation to 4 has to drop something.
+    known.sort(key=lambda mv: mv.id not in enabled)
+    return _moves_from_objs(known, disabled_ids={mv.id for mv in known
+                                                 if mv.id not in enabled})
+
+
 def _our_side(battle, pending=None):
     active = battle.active_pokemon
-    active_moves = _moves_from_objs(battle.available_moves)
+    active_moves = _active_own_moves(battle, active)
     active_pe = _own_pokemon(active, moves_override=active_moves)
     bench = [m for m in battle.team.values() if m is not active]
     pkmn = [active_pe] + [_own_pokemon(m) for m in bench]
@@ -764,7 +878,8 @@ def _our_side(battle, pending=None):
     return Side(
         pokemon=pkmn[:6],
         side_conditions=_side_conditions(battle.side_conditions, battle.turn,
-                                         protect=getattr(active, "protect_counter", 0)),
+                                         protect=getattr(active, "protect_counter", 0),
+                                         toxic_count=_toxic_count(active)),
         active_index="0", volatile_status_durations=durations,
         wish=wish, future_sight=fs, volatile_statuses=_volatile_set(active) | dur_vols,
         substitute_health=_sub_health(active, _maxhp(active, own=True)),
@@ -805,7 +920,8 @@ def _opp_side(battle, use_stats=True, opp_used_since_switch=None, opp_speed_hint
     return Side(
         pokemon=pkmn[:6],
         side_conditions=_side_conditions(battle.opponent_side_conditions, battle.turn,
-                                         protect=getattr(active, "protect_counter", 0)),
+                                         protect=getattr(active, "protect_counter", 0),
+                                         toxic_count=_toxic_count(active)),
         active_index="0", volatile_status_durations=durations,
         wish=wish, future_sight=fs, volatile_statuses=_volatile_set(active) | dur_vols,
         substitute_health=_sub_health(active, _maxhp(active, own=False)),

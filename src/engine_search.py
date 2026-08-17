@@ -517,7 +517,8 @@ class EnginePlayer(Player):
                         self._log(battle, pooled, choice)
                     if self.record:
                         self._record(battle, pooled, choice, fallback=False, mixed=mixed,
-                                     reorders=reorders)
+                                     reorders=reorders,
+                                     ms=(time.perf_counter() - t_turn) * 1000)
                     self._emit("decision", battle=battle, choice=choice, ranked=ranked,
                                mixed=mixed, reorders=list(reorders), fallback=False,
                                ms=(time.perf_counter() - t_turn) * 1000)
@@ -1110,8 +1111,14 @@ class EnginePlayer(Player):
                              if not c.startswith("switch ") and dmg(c) <= 0.0}
         return tied + ranked[len(tied):]
 
-    def _record(self, battle, pooled, choice, fallback, mixed=False, reorders=None):
-        """Per-turn decision snapshot for post-hoc loss analysis (record=True)."""
+    def _record(self, battle, pooled, choice, fallback, mixed=False, reorders=None, ms=None):
+        """Per-turn decision snapshot for post-hoc loss analysis (record=True).
+
+        opp_boosts and ms are here so mining doesn't have to re-parse the replay HTML and
+        re-join it to this file on turn number: the setup-pressure metrics (mine_losses
+        boost_pressure / mechanism counters) are the ones that separate a cohort, and
+        deriving them needed a protocol-log join that made the loop annoying enough to
+        skip. Both are read with .get downstream, so older traces still load."""
         me, opp = battle.active_pokemon, battle.opponent_active_pokemon
         top = sorted(pooled.items(), key=lambda kv: kv[1], reverse=True)[:3]
         entry = {
@@ -1123,7 +1130,10 @@ class EnginePlayer(Player):
             "top": [(c, round(s, 2)) for c, s in top],
             "choice": choice,
             "fallback": fallback,
+            "opp_boosts": {k: v for k, v in (opp.boosts or {}).items() if v} if opp else {},
         }
+        if ms is not None:
+            entry["ms"] = round(ms, 1)
         if mixed:
             entry["mixed"] = True
         if reorders:

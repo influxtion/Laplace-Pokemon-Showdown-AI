@@ -225,6 +225,7 @@ current level, not an older one.
 | `src/knowledge.py` | Opponent set/ability prediction from Random Battle data, plus damage estimation. |
 | `src/value_features.py`, `src/train_value.py` | The learned value head: feature extraction and its trainer. |
 | `src/ladder.py` | Plays ranked games on the official ladder (the shipped config lives here). |
+| `src/ladder_old.py` | Plays ranked games on the official ladder with an older model. |
 | `src/analyze_battle.py`, `src/live_analysis.py` | One ladder game, narrated live: the play-by-play plus the search's candidates, guards, hidden-set guesses and eval, then a post-game report. |
 | `src/eval_engine.py` | Fast benchmark vs the built-in heuristic. |
 | `src/gen_value_data.py`, `src/mine_losses.py` | Self-play data generation and replay-based loss analysis. |
