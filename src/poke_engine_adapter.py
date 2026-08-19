@@ -440,11 +440,50 @@ def _last_used_str(mon, pe_moves):
     return "move:none"
 
 
+_UNKNOWN_ITEM = "unknown_item"
+
+
+def _resolve_item(state, known, sampled):
+    """Revealed item / empty slot / this world's sample, in that order."""
+    if state == "known":
+        return known
+    return "none" if state == "gone" else sampled
+
+
+def _item_evidence(mon):
+    """('known', id) / ('gone', None) / ('unknown', None) for a Pokemon's item slot.
+
+    poke-env packs three states into one attribute, and this file previously read TWO of
+    them backwards:
+
+      'unknown_item'  never revealed -- but TRUTHY, so `to_id_str(mon.item) if mon.item`
+                      took it as KNOWN and handed poke-engine the literal id 'unknownitem'.
+                      Measured against the shipping engine, 'unknownitem' scores exactly
+                      like 'none' (Life Orb 1.29x damage, Choice Specs 1.49x, both
+                      'none' and 'unknownitem' 1.00x), so the entire opponent item model --
+                      Choice boosts, Life Orb, Leftovers, Assault Vest, Boots, Booster
+                      Energy -- was inert for every unrevealed item, which is most of them.
+                      It also silently disabled the Choice Scarf verdict, whose
+                      precondition is `not mon.item`.
+      None            end_item() ran: Knock Off, an eaten berry, a spent Booster Energy.
+                      The slot is EMPTY -- and the old code, reading None as falsy, sampled
+                      it a brand new item.
+      anything else   genuinely revealed.
+    """
+    it = getattr(mon, "item", None)
+    if it == _UNKNOWN_ITEM:
+        return "unknown", None
+    if not it:
+        return "gone", None
+    return "known", to_id_str(it)
+
+
 def _own_pokemon(mon, moves_override=None):
     """Engine Pokemon for our side -- everything known, nothing sampled."""
     maxhp = _maxhp(mon, own=True)
     moves = moves_override if moves_override is not None else _moves_from_objs(mon.moves.values())
-    item = to_id_str(mon.item) if mon.item else "none"
+    _st, _known = _item_evidence(mon)
+    item = _known if _st == "known" else "none"   # our own slot is never a guess
     ability = to_id_str(mon.ability) if mon.ability else "none"
     tera = mon.tera_type.name.lower() if getattr(mon, "tera_type", None) else "typeless"
     return PEPokemon(
@@ -526,13 +565,16 @@ def _illusion_tell(mon):
 
 
 def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None, speed_hint=None,
-                              use_joint=False):
+                              use_joint=False, item_hint=None):
     """Engine Pokemon for a revealed opponent mon, sampling its hidden set.
 
     use_stats           -- use the real randbats item/ability/tera feed (kwarg exists to A/B it).
     used_since_switch   -- move ids used since switch-in, active only. 2+ distinct rules out
                            a Choice item; 1 move + a Choice item means locked.
     speed_hint          -- 'scarf'/'noscarf' from observed turn order; overrides item sampling.
+    item_hint           -- 'boots'/'noboots' from observed hazard damage, see
+                           engine_search._scan_item_evidence. Unlike the stats feed this is
+                           an OBSERVATION, so it wins outright.
     use_joint           -- sample a complete counted joint set instead of composing from
                            marginals. Falls through to the marginal path if no joint data."""
     zoro = _illusion_tell(mon)
@@ -546,27 +588,42 @@ def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None, speed
     sheet_id = species if species in SETS.by_species else to_id_str(mon.base_species)
     revealed = list(mon.moves.keys())
     # Two distinct moves without leaving the field => can't be Choice-locked.
+    item_state, known_item = _item_evidence(mon)
     multi_moved = bool(used_since_switch) and len(used_since_switch) >= 2
     item_exclude = _CHOICE_ITEMS if multi_moved else \
         ("choicescarf",) if speed_hint == "noscarf" else ()
+    # Hazard evidence is exact, not statistical: a mon that took Stealth Rock damage on
+    # entry is NOT holding Heavy-Duty Boots, and one that walked through rocks untouched
+    # is. Boots is the modal randbats item, so without this the sampler hands a large share
+    # of worlds a hazard immunity the opponent has already demonstrated it doesn't have --
+    # and the search then prices our own hazards at close to zero.
+    if item_hint == "noboots":
+        item_exclude = tuple(item_exclude) + ("heavydutyboots",)
 
     if use_joint:
         joint_id = species if species in JOINT.by_species else to_id_str(mon.base_species)
         js = JOINT.sample(
             joint_id, revealed_moves=revealed,
-            item=to_id_str(mon.item) if mon.item else None,
+            item=known_item,
             ability=to_id_str(mon.ability) if mon.ability else None,
             item_exclude=item_exclude,
-            force_scarf=(speed_hint == "scarf" and not mon.item and not multi_moved))
+            force_scarf=(speed_hint == "scarf" and item_state == "unknown"
+                         and not multi_moved))
         if js is not None:
             move_ids = (list(dict.fromkeys(revealed))
                         + [m for m in js["moves"] if m not in revealed])[:4]
             ability = to_id_str(mon.ability) if mon.ability else js["ability"]
             tera = (mon.tera_type.name.lower() if getattr(mon, "tera_type", None)
                     else js["tera"])
-            item = to_id_str(mon.item) if mon.item else js["item"]
-            if speed_hint == "scarf" and not mon.item and not multi_moved:
+            item = _resolve_item(item_state, known_item, js["item"])
+            if item_state == "unknown" and speed_hint == "scarf" and not multi_moved:
                 item = "choicescarf"
+            # Boots outranks the Scarf verdict when both fire: a mon cannot hold two items,
+            # and hazard evidence reads the item slot directly, while the speed verdict
+            # cannot tell a Scarf from a speed ability (see _infer_scarf) and so is the
+            # weaker claim about WHICH item is held.
+            if item_hint == "boots" and item_state == "unknown":
+                item = "heavydutyboots"
             locked = None
             last = getattr(mon, "last_move", None)
             if (last is not None and not multi_moved and last.id in move_ids
@@ -601,7 +658,8 @@ def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None, speed
         tera = (mon.tera_type.name.lower() if getattr(mon, "tera_type", None)
                 else st_tera or random.choice(s["tera"]))
         # Real item probability (Choice / Life Orb / etc.) -> correct incoming damage.
-        item = to_id_str(mon.item) if mon.item else st_item or _guess_item(s, ability)
+        item = _resolve_item(item_state, known_item,
+                             st_item or _guess_item(s, ability))
     else:
         move_ids = revealed
         ability = to_id_str(mon.ability) if mon.ability else "none"
@@ -609,13 +667,16 @@ def _opp_pokemon_determinized(mon, use_stats=True, used_since_switch=None, speed
         # typeless tera strips the mon's real typing (and immunities) in those lines.
         tera = (mon.tera_type.name.lower() if getattr(mon, "tera_type", None)
                 else _types_tuple(mon)[0])
-        item = to_id_str(mon.item) if mon.item else "heavydutyboots"
+        item = _resolve_item(item_state, known_item, "heavydutyboots")
 
     # Turn-order evidence: outsped its known raw speed -> Scarf in every world. Skipped if
     # the item is revealed, or it used 2+ moves without switching (then the speed came from
     # an ability we don't model, and a Choice item is impossible anyway).
-    if speed_hint == "scarf" and not mon.item and not multi_moved:
-        item = "choicescarf"
+    if item_state == "unknown":
+        if speed_hint == "scarf" and not multi_moved:
+            item = "choicescarf"
+        if item_hint == "boots":       # see the joint path for precedence
+            item = "heavydutyboots"
 
     # Choice lock: if this world's item is a Choice item (or the ability is Gorilla Tactics)
     # and the mon has committed to a move since switch-in, only that move is selectable.
@@ -892,15 +953,18 @@ def _our_side(battle, pending=None):
 
 
 def _opp_side(battle, use_stats=True, opp_used_since_switch=None, opp_speed_hints=None,
-              pending=None, use_joint=False):
+              pending=None, use_joint=False, opp_item_hints=None):
     hints = opp_speed_hints or {}
+    items = opp_item_hints or {}
     active = battle.opponent_active_pokemon
     active_pe = _opp_pokemon_determinized(active, use_stats, used_since_switch=opp_used_since_switch,
                                           speed_hint=hints.get(to_id_str(active.species)),
+                                          item_hint=items.get(to_id_str(active.species)),
                                           use_joint=use_joint)
     bench = [m for m in battle.opponent_team.values() if m is not active]
     pkmn = [active_pe] + [_opp_pokemon_determinized(m, use_stats,
                                                     speed_hint=hints.get(to_id_str(m.species)),
+                                                    item_hint=items.get(to_id_str(m.species)),
                                                     use_joint=use_joint)
                           for m in bench]
 
@@ -959,7 +1023,7 @@ def _trick_room(battle):
 
 
 def build_state(battle, use_stats=True, opp_used_since_switch=None, opp_speed_hints=None,
-                pending=None, use_joint=False):
+                pending=None, use_joint=False, opp_item_hints=None):
     """A determinized State for the current position. Call repeatedly for different samples.
 
     use_stats             -- real randbats item/ability/tera feed.
@@ -968,6 +1032,8 @@ def build_state(battle, use_stats=True, opp_used_since_switch=None, opp_speed_hi
                              inference.
     opp_speed_hints       -- {species_id: 'scarf'|'noscarf'} from turn order, see
                              engine_search._infer_scarf.
+    opp_item_hints        -- {species_id: 'boots'|'noboots'} from observed hazard damage on
+                             switch-in, see engine_search._scan_item_evidence.
     pending               -- tracked Wish / Future Sight, {'p1_wish': (turn, amt), ...}.
     use_joint             -- complete counted joint sets instead of marginals."""
     weather, weather_left = _weather_str(battle)
@@ -976,7 +1042,7 @@ def build_state(battle, use_stats=True, opp_used_since_switch=None, opp_speed_hi
     return State(
         side_one=_our_side(battle, pending),
         side_two=_opp_side(battle, use_stats, opp_used_since_switch, opp_speed_hints, pending,
-                           use_joint=use_joint),
+                           use_joint=use_joint, opp_item_hints=opp_item_hints),
         weather=weather, weather_turns_remaining=weather_left,
         terrain=terrain, terrain_turns_remaining=terrain_left,
         trick_room=tr, trick_room_turns_remaining=tr_left, team_preview=False,

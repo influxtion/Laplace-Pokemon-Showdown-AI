@@ -1,8 +1,8 @@
 # Laplace, a Pokémon Showdown battle AI
 
 Laplace plays [Pokémon Showdown](https://pokemonshowdown.com/) Gen 9 Random Battle and
-reached a peak of **2137 Elo** on the live ladder, top 1% of active, ranked players, and well into
-the range where the opponents are strong humans rather than other bots. The bot achieved top 500 (#447) on the ladder.
+reached a peak of **2231 Elo** on the live ladder, top 1% of active, ranked players, and well into
+the range where the opponents are strong humans rather than other bots. The bot achieved top 150 (#135) on the ladder.
 This is almost at the level of professional players and at the top of the best human pokemon players. It received over
 200k views on social media.
 
@@ -94,7 +94,7 @@ mixed root strategy both came out of losing to it and reading its source).
 
 | Opponent | Result |
 |---|---|
-| Live Showdown ladder (humans) | peak **2137 Elo**, ~81 GXE — top 1% and top 500 in the world |
+| Live Showdown ladder (humans) | peak **2231 Elo**, ~83.3 GXE — top 1% and top 150 in the world |
 
 ## Setup
 
@@ -155,6 +155,26 @@ Games can additionally be published as hosted replays on `replay.pokemonshowdown
 game without shipping an HTML file. These links are **public**, so it's opt-in per run:
 `--upload-first` publishes the first 5 games, `--upload-first N` the first N. Off by
 default; the local archive above is written either way.
+
+A cohort is meant to be left running for hours unattended, so two more things happen on
+their own.
+
+**A run survives a dropped connection.** `poke-env` logs a disconnect and stops listening
+without ever reconnecting, which used to hang the whole run in silence — nothing reads the
+socket, so the game in progress forfeits on the timer and the remaining games never happen.
+A watchdog now spots the dead socket, archives everything that connection played, and
+resumes the rest of the run on a fresh one, keeping a single continuous game numbering and
+W/L tally. The interrupted game is reported and replaced rather than counted, so the final
+tally is always the number of games actually played to a result. `--reconnects 0` restores
+the old stop-at-the-first-drop behaviour.
+
+**Peak Elo is tracked, and a record ends the run.** Each finished game's post-game rating is
+checked against the record in `replays/ladder/elo_high.json` (currently **2227**). Beating
+it prints a `*** NEW ELO HIGH ***` line as it happens, keeps a second copy of that replay
+and its trace under `replays/ladder/records/`, and stops the run — the ladder queue is
+cancelled rather than handing a fresh peak straight back to the next opponent. If
+matchmaking wins the race and a game has already started, it is played out first; dropping
+it would forfeit, which is the opposite of the point. `--no-stop-on-record` keeps laddering.
 
 ### Watching a game being played
 

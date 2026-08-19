@@ -23,6 +23,7 @@ instrumentation, nothing read back, so moves are identical with and without one
 attached. live_analysis.LiveAnalyzer is the shipped consumer.
 """
 
+import re
 import time
 from collections import namedtuple
 from concurrent.futures import ProcessPoolExecutor
@@ -52,6 +53,39 @@ def _spe_mult(boost):
 
 _Opt = namedtuple("_Opt", "move_choice visits")
 _Res = namedtuple("_Res", "side_one side_two total_visits")
+
+
+# Every move slot in a serialised State is "<ID>;<disabled>;<pp>". This blanks the pp field.
+# Anchored on the ';true;'/';false;' pair, which only occurs in move slots (the wish /
+# future-sight tail uses '/' separators, the tera flag uses ',').
+_PP_FIELD = re.compile(r"(;(?:true|false);)\d+")
+# Side one's last_used_move ('move:none' before acting, 'move:<slot>' after). count=1 keeps
+# the OPPONENT's, which is real information -- if our move flinched theirs away, theirs
+# stays 'move:none' and that difference must survive.
+_LAST_MOVE = re.compile(r"(=move:)[a-z0-9]+")
+
+
+def _board_only(state_str):
+    """A serialised State stripped of the bookkeeping that merely records THAT we acted.
+
+    The no-op guard asks "is this move equivalent to passing?", but passing is not a legal
+    action, so the baseline it compares against is unreachable and every real move differs
+    from it in two fields regardless of what it accomplished: the PP it spent, and
+    last_used_move. Measured against the shipping engine, those two alone made a guaranteed-
+    fail full-HP Synthesis look like it did something. What's left after this is the board.
+    """
+    return _LAST_MOVE.sub(r"\g<1>", _PP_FIELD.sub(r"\g<1>0", state_str), count=1)
+
+# Moves that heal the user on the turn they resolve. poke-env's Move.heal only carries the
+# FIXED-fraction heals (Recover 0.5, Roost 0.5, ...) and reports 0.0 for every
+# weather/terrain-scaled one -- Synthesis, Moonlight, Morning Sun, Shore Up all come back
+# 0.0. Synthesis is the move that produced the 5-click full-HP loop this guard exists to
+# catch, so the id set is not optional. Union'd with mv.heal > 0 at the call site.
+_RECOVERY_MOVES = frozenset((
+    "recover", "roost", "softboiled", "slackoff", "milkdrink", "synthesis", "moonlight",
+    "morningsun", "shoreup", "strengthsap", "lifedew", "junglehealing", "healorder",
+    "rest", "swallow", "painsplit", "purify", "floralhealing",
+))
 
 
 def _search_world(state_str, time_ms, threads):
@@ -116,6 +150,11 @@ class EnginePlayer(Player):
         # spreads are fixed (85 EVs / 31 IVs / neutral), so raw speed is essentially known;
         # outsped when it shouldn't have been => Scarf (or a speed ability -- same model).
         self._opp_speed = {}
+        # battle_tag -> {species_id: "boots"|"noboots"} from entry-hazard damage, and the
+        # hazards currently on the opponent's side (tracked in protocol order, because the
+        # battle object only ever shows the end-of-payload state). See _scan_item_evidence.
+        self._opp_item = {}
+        self._opp_hazards = {}
         # battle_tag -> delayed effects. '<side>_wish' -> (lands_on_turn, amount),
         # '<side>_fs' -> hits_at_end_of_turn. Sides are 'p1'/'p2' as on the protocol.
         self._pending = {}
@@ -235,8 +274,89 @@ class EnginePlayer(Player):
             battle = self.battles.get(tag)
             if battle is not None:
                 self._scan_speed_evidence(battle, split_messages)
+                self._scan_item_evidence(battle, split_messages)
         except Exception:
             self.diag["speed_scan_err"] = self.diag.get("speed_scan_err", 0) + 1
+
+    # Abilities that ignore entry-hazard chip, so "walked through rocks untouched" says
+    # nothing about the item slot for them.
+    _HAZARD_IMMUNE_ABILITIES = frozenset(("magicguard",))
+
+    def _scan_item_evidence(self, battle, split_messages):
+        """Read Heavy-Duty Boots on or off an opponent from entry-hazard damage.
+
+        This is the one item fact the protocol hands over for free and the bot was throwing
+        away. Boots is the modal randbats item, so every world the determinizer draws for an
+        unrevealed opponent has a large chance of a hazard immunity -- which both prices our
+        own Stealth Rock at ~nothing and mis-prices their switch costs. The observation is
+        exact in the negative direction (it took rock damage, so it is not holding Boots)
+        and near-exact in the positive (rocks up, switched in, no damage => Boots, barring
+        Magic Guard).
+
+        Hazard state is tracked HERE rather than read off battle.opponent_side_conditions
+        because the battle object reflects the END of the payload: a mon that switches in
+        clean and then eats our Stealth Rock later in the same turn would otherwise look
+        like it had walked through rocks. Scanning in order keeps the timeline honest.
+        Spikes is used only for the negative -- Flying types and Levitate skip it, so
+        'no damage' there is not evidence of an item."""
+        me = battle.player_role
+        if not me:
+            return
+        opp_side = "p2" if me == "p1" else "p1"
+        hazards = self._opp_hazards.setdefault(battle.battle_tag, set())
+        verdicts = self._opp_item.setdefault(battle.battle_tag, {})
+        pending = None      # (species_id, saw_rock_damage) for a switch-in being watched
+        # slot -> species id of whatever is standing there. A |-damage| line carries only
+        # the DISPLAY name ('Keldeo'), while |switch| carries the full forme
+        # ('Keldeo-Resolute') -- which is what poke-env's mon.species, and therefore
+        # _opp_side's lookup key, actually is. Keying damage off the display name split one
+        # Pokemon into two verdicts, one of which could never be read back.
+        slot_species = {}
+
+        def close(entry):
+            species, hit = entry
+            if species in verdicts and verdicts[species] == "noboots":
+                return                       # a hard negative is never overturned
+            verdicts[species] = "noboots" if hit else "boots"
+
+        for msg in split_messages:
+            if len(msg) < 2:
+                continue
+            tag = msg[1]
+            if tag in ("-sidestart", "-sideend") and len(msg) > 3:
+                if msg[2][:2] == opp_side:
+                    haz = to_id_str(msg[3].split(":")[-1])
+                    (hazards.add if tag == "-sidestart" else hazards.discard)(haz)
+            elif tag in ("switch", "drag") and len(msg) > 3:
+                if pending is not None:
+                    close(pending); pending = None
+                species = to_id_str(msg[3].split(",")[0])
+                slot_species[msg[2][:3]] = species
+                if msg[2][:2] != opp_side or "stealthrock" not in hazards:
+                    continue
+                mon = battle.opponent_team.get(f"{opp_side}: {msg[2].split(':', 1)[-1].strip()}")
+                ability = to_id_str(getattr(mon, "ability", "") or "") if mon else ""
+                if ability in self._HAZARD_IMMUNE_ABILITIES:
+                    continue
+                pending = (species, False)
+            elif tag == "-damage" and len(msg) > 2 and msg[2][:2] == opp_side:
+                src = ""
+                for part in msg[3:]:
+                    if str(part).startswith("[from]"):
+                        src = to_id_str(str(part).replace("[from]", ""))
+                if src in ("stealthrock", "spikes"):
+                    # Hard negative, whether or not we were watching a switch-in: taking
+                    # hazard chip is only possible without Boots. Spikes counts here (the
+                    # damage happened) even though its ABSENCE proves nothing.
+                    species = slot_species.get(
+                        msg[2][:3], to_id_str(msg[2].split(":", 1)[-1].strip()))
+                    verdicts[species] = "noboots"
+                    if pending is not None and pending[0] == species:
+                        pending = None
+            elif tag in ("move", "turn", "upkeep") and pending is not None:
+                close(pending); pending = None
+        if pending is not None:
+            close(pending)
 
     def _scan_speed_evidence(self, battle, split_messages):
         """Scrape who-moved-first evidence (Scarf) and pending Wish/Future Sight out of one
@@ -357,6 +477,7 @@ class EnginePlayer(Player):
         self._worlds = []
         opp_used = self._opp_used_since_switch(battle)
         speed_hints = self._opp_speed.get(battle.battle_tag, {})
+        item_hints = self._opp_item.get(battle.battle_tag, {})
 
         n = self.N_DETERMINIZATIONS
         self._emit("search_start", worlds=n, time_ms=self.SEARCH_TIME_MS,
@@ -370,6 +491,7 @@ class EnginePlayer(Player):
                     state = build_state(battle, use_stats=self.use_stats,
                                         opp_used_since_switch=opp_used,
                                         opp_speed_hints=speed_hints,
+                                        opp_item_hints=item_hints,
                                         pending=self._pending.get(battle.battle_tag),
                                         use_joint=self.use_joint_sets)
                     fut = self._pool().submit(_search_world, state.to_string(),
@@ -399,6 +521,7 @@ class EnginePlayer(Player):
                     state = build_state(battle, use_stats=self.use_stats,
                                         opp_used_since_switch=opp_used,
                                         opp_speed_hints=speed_hints,
+                                        opp_item_hints=item_hints,
                                         pending=self._pending.get(battle.battle_tag),
                                         use_joint=self.use_joint_sets)
                     res = monte_carlo_tree_search(state, self.SEARCH_TIME_MS,
@@ -695,12 +818,24 @@ class EnginePlayer(Player):
             self.diag["value_err"] = self.diag.get("value_err", 0) + 1
             return ranked
 
+    # Worlds polled by _noop_demote before it will call a candidate a no-op (majority wins).
+    NOOP_WORLDS = 3
+
     def _successor_sig(self, state, our_choice, opp_choice):
-        """Sorted (probability, state-string) branch signature for one joint move pair."""
+        """Sorted (probability, state-string) branch signature for one joint move pair.
+
+        Successors are compared on the BOARD only (see _board_only). Measured against the
+        shipping stock engine, a guaranteed-fail full-HP Synthesis differed from the
+        do-nothing baseline in exactly two fields -- the PP it spent and last_used_move --
+        and nothing else. Those two made every PP-spending move differ from the baseline, so
+        _noop_demote could never flag the failed-recovery / redundant-hazard class it was
+        written for, both of which its own docstring cites. A full-HP Synthesis x5 loop
+        (four outright -fail) cost a rated game with the guard active and silent.
+        """
         sig = []
         for b in generate_instructions(state, our_choice, opp_choice):
             ns = state.apply_instructions(b)
-            sig.append((round(b.percentage, 1), ns.to_string()))
+            sig.append((round(b.percentage, 1), _board_only(ns.to_string())))
         return sorted(sig)
 
     def _noop_demote(self, ranked):
@@ -721,25 +856,41 @@ class EnginePlayer(Player):
         winners = [c for c, s in ranked if s >= self._win_floor][:3]
         if len(winners) < 2:
             return ranked
-        state, res = self._worlds[0]
-        opp = max(res.side_two, key=lambda o: o.visits, default=None)
-        if opp is None:
-            return ranked
-        opp_choice = self._engine_choice(opp.move_choice)
-        try:
-            baseline = self._successor_sig(state, "none", opp_choice)
-        except Exception:
-            self.diag["noop_err"] = self.diag.get("noop_err", 0) + 1
-            return ranked
-        noops = set()
-        for c in winners:
+        # Poll several worlds, not just world 0. The verdict depends on the opponent's
+        # MODAL reply, which is a per-world quantity, and one world's mode is a sample of
+        # size one; requiring a majority keeps a single unlucky determinization from
+        # vetoing a confident argmax at any score gap.
+        votes = {c: 0 for c in winners}
+        polls = 0
+        for state, res in self._worlds[:self.NOOP_WORLDS]:
+            opp = max(res.side_two, key=lambda o: o.visits, default=None)
+            if opp is None:
+                continue
+            opp_choice = self._engine_choice(opp.move_choice)
             try:
-                if self._successor_sig(state, self._engine_choice(c), opp_choice) == baseline:
-                    noops.add(c)
+                baseline = self._successor_sig(state, "none", opp_choice)
             except Exception:
                 self.diag["noop_err"] = self.diag.get("noop_err", 0) + 1
+                continue
+            polls += 1
+            for c in winners:
+                try:
+                    if self._successor_sig(state, self._engine_choice(c),
+                                           opp_choice) == baseline:
+                        votes[c] += 1
+                except Exception:
+                    self.diag["noop_err"] = self.diag.get("noop_err", 0) + 1
+        if not polls:
+            return ranked
+        noops = {c for c in winners if votes[c] * 2 > polls}
         if not noops or len(noops) == len(winners):
             return ranked
+        # Two very different situations reach this line and they used to be indistinguishable
+        # in the logs. If EVERY non-switch winner is a no-op, the opponent's modal reply
+        # neutralises us wholesale -- it Protects, or it KOs us before we move (both verified
+        # against the engine) -- and what the guard really does is promote a switch. If only
+        # some are, it is the wasted-turn call the docstring describes. Counted separately so
+        # a cohort can price them apart instead of averaging them together.
         # A '-tera' variant always differs from the pass baseline (tera rewrites the state
         # before we act, even if we then die), so it can never be flagged a no-op -- which
         # turned this reorder into a tera PROMOTER: plain move demoted, tera twin bubbles up
@@ -750,6 +901,9 @@ class EnginePlayer(Player):
                 if c not in noops and (c == ranked[0][0] or not c.endswith("-tera"))]
         if not keep:
             return ranked
+        moves = [c for c in winners if not c.startswith("switch ")]
+        key = "noop_blanket" if moves and all(c in noops for c in moves) else "noop_selective"
+        self.diag[key] = self.diag.get(key, 0) + 1
         demoted = [c for c in winners if c not in keep]
         noops = set(demoted)
         self._vetoed |= noops
@@ -860,6 +1014,7 @@ class EnginePlayer(Player):
             "opp": opp.species,
             "choice": choice,
             "opp_hp": opp.current_hp_fraction,
+            "my_hp": me.current_hp_fraction,
             "my_boosts": sum(v for v in (me.boosts or {}).values() if v > 0),
         })
 
@@ -921,11 +1076,22 @@ class EnginePlayer(Player):
                 return opp.current_hp_fraction >= min(anchors) - self.FUTILE_HP_EPS
             boosts = dict(mv.boosts or {})
             boosts.update(mv.self_boost or {})
-            if not any(v > 0 for v in boosts.values()):
-                return False
-            my_now = sum(v for v in (me.boosts or {}).values() if v > 0)
-            return (len(run) >= self.FUTILE_BOOST_RUN
-                    and my_now <= run[-1]["my_boosts"])
+            if any(v > 0 for v in boosts.values()):
+                my_now = sum(v for v in (me.boosts or {}).values() if v > 0)
+                return (len(run) >= self.FUTILE_BOOST_RUN
+                        and my_now <= run[-1]["my_boosts"])
+            # Recovery futility: same shape, our own HP as the ledger. A heal run that
+            # isn't gaining HP is either failing outright (full HP -- the Synthesis x5 loop
+            # that lost a rated game while the opponent set up to +6) or being out-damaged,
+            # and both are wasted turns the search keeps buying. Non-boosting status moves
+            # used to fall straight through here, which is why neither this guard nor the
+            # no-op guard ever saw that loop. mv.heal misses weather-scaled heals, hence
+            # the id set -- see _RECOVERY_MOVES.
+            if move_id in _RECOVERY_MOVES or (getattr(mv, "heal", 0) or 0) > 0:
+                return (len(run) >= self.FUTILE_BOOST_RUN
+                        and me.current_hp_fraction
+                        <= run[-1].get("my_hp", 0.0) + self.FUTILE_HP_EPS)
+            return False
 
         dead = {c for c, _s in ranked if futile(c)}
         if not dead or all(c in dead or c.endswith("-tera") for c, _s in ranked):
@@ -1134,6 +1300,13 @@ class EnginePlayer(Player):
         }
         if ms is not None:
             entry["ms"] = round(ms, 1)
+        # Total MCTS volume behind this decision. The per-turn BUDGET is fixed in
+        # milliseconds, so when the machine is loaded or thermally throttled the turn still
+        # takes ~the same time while quietly buying fewer iterations -- measured +6.9% turn
+        # time drift over one 4-hour run, with no record of the visits lost. Without this,
+        # "searched less" and "played worse" are the same observation.
+        if self._worlds:
+            entry["visits"] = sum(res.total_visits for _, res in self._worlds)
         if mixed:
             entry["mixed"] = True
         if reorders:

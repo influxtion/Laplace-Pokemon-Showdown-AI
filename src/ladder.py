@@ -33,6 +33,12 @@ replay.pokemonshowdown.com are OFF by default and opt-in per run:
 A dropped websocket does NOT end the run: the connection watchdog notices, the segment is
 torn down (replays swept, ratings logged) and the remaining games are played on a fresh
 connection. --reconnects 0 turns that off. See watch_connection / play_segment.
+
+Every finished game's post-game Elo is checked against the standing record in
+replays/ladder/elo_high.json. A new high is announced as it happens, its replay is kept a
+second time under replays/ladder/records/, and the run STOPS there -- the queue is cancelled
+rather than handing a fresh peak straight back. --no-stop-on-record keeps laddering.
+See check_elo_record / watch_stop.
 """
 
 import argparse
@@ -42,6 +48,7 @@ import logging
 import os
 import re
 import sys
+from datetime import datetime
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -66,6 +73,7 @@ from poke_env import AccountConfiguration, ShowdownServerConfiguration
 # poke_env drives its websocket from POKE_LOOP, a loop running in its own thread; this is
 # the hop every public Player method takes to get onto it. See request_upload().
 from poke_env.concurrency import handle_threaded_coroutines
+from poke_env.data import to_id_str
 
 from engine_search import EnginePlayer
 
@@ -91,7 +99,7 @@ RATING_LOG = os.path.join(REPLAY_DIR, "ratings.csv")
 # act, not a side effect of laddering. UPLOAD_FIRST_N is what a bare --upload-first means.
 REPLAY_UPLOAD_URL = "https://replay.pokemonshowdown.com/"
 UPLOAD_FIRST_N = 5
-UPLOAD_TIMEOUT = 15.0       # how long report_progress waits on one /savereplay
+SEND_TIMEOUT = 15.0         # how long a poll loop waits on one websocket send
 
 # Auto-resume after a dropped connection (see watch_connection). MAX_RECONNECTS is the
 # default for --reconnects and counts CONSECUTIVE failures: any segment that finishes a game
@@ -100,6 +108,17 @@ UPLOAD_TIMEOUT = 15.0       # how long report_progress waits on one /savereplay
 # network from spinning the reconnect loop.
 MAX_RECONNECTS = 5
 RECONNECT_WAIT = 15.0
+CANCEL_GRACE = 5.0          # after /cancelsearch, how long a match already made can still land
+
+# Peak-Elo tracking (see final_rating / check_elo_record). Every game that ends above the
+# standing record archives a second copy of its replay here and moves the record on.
+# ELO_HIGH_FILE is the running one and wins once written; ELO_HIGH_SEED is only the floor
+# for the very first run -- the account's peak as of 2026-08-17, and the same number the
+# README reports. replays/ is gitignored, so ELO_HIGH_FILE is machine-local: this constant
+# is the only committed record of the peak, and is worth bumping when one is set.
+ELO_DIR = os.path.join(REPLAY_DIR, "records")
+ELO_HIGH_FILE = os.path.join(REPLAY_DIR, "elo_high.json")
+ELO_HIGH_SEED = 2227
 
 # .env lives in the project root, one level up from src/.
 _ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
@@ -200,17 +219,11 @@ class PopupWatcher(logging.Handler):
             pass
 
 
-async def request_upload(agent, tag):
-    """Ask Showdown to publish this battle as a hosted replay.
-
-    Sent at battle START, not end, for two reasons found in the server/client source:
-    poke_env sends '/leave' the moment a battle ends (player.py), so saving on the
-    'finished' poll races the room teardown; and once a battle has been saved once, the
-    server re-uploads the COMPLETE log automatically at game end (room-battle.ts), silently
-    overwriting the partial. Saving early is both the safe order and the complete one.
+async def send_to_showdown(agent, message, room="", timeout=SEND_TIMEOUT):
+    """Send one command on poke_env's websocket from a task on the MAIN loop.
 
     MUST go through handle_threaded_coroutines. The websocket belongs to poke_env's
-    POKE_LOOP, which runs in ITS OWN THREAD; our callers (report_progress here,
+    POKE_LOOP, which runs in ITS OWN THREAD; our callers (report_progress, watch_stop,
     announce in analyze_battle) are tasks on the main asyncio.run loop. Awaiting
     ps_client.send_message directly therefore drove websocket.send from the wrong thread,
     writing into the SSL transport concurrently with POKE_LOOP's own writes. That corrupts
@@ -218,19 +231,40 @@ async def request_upload(agent, tag):
     _do_write, then 'no close frame received or sent' as the connection dies and the whole
     run ends mid-battle. Hopping onto POKE_LOOP serialises this send with every other one.
 
-    Bounded by UPLOAD_TIMEOUT because the caller is report_progress: an await that never
+    Bounded, because the callers are poll loops that must keep ticking: an await that never
     returns (a dying socket, ps_client's send lock held by a stuck write) would stop the
     monitor dead -- no start/finish lines and no per-battle replay saves for the rest of the
     run. SHIELDED, so the timeout only stops US waiting; cancelling a half-written websocket
-    frame is exactly the transport corruption described above."""
+    frame is exactly the transport corruption described above.
+
+    room="" is how poke_env sends global commands (see its search_ladder_game)."""
+    sending = asyncio.ensure_future(handle_threaded_coroutines(
+        agent.ps_client.send_message(message, room=room), agent.ps_client.loop))
+    await asyncio.wait_for(asyncio.shield(sending), timeout)
+
+
+async def request_upload(agent, tag):
+    """Ask Showdown to publish this battle as a hosted replay.
+
+    Sent at battle START, not end, for two reasons found in the server/client source:
+    poke_env sends '/leave' the moment a battle ends (player.py), so saving on the
+    'finished' poll races the room teardown; and once a battle has been saved once, the
+    server re-uploads the COMPLETE log automatically at game end (room-battle.ts), silently
+    overwriting the partial. Saving early is both the safe order and the complete one."""
     try:
-        sending = asyncio.ensure_future(handle_threaded_coroutines(
-            agent.ps_client.send_message("/savereplay", room=tag), agent.ps_client.loop))
-        await asyncio.wait_for(asyncio.shield(sending), UPLOAD_TIMEOUT)
+        await send_to_showdown(agent, "/savereplay", room=tag)
         print(f"    /savereplay sent -> {replay_url(tag)}", flush=True)
     except Exception as exc:
         # Never fatal: the local .html archive is written either way.
         print(f"    WARNING: /savereplay failed for {tag}: {exc!r}", flush=True)
+
+
+async def cancel_search(agent):
+    """Leave the matchmaking queue. Never fatal -- worst case we play one more game."""
+    try:
+        await send_to_showdown(agent, "/cancelsearch")
+    except Exception as exc:
+        print(f"    WARNING: /cancelsearch failed: {exc!r}", flush=True)
 
 
 def result_label(battle):
@@ -327,6 +361,105 @@ def log_rating(tag, battle, logged):
     return True
 
 
+# |raw|influxobot's rating: 1844 &rarr; <strong>1863</strong><br />(+19 for winning)
+# Greedy on the name: a username can contain "'s ", but the line can only carry one
+# "'s rating: ", so the LAST match is always the real split point.
+_RATING_LINE = re.compile(r"(.+)'s rating: (\d+) &rarr; <strong>(\d+)</strong>")
+
+
+def final_rating(battle):
+    """Our Elo AFTER this battle, or None until Showdown has reported it.
+
+    NOT battle.rating -- that is the rating we went IN at. poke_env keeps rating_info[:4],
+    the number to the LEFT of the arrow (abstract_battle.parse_message; see log_rating
+    GOTCHA 1), so the post-game number exists nowhere in its public API. It is in the raw
+    line itself though, and parse_message archives every message verbatim in _replay_data
+    before interpreting it, so this re-reads it from there.
+
+    Scanned newest-first and matched on username: Showdown sends one of these lines per
+    player and the opponent's is identical in shape."""
+    me = to_id_str(battle.player_username)
+    for msg in reversed(getattr(battle, "_replay_data", None) or []):
+        if len(msg) > 2 and msg[1] == "raw":
+            hit = _RATING_LINE.search(msg[2])
+            if hit and to_id_str(hit.group(1)) == me:
+                return int(hit.group(3))
+    return None
+
+
+def load_elo_high():
+    """(record Elo, the battle that set it). ELO_HIGH_SEED until the file exists.
+
+    An unreadable file falls back to the seed but SAYS SO: silently starting from the seed
+    when the real record is higher would let a worse game overwrite it."""
+    if not os.path.exists(ELO_HIGH_FILE):
+        return ELO_HIGH_SEED, None
+    try:
+        with open(ELO_HIGH_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return int(data["elo"]), data.get("tag")
+    except Exception as exc:
+        print(f"  WARNING: could not read {ELO_HIGH_FILE} ({exc!r}); "
+              f"falling back to {ELO_HIGH_SEED}", flush=True)
+        return ELO_HIGH_SEED, None
+
+
+def check_elo_record(agent, tag, battle, run):
+    """Handle one finished battle's post-game Elo. True once it has been checked.
+
+    False while Showdown hasn't sent the rating yet, so the poll loop keeps retrying -- the
+    |raw| lines trail |win| by a tick or two, exactly like log_rating. Unrated games never
+    produce one and are simply never checked.
+
+    A new record archives a SECOND copy of the replay under ELO_DIR (the normal
+    won-/lost- copy is still written by save_battle) and moves the record on disk, so the
+    peak survives across runs."""
+    if not run.track_elo or tag in run.elo_checked:
+        return False
+    try:
+        elo = final_rating(battle)
+    except Exception as exc:
+        # This runs inside the progress monitor. A surprise in the raw line must not take
+        # the monitor down with it, and must not be retried every poll tick either.
+        run.elo_checked.add(tag)
+        print(f"    WARNING: could not read the post-game Elo for {tag}: {exc!r}", flush=True)
+        return True
+    if elo is None:
+        return False
+    run.elo_checked.add(tag)
+    if elo <= run.elo_high:
+        return True
+    was = run.elo_high
+    run.elo_high, run.elo_high_tag = elo, tag
+    run.elo_records.append((elo, tag))
+    print(f"    *** NEW ELO HIGH: {elo}  (previous best {was}) ***", flush=True)
+    # End the run here rather than queue again and hand the new peak straight back.
+    # watch_stop does the actual stopping -- we are already in the matchmaking queue by now.
+    if run.stop_on_record and run.stop_reason is None:
+        run.stop_reason = f"new Elo record {elo}"
+    # Both writes are guarded separately: losing the archived replay must not cost us the
+    # record, and vice versa.
+    try:
+        os.makedirs(ELO_DIR, exist_ok=True)
+        path = os.path.join(ELO_DIR, f"elo{elo}-{tag}.html")
+        agent.save_replay(tag, path)
+        traces = getattr(agent, "traces", {}).get(tag)
+        if traces:
+            with open(os.path.join(ELO_DIR, f"elo{elo}-{tag}.trace.json"),
+                      "w", encoding="utf-8") as f:
+                json.dump(traces, f, indent=1)
+        print(f"    archived -> {path}", flush=True)
+    except Exception as exc:
+        print(f"    WARNING: could not archive the record replay: {exc!r}", flush=True)
+    try:
+        with open(ELO_HIGH_FILE, "w", encoding="utf-8") as f:
+            json.dump({"elo": elo, "tag": tag, "engine": "fork" if FORK_MODE else "stock",
+                       "when": datetime.now().isoformat(timespec="seconds")}, f, indent=1)
+    except Exception as exc:
+        print(f"    WARNING: could not update {ELO_HIGH_FILE}: {exc!r}", flush=True)
+    return True
+
+
 class Run:
     """Everything about a run that has to outlive the agent playing it.
 
@@ -337,14 +470,25 @@ class Run:
 
     `total` counts games played to a result. A game abandoned mid-battle to a disconnect is
     forfeited on Showdown's timer and its result never reaches us, so it is recorded in
-    `abandoned` and replaced by another game rather than counted."""
+    `abandoned` and replaced by another game rather than counted.
 
-    def __init__(self, total, upload_first=0):
+    track_elo=False for callers that must not touch the peak record -- ladder_old plays
+    deliberately weakened builds, and a record set by one of those would be a lie.
+
+    stop_reason, once set, ends the run at the next opportunity; watch_stop acts on it."""
+
+    def __init__(self, total, upload_first=0, track_elo=True, stop_on_record=True):
         self.total = total
         self.upload_first = upload_first
         self.saved, self.warned, self.logged = set(), set(), set()
         self.done = self.won = self.lost = 0
         self.abandoned = []
+        self.track_elo = track_elo
+        self.elo_high, self.elo_high_tag = load_elo_high() if track_elo else (0, None)
+        self.elo_checked = set()    # battles whose post-game Elo has been seen
+        self.elo_records = []       # (elo, tag) per new high set this run, in order
+        self.stop_on_record = stop_on_record
+        self.stop_reason = None
 
     def absorb(self, agent):
         """Fold a retired agent's results into the totals. Once per agent, after it stops."""
@@ -374,6 +518,38 @@ async def watch_connection(agent, poll=2.0):
         print("  NOTE: connection watchdog off (no ps_client._listening_coroutine)", flush=True)
     while fut is None or not fut.done():
         await asyncio.sleep(poll)
+
+
+async def watch_stop(agent, run, poll=1.0):
+    """Complete once the run should end early, having left the ladder queue cleanly.
+
+    Set by check_elo_record: a game that breaks the Elo record ends the run rather than
+    putting the new peak straight back at risk.
+
+    Why this can't just cancel the play coroutine -- poke_env's Player._ladder sends
+    '/search' for the NEXT game the instant the previous one ends: it is woken by
+    _battle_end_condition inside the |win| handler, which runs before the |raw| rating lines
+    that tell us we set a record. So by the time we know, we are already in the matchmaking
+    queue, and cancelling _ladder would leave us sitting in it -- Showdown would match us and
+    start a game with nothing driving the queue bookkeeping. The queue has to be left
+    explicitly."""
+    while not run.stop_reason:
+        await asyncio.sleep(poll)
+    print(f"  STOPPING EARLY: {run.stop_reason} -- not queuing for another game.", flush=True)
+    while True:
+        await cancel_search(agent)
+        # A match made just before /cancelsearch reached the server still arrives. Give its
+        # |init| time to land before calling the queue clean: returning early here would
+        # tear the run down on top of a game that had just started and forfeit it.
+        await asyncio.sleep(CANCEL_GRACE)
+        if not any(not b.finished for b in agent.battles.values()):
+            return
+        # Matchmaking beat us to it. That game is rated and already under way, so it gets
+        # played out: dropping it would forfeit, which is the opposite of the point. Once it
+        # ends, _ladder queues another search, hence the loop back to /cancelsearch.
+        print("  ... a game had already started; playing it out, then stopping.", flush=True)
+        while any(not b.finished for b in agent.battles.values()):
+            await asyncio.sleep(poll)
 
 
 async def report_progress(agent, run, poll=3.0):
@@ -406,10 +582,12 @@ async def report_progress(agent, run, poll=3.0):
                       f"{battle.turn} turns  (running {run.won + agent.n_won_battles}W / "
                       f"{run.lost + agent.n_lost_battles}L)", flush=True)
             # Deliberately OUTSIDE the `not in finished` gate above: the |raw| rating lines
-            # can arrive a tick or two after |win|, so this has to keep looking.
-            if battle.finished and log_rating(tag, battle, run.logged):
-                vs = f" vs {battle.opponent_rating}" if battle.opponent_rating else ""
-                print(f"    rated: went in at {battle.rating}{vs}", flush=True)
+            # can arrive a tick or two after |win|, so these have to keep looking.
+            if battle.finished:
+                if log_rating(tag, battle, run.logged):
+                    vs = f" vs {battle.opponent_rating}" if battle.opponent_rating else ""
+                    print(f"    rated: went in at {battle.rating}{vs}", flush=True)
+                check_elo_record(agent, tag, battle, run)
         # No unfinished battle and not done yet -> sitting in the matchmaking queue.
         active = any(not b.finished for b in agent.battles.values())
         done = run.done + len(finished)
@@ -420,35 +598,44 @@ async def report_progress(agent, run, poll=3.0):
 
 
 async def play_segment(agent, run, play):
-    """Play one connection's worth of games. True if `play` ran to completion.
+    """Play one connection's worth of games. True when the run is over, don't resume.
 
-    False means the watchdog won the race: the websocket is gone and `play` would have hung
-    forever, so it is cancelled and the caller decides whether to resume on a new agent.
+    True covers both `play` finishing normally and watch_stop deciding to end the run early
+    (a new Elo record). False means the watchdog won the race: the websocket is gone and
+    `play` would have hung forever, so it is cancelled and the caller decides whether to
+    resume on a new agent.
 
-    The teardown runs on BOTH paths -- normal finish, disconnect, Ctrl-C, crash -- because
-    it is the only chance to archive this agent's games: the battle rooms are gone once the
-    process exits, and after a drop the agent itself is discarded."""
+    The teardown runs on ALL paths -- normal finish, early stop, disconnect, Ctrl-C, crash --
+    because it is the only chance to archive this agent's games: the battle rooms are gone
+    once the process exits, and after a drop the agent itself is discarded."""
     monitor = asyncio.ensure_future(report_progress(agent, run))
     watchdog = asyncio.ensure_future(watch_connection(agent))
+    stopper = asyncio.ensure_future(watch_stop(agent, run))
     playing = asyncio.ensure_future(play)
     try:
-        await asyncio.wait({playing, watchdog}, return_when=asyncio.FIRST_COMPLETED)
+        await asyncio.wait({playing, watchdog, stopper},
+                           return_when=asyncio.FIRST_COMPLETED)
         if playing.done():
             playing.result()        # re-raise a genuine failure instead of reporting success
             return True
+        if stopper.done():
+            stopper.result()        # a bug in the stopper should surface, not stop us quietly
+            return True
         return False
     finally:
-        for task in (monitor, watchdog, playing):
+        for task in (monitor, watchdog, stopper, playing):
             task.cancel()
-        await asyncio.gather(monitor, watchdog, playing, return_exceptions=True)
+        await asyncio.gather(monitor, watchdog, stopper, playing, return_exceptions=True)
         # Catches the final game and anything the last poll tick missed. In-progress battles
         # are saved too, under the 'unfinished-' prefix.
         sweep_replays(agent, run.saved, run.warned)
         # Same gap sweep_replays exists for: the monitor is cancelled the instant the last
-        # game ends, so that game's rating row would otherwise never be written.
+        # game ends, so that game's rating row -- and the Elo record it might have set --
+        # would otherwise never be written.
         for tag, battle in list(agent.battles.items()):
             if battle.finished:
                 log_rating(tag, battle, run.logged)
+                check_elo_record(agent, tag, battle, run)
         run.absorb(agent)
         # parallel_worlds only: don't leak a pool of engine processes per reconnect.
         pool = getattr(agent, "_executor", None)
@@ -475,6 +662,10 @@ async def main():
     parser.add_argument("--fork", action="store_true",
                         help="run the Phase-2 fork engine (net-at-leaf, 600ms/world); "
                              "handled at import time, this flag just documents it")
+    parser.add_argument("--no-stop-on-record", action="store_true",
+                        help="keep laddering after a new Elo record. By default a record "
+                             "ends the run immediately -- the queue is cancelled rather "
+                             "than putting the fresh peak straight back at risk.")
     parser.add_argument("--reconnects", type=int, default=MAX_RECONNECTS, metavar="N",
                         help=f"after a dropped websocket, resume the remaining games on a "
                              f"fresh connection, up to N consecutive failures "
@@ -504,7 +695,14 @@ async def main():
     # One agent per connection. A drop retires the agent (poke_env can't reconnect one) and
     # the loop builds another for whatever is left to play, so a 20-game run isn't ended by
     # a 2-second network hiccup at game 6.
-    run = Run(args.battles, args.upload_first)
+    run = Run(args.battles, args.upload_first,
+              stop_on_record=not args.no_stop_on_record)
+    start_high = run.elo_high
+    print(f"  Elo record to beat: {start_high}"
+          f"{f' (set in {run.elo_high_tag})' if run.elo_high_tag else ''}  "
+          f"-- new highs archived to {ELO_DIR}", flush=True)
+    print("    breaking it ENDS the run" if run.stop_on_record
+          else "    --no-stop-on-record: the run continues past a new record", flush=True)
     failures = 0
     while run.done < run.total:
         remaining = run.total - run.done
@@ -537,6 +735,10 @@ async def main():
         # never see its |win| it is replaced rather than counted.
         for tag in run.abandoned[before_abandoned:]:
             print(f"  CONNECTION LOST -- abandoned {tag} (forfeits on the timer)", flush=True)
+        if run.stop_reason:
+            # The record already ended this run; losing the socket on the way out is not a
+            # reason to reconnect and start playing again.
+            break
         # Consecutive drops with nothing to show for them. A segment that finished a game
         # starts the streak over, so a long run can ride out more than --reconnects hiccups;
         # what the budget stops is a loop that reconnects and immediately drops again.
@@ -555,6 +757,16 @@ async def main():
         print(f"\nDone: won {run.won}/{run.done} ({run.won / run.done:.0%}).", flush=True)
     else:
         print("\nNo games played.", flush=True)
+    if run.elo_records:
+        print(f"  NEW ELO RECORD: {run.elo_high} (was {start_high}), "
+              f"{len(run.elo_records)} new high(s) this run -> {ELO_DIR}", flush=True)
+    elif run.track_elo:
+        print(f"  Elo record unchanged at {run.elo_high}.", flush=True)
+    # Guarded on done < total: the LAST game setting a record is not an early stop, and
+    # check_elo_record still sets stop_reason there (play_segment's teardown sweep).
+    if run.stop_reason and run.done < run.total:
+        print(f"  Stopped early at {run.done}/{run.total} games: {run.stop_reason}.",
+              flush=True)
     if run.abandoned:
         print(f"  {len(run.abandoned)} game(s) abandoned to a dropped connection and "
               f"forfeited -- not in the count above:", flush=True)

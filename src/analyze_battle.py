@@ -184,6 +184,12 @@ async def main():
             path = None
             if ladder.save_battle(agent, tag, battle, saved, warned):
                 path = os.path.join(ladder.REPLAY_DIR, f"{result}-{tag}.html")
+            # This game is rated like any other, so it can set the peak-Elo record too --
+            # without this a record set here would be missed. stop_on_record=False: there is
+            # no next game to stop, ladder.py's early stop is meaningless for one battle.
+            if battle.finished and not args.local:
+                ladder.check_elo_record(agent, tag, battle,
+                                        ladder.Run(1, stop_on_record=False))
             analyzer.summary(battle=battle, result=result, replay_path=path,
                              diag=dict(agent.diag))
             if not args.no_save_log and path:
