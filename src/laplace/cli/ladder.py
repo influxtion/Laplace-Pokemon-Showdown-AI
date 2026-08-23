@@ -61,12 +61,23 @@ from laplace import paths
 # argparse. The LAPLACE_* vars are read once by the Rust engine on first search; without
 # LAPLACE_VALUE_NET the fork is bit-identical to stock. setdefault so an explicit env
 # override wins.
-FORK_MODE = "--fork" in sys.argv
+# --fork-baseline: the CONTROL for any fork experiment. Loads the same fork wheel but
+# leaves every LAPLACE_* var unset, so value_net.rs returns None and mcts.rs falls back to
+# the stock UCT constant -- the fork binary running stock behaviour at the stock 150ms
+# budget. Without this, a change inside the fork can only be compared against a DIFFERENT
+# binary at a DIFFERENT time budget, and the build is confounded with the change.
+FORK_BASELINE = "--fork-baseline" in sys.argv
+FORK_MODE = "--fork" in sys.argv or FORK_BASELINE
 if FORK_MODE:
     sys.path.insert(0, paths.FORK_WHEEL)
+if FORK_MODE and not FORK_BASELINE:
     os.environ.setdefault("LAPLACE_VALUE_NET", paths.FORK_VALUE_NET)
     os.environ.setdefault("LAPLACE_VALUE_NET_BLEND", "0.5")
     os.environ.setdefault("LAPLACE_UCT_C2", "0.1")
+
+# What goes in the `engine` column of ratings.csv. Keep these three labels distinct: the
+# whole point of the baseline run is being able to slice the log by build afterwards.
+ENGINE_LABEL = "fork-base" if FORK_BASELINE else ("fork" if FORK_MODE else "stock")
 
 from poke_env import AccountConfiguration, ShowdownServerConfiguration
 # poke_env drives its websocket from POKE_LOOP, a loop running in its own thread; this is
@@ -82,7 +93,8 @@ if FORK_MODE:
     if not hasattr(poke_engine, "featurize_state"):
         sys.exit(f"--fork: loaded STOCK poke_engine from {poke_engine.__file__} -- "
                  f"is the fork wheel installed in poke-engine-fork/py?")
-    if not os.path.exists(os.environ["LAPLACE_VALUE_NET"]):
+    # Only --fork needs the weights; --fork-baseline deliberately leaves the var unset.
+    if not FORK_BASELINE and not os.path.exists(os.environ["LAPLACE_VALUE_NET"]):
         sys.exit(f"--fork: weight file missing: {os.environ['LAPLACE_VALUE_NET']}")
 
 BATTLE_FORMAT = "gen9randombattle"
@@ -346,7 +358,7 @@ def log_rating(tag, battle, logged):
         with open(RATING_LOG, "a", encoding="utf-8", newline="") as f:
             if new:
                 f.write("tag,engine,result,turns,rating_before,opp_rating_before\n")
-            f.write(f"{tag},{'fork' if FORK_MODE else 'stock'},{result_label(battle)},"
+            f.write(f"{tag},{ENGINE_LABEL},{result_label(battle)},"
                     f"{battle.turn},{battle.rating},{battle.opponent_rating or ''}\n")
     except Exception as exc:
         # Unlike save_battle this gives up on the row instead of leaving it for a retry: a
@@ -451,7 +463,7 @@ def check_elo_record(agent, tag, battle, run):
         print(f"    WARNING: could not archive the record replay: {exc!r}", flush=True)
     try:
         with open(ELO_HIGH_FILE, "w", encoding="utf-8") as f:
-            json.dump({"elo": elo, "tag": tag, "engine": "fork" if FORK_MODE else "stock",
+            json.dump({"elo": elo, "tag": tag, "engine": ENGINE_LABEL,
                        "when": datetime.now().isoformat(timespec="seconds")}, f, indent=1)
     except Exception as exc:
         print(f"    WARNING: could not update {ELO_HIGH_FILE}: {exc!r}", flush=True)
@@ -660,6 +672,11 @@ async def main():
     parser.add_argument("--fork", action="store_true",
                         help="run the Phase-2 fork engine (net-at-leaf, 600ms/world); "
                              "handled at import time, this flag just documents it")
+    parser.add_argument("--fork-baseline", action="store_true",
+                        help="CONTROL run: the fork wheel with every LAPLACE_* var unset, "
+                             "so it behaves as stock at the stock 150ms budget. Logged as "
+                             "engine=fork-base. Use this to give the fork build a ladder "
+                             "baseline before changing anything inside it.")
     parser.add_argument("--no-stop-on-record", action="store_true",
                         help="keep laddering after a new Elo record. By default a record "
                              "ends the run immediately -- the queue is cancelled rather "
@@ -677,7 +694,13 @@ async def main():
         parser.error("challenge mode needs --opponent USERNAME.")
 
     account = AccountConfiguration(args.username, args.password)
-    if FORK_MODE:
+    if FORK_BASELINE:
+        import poke_engine
+        print(f"Playing as '{args.username}' (Laplace FORK BASELINE: stock "
+              f"eval, stock UCT, 150ms/world; a control for the fork build). "
+              f"Logged as engine=fork-base.", flush=True)
+        print(f"  engine: {poke_engine.__file__}", flush=True)
+    elif FORK_MODE:
         import poke_engine
         print(f"Playing as '{args.username}' (Laplace FORK: net-at-leaf blend 0.5, "
               f"c2={os.environ['LAPLACE_UCT_C2']}, 600ms/world).\n"
@@ -704,7 +727,7 @@ async def main():
     failures = 0
     while run.done < run.total:
         remaining = run.total - run.done
-        agent = build_agent(account, fork=FORK_MODE)
+        agent = build_agent(account, fork=FORK_MODE and not FORK_BASELINE)
         if args.upload_first > 0:
             # The popup is the only confirmation Showdown sends, and poke_env logs it at
             # WARNING. If something raised the client's level above that we'd never see it,
