@@ -35,8 +35,8 @@ from poke_env.data import to_id_str
 
 from poke_engine import monte_carlo_tree_search, generate_instructions
 
-from knowledge import (estimate_damage_fraction, get_move, move_nullified, safe_priority,
-                       _estimate_stat)
+from knowledge import (estimate_damage_fraction, get_move, move_nullified,
+                       priority_ability_possible, safe_priority, _estimate_stat)
 from poke_engine_adapter import build_state
 
 
@@ -98,6 +98,21 @@ def _search_world(state_str, time_ms, threads):
                 res.total_visits)
     except BaseException:
         return None
+
+
+# poke-engine is a Rust extension: an inconsistent state makes it PANIC, and pyo3 surfaces
+# that as PanicException, which derives from BaseException and NOT from Exception (verified
+# on the shipped 0.0.47 build -- "Encore should not be active when last used move is not a
+# move" comes back as pyo3_runtime.PanicException, isinstance(_, Exception) is False). So
+# `except Exception` around any engine call is a hole. Every engine call site below uses the
+# (KeyboardInterrupt, SystemExit) -> re-raise / BaseException -> handle pair instead: Ctrl-C
+# still works, a panic is contained.
+#
+# WHERE the hole is matters. A panic inside the SEARCH costs one determinized world, which
+# was always handled. A panic inside a GUARD escaped choose_move entirely, out through
+# poke_env's per-message task where nothing retrieves it -- so no move was ever sent, the
+# websocket stayed up (so the reconnect watchdog never fired) and the game ran down its
+# move timer.
 
 
 def _shim(raw):
@@ -267,12 +282,15 @@ class EnginePlayer(Player):
 
     async def _handle_battle_message(self, split_messages):
         await super()._handle_battle_message(split_messages)
-        if not self.speed_inference:
-            return
         try:
             tag = split_messages[0][0].replace(">", "").strip()
             battle = self.battles.get(tag)
             if battle is not None:
+                # Both scans run whatever speed_inference says. It gates ONE thing -- the
+                # Scarf verdict, inside _scan_speed_evidence -- and gating the dispatch on
+                # it instead also switched off Heavy-Duty Boots detection and the Wish /
+                # Future Sight tracking that build_state needs, neither of which has
+                # anything to do with reading speed off turn order.
                 self._scan_speed_evidence(battle, split_messages)
                 self._scan_item_evidence(battle, split_messages)
         except Exception:
@@ -358,15 +376,66 @@ class EnginePlayer(Player):
         if pending is not None:
             close(pending)
 
+    @staticmethod
+    def _speed_payload_tainted(split_messages):
+        """True if anything ANYWHERE in this payload moved a value _infer_scarf reads.
+
+        _infer_scarf reasons about a move pair at the point the pair completes, but it reads
+        the battle object, which poke-env has already advanced to the END of the payload
+        (this whole scan runs after super()._handle_battle_message). So a line that lands
+        AFTER the pair still corrupts the comparison, and walking-order taint -- the flag
+        this replaces -- could only ever see lines BEFORE it.
+
+        Measured on real payloads captured off a local server, 235 cross-side move pairs:
+        5.3% are followed, in the same payload, by a speed boost, and ~1% each by a
+        paralysis or a switch. Net, this rule reads 210 of those 235 pairs where the
+        walking-order flag read 228 -- it gives up 8% of the observations, all of them
+        ones it could not have interpreted. The common case is a self-boosting attack:
+        `move Scald / move Rapid Spin / -boost spe 1` compares Suicune against an Excadrill
+        the engine thinks is already at +1, and reports Suicune as Scarfed. A false Scarf
+        verdict is expensive out of proportion to its rate -- it pins choicescarf into every
+        determinized world for that species for the rest of the game, plus a Choice lock.
+
+        Everything listed is an input to the comparison: who the actives are, their Speed
+        stages, paralysis, Tailwind, Trick Room, and a Choice Scarf changing hands."""
+        for msg in split_messages:
+            if len(msg) < 2:
+                continue
+            tag, rest = msg[1], msg[2:]
+            if tag in ("switch", "drag", "replace"):
+                return True                                  # the actives are not the movers
+            if tag in ("-boost", "-unboost", "-setboost") and len(rest) > 1 and rest[1] == "spe":
+                return True
+            if tag in ("-clearboost", "-clearallboost", "-invertboost", "-copyboost",
+                       "-swapboost", "-clearnegativeboost"):
+                return True                                  # Haze & friends reset the stages
+            if tag in ("-status", "-curestatus") and len(rest) > 1 and rest[1] == "par":
+                return True
+            if tag in ("-sidestart", "-sideend") and len(rest) > 1 \
+                    and to_id_str(rest[1].split(":")[-1]) == "tailwind":
+                return True
+            if tag in ("-fieldstart", "-fieldend") and rest \
+                    and to_id_str(rest[0].split(":")[-1]) == "trickroom":
+                return True
+            if tag in ("-item", "-enditem") and len(rest) > 1 \
+                    and to_id_str(rest[1]) == "choicescarf":
+                return True
+        return False
+
     def _scan_speed_evidence(self, battle, split_messages):
         """Scrape who-moved-first evidence (Scarf) and pending Wish/Future Sight out of one
         message payload.
 
         Speed comparisons are skipped on turns tainted by a mid-turn switch (pivot) or an
         in-turn speed change: the end-of-payload battle state no longer reflects the
-        conditions that decided move order."""
+        conditions that decided move order. See _speed_payload_tainted -- the taint is a
+        property of the WHOLE payload, not of the lines read so far.
+
+        The Wish / Future Sight tracking below is unconditional; only the Scarf verdict is
+        gated on speed_inference."""
         moves = []          # (side, move_id) in order within the current turn
-        tainted = False
+        payload_tainted = self._speed_payload_tainted(split_messages)
+        tainted = payload_tainted
         wish_side = fs_side = None      # sides that queued a delayed effect this payload
         pend = self._pending.setdefault(battle.battle_tag, {})
         for msg in split_messages:
@@ -383,19 +452,22 @@ class EnginePlayer(Player):
                 if fs_side:
                     pend[f"{fs_side}_fs"] = turn + 1
                     fs_side = None
-                moves, tainted = [], False
-            elif tag in ("switch", "drag") and moves:
-                tainted = True
-            elif tag in ("-boost", "-unboost") and len(msg) > 3 and msg[3] == "spe":
-                tainted = True
+                moves, tainted = [], payload_tainted
             elif tag == "move" and len(msg) > 3:
                 if to_id_str(msg[3]) == "wish":
                     wish_side = msg[2][:2]
                     healer = battle.active_pokemon if wish_side == battle.player_role \
                         else battle.opponent_active_pokemon
                     pend["_wish_amt"] = int(_estimate_stat(healer, "hp")) // 2 if healer else 0
+                if any(str(x).startswith("[from]") for x in msg[4:]):
+                    # A CALLED move (Sleep Talk, Dancer, Magic Bounce): not an action of its
+                    # own, so it must not occupy a slot in the turn-order pair. Observed
+                    # live: `move Sleep Talk / move Calm Mind [from] Sleep Talk` filled both
+                    # slots from one side, and the real cross-side pair after it was never
+                    # compared.
+                    continue
                 moves.append((msg[2][:2], to_id_str(msg[3])))
-                if len(moves) == 2 and not tainted:
+                if len(moves) == 2 and not tainted and self.speed_inference:
                     self._infer_scarf(battle, moves)
             elif tag == "-start" and len(msg) > 3 and msg[3] == "move: Future Sight":
                 fs_side = msg[2][:2]
@@ -416,6 +488,14 @@ class EnginePlayer(Player):
             return
         me, opp = battle.active_pokemon, battle.opponent_active_pokemon
         if me is None or opp is None or me.fainted or opp.fainted:
+            return
+        # Equal PRINTED priority is not equal actual priority. Move.priority knows nothing
+        # about Prankster and friends, so a Klefki -- always Prankster in randbats -- going
+        # first with Spikes read as "outsped a faster Pokemon", i.e. Choice Scarf, and the
+        # sampler then handed it a Scarf in every world for the rest of the game (observed
+        # in the ladder archive, twice, both later contradicted by a revealed Leftovers).
+        our_mv, their_mv = (mv1, mv2) if s1 == role else (mv2, mv1)
+        if priority_ability_possible(me, our_mv) or priority_ability_possible(opp, their_mv):
             return
 
         our = float((me.stats or {}).get("spe") or _estimate_stat(me, "spe"))
@@ -497,6 +577,8 @@ class EnginePlayer(Player):
                     fut = self._pool().submit(_search_world, state.to_string(),
                                               self.SEARCH_TIME_MS, self.THREADS)
                     jobs.append((state, fut))
+                except (KeyboardInterrupt, SystemExit):
+                    raise
                 except BaseException:
                     self.diag["det_fail"] += 1
                     self._emit("world_fail", index=j, total=n)
@@ -504,7 +586,9 @@ class EnginePlayer(Player):
                 t0 = time.perf_counter()
                 try:
                     raw = fut.result(timeout=self.SEARCH_TIME_MS / 1000 * 4 + 10)
-                except Exception:
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException:
                     raw = None
                 if raw is None:
                     self.diag["det_fail"] += 1
@@ -526,6 +610,8 @@ class EnginePlayer(Player):
                                         use_joint=self.use_joint_sets)
                     res = monte_carlo_tree_search(state, self.SEARCH_TIME_MS,
                                                   threads=self.THREADS)
+                except (KeyboardInterrupt, SystemExit):
+                    raise
                 except BaseException:
                     # poke-engine PANICS on an inconsistent state, and PanicException is
                     # not an Exception subclass -- hence the bare BaseException. Skip the
@@ -656,7 +742,12 @@ class EnginePlayer(Player):
                        ms=(time.perf_counter() - t_turn) * 1000)
             return self.choose_max_damage_move(battle) if battle.available_moves \
                 else self.choose_random_move(battle)
-        except Exception:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            # BaseException, not Exception: a poke-engine panic raised by one of the guards
+            # is not an Exception (see the module-level note) and used to escape this
+            # handler, which meant no move was sent at all.
             self.diag["fallback"] += 1
             self._emit("decision", battle=battle, choice="<crash>", ranked=[],
                        mixed=False, reorders=[], fallback=True, ms=0.0)
@@ -774,7 +865,9 @@ class EnginePlayer(Player):
                             branches = generate_instructions(
                                 state, self._engine_choice(cand),
                                 self._engine_choice(o.move_choice))
-                        except Exception:
+                        except (KeyboardInterrupt, SystemExit):
+                            raise
+                        except BaseException:
                             continue
                         for si in branches:
                             w = (o.visits / opp_total) * (si.percentage / 100.0)
@@ -814,7 +907,9 @@ class EnginePlayer(Player):
             rest = [rc for rc in ranked if rc[0] not in set(order)]
             scores = dict(ranked)
             return [(c, scores[c]) for c in order] + rest
-        except Exception:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
             self.diag["value_err"] = self.diag.get("value_err", 0) + 1
             return ranked
 
@@ -869,7 +964,9 @@ class EnginePlayer(Player):
             opp_choice = self._engine_choice(opp.move_choice)
             try:
                 baseline = self._successor_sig(state, "none", opp_choice)
-            except Exception:
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException:
                 self.diag["noop_err"] = self.diag.get("noop_err", 0) + 1
                 continue
             polls += 1
@@ -878,7 +975,9 @@ class EnginePlayer(Player):
                     if self._successor_sig(state, self._engine_choice(c),
                                            opp_choice) == baseline:
                         votes[c] += 1
-                except Exception:
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException:
                     self.diag["noop_err"] = self.diag.get("noop_err", 0) + 1
         if not polls:
             return ranked
@@ -1211,7 +1310,9 @@ class EnginePlayer(Player):
                         votes += 1
                 if checked and votes * 2 >= checked and votes > 0:
                     dead.add(cand)
-        except Exception:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
             self.diag["gamble_err"] = self.diag.get("gamble_err", 0) + 1
             return ranked
         if not dead:

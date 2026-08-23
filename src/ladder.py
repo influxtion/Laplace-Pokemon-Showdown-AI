@@ -113,12 +113,12 @@ CANCEL_GRACE = 5.0          # after /cancelsearch, how long a match already made
 # Peak-Elo tracking (see final_rating / check_elo_record). Every game that ends above the
 # standing record archives a second copy of its replay here and moves the record on.
 # ELO_HIGH_FILE is the running one and wins once written; ELO_HIGH_SEED is only the floor
-# for the very first run -- the account's peak as of 2026-08-17, and the same number the
+# for the very first run -- the account's peak as of 2026-08-18, and the same number the
 # README reports. replays/ is gitignored, so ELO_HIGH_FILE is machine-local: this constant
 # is the only committed record of the peak, and is worth bumping when one is set.
 ELO_DIR = os.path.join(REPLAY_DIR, "records")
 ELO_HIGH_FILE = os.path.join(REPLAY_DIR, "elo_high.json")
-ELO_HIGH_SEED = 2227
+ELO_HIGH_SEED = 2231
 
 # .env lives in the project root, one level up from src/.
 _ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")

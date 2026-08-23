@@ -48,11 +48,18 @@ def _play_share(n, det, time_ms, idx, stamp, out_dir=None):
             try:
                 recorded = self.samples.setdefault(battle.battle_tag, [])
                 for _ in range(WORLDS_PER_DECISION):   # 2 hidden-set draws of the same position
+                    # Every argument the search's own worlds are built with, including
+                    # use_joint and the Boots hints. Leaving those two off drew the training
+                    # states from the MARGINAL sampler while the shipped bot searches (and
+                    # the value head scores) joint-set worlds -- the one thing this file
+                    # exists to keep identical, quietly not identical.
                     state = build_state(
                         battle, use_stats=self.use_stats,
                         opp_used_since_switch=self._opp_used_since_switch(battle),
                         opp_speed_hints=self._opp_speed.get(battle.battle_tag, {}),
-                        pending=self._pending.get(battle.battle_tag))
+                        opp_item_hints=self._opp_item.get(battle.battle_tag, {}),
+                        pending=self._pending.get(battle.battle_tag),
+                        use_joint=self.use_joint_sets)
                     recorded.append(featurize(state).astype(np.float16))
             except Exception:
                 pass

@@ -105,6 +105,42 @@ _ABILITY_IGNORING = {"moldbreaker", "teravolt", "turboblaze"}
 _ABSORB_CHECK_SKIP = {"terablast", "thousandarrows"}
 
 
+# Abilities that move a Pokemon out of its move's printed priority bracket, and the moves
+# they apply to. Move.priority is the move's OWN priority and knows nothing about these, so
+# two moves that read as an equal bracket can still have been ordered by ability rather than
+# by speed -- which is exactly the assumption engine_search._infer_scarf runs on.
+_PRIORITY_ABILITIES = {
+    "prankster":     lambda mv: mv.category.name == "STATUS",       # +1
+    "galewings":     lambda mv: mv.type is not None and mv.type.name == "FLYING",
+    "triage":        lambda mv: (mv.heal or 0) > 0,                 # +3
+    "myceliummight": lambda mv: mv.category.name == "STATUS",       # -1 (moves last)
+    "quickdraw":     lambda mv: mv.category.name != "STATUS",       # 30% of the time
+    "stall":         lambda mv: True,                               # always last
+}
+
+
+def priority_ability_possible(mon, move):
+    """True if `mon` might be moving out of `move`'s printed priority bracket by ability.
+
+    POSSIBILITY, not certainty, on purpose -- the opposite standard from _ability_absorbs.
+    That one gates a veto, where acting on a guess is the expensive mistake; this one gates
+    whether a turn-order observation is INTERPRETABLE, where the expensive mistake is
+    reading a Prankster Klefki's Spikes as evidence of a Choice Scarf and then handing every
+    determinized world a Scarf (and a Choice lock) for the rest of the game. Anything short
+    of "no set here has a priority ability that applies" means the observation says nothing
+    about speed."""
+    if mon is None or move is None:
+        return False
+    if mon.ability:
+        test = _PRIORITY_ABILITIES.get(to_id_str(mon.ability))
+        return bool(test and test(move))
+    for ability, p in KNOWLEDGE.predicted_abilities(mon).items():
+        test = _PRIORITY_ABILITIES.get(ability)
+        if p > 0 and test and test(move):
+            return True
+    return False
+
+
 def _ability_absorbs(attacker, move, defender):
     """True iff the defender's ability CERTAINLY nullifies this move: revealed, or every
     still-possible randbats set runs an absorbing ability for the move's type. Any

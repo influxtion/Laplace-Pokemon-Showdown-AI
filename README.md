@@ -169,7 +169,7 @@ tally is always the number of games actually played to a result. `--reconnects 0
 the old stop-at-the-first-drop behaviour.
 
 **Peak Elo is tracked, and a record ends the run.** Each finished game's post-game rating is
-checked against the record in `replays/ladder/elo_high.json` (currently **2227**). Beating
+checked against the record in `replays/ladder/elo_high.json` (currently **2231**). Beating
 it prints a `*** NEW ELO HIGH ***` line as it happens, keeps a second copy of that replay
 and its trace under `replays/ladder/records/`, and stops the run — the ladder queue is
 cancelled rather than handing a fresh peak straight back to the next opponent. If
@@ -222,7 +222,11 @@ next to the replay as `<result>-<battle-tag>.analysis.txt`.
 
 Useful flags: `--local` plays on the local server instead (for trying it out without
 spending a rated game), `--ascii` / `--no-color` for dumb terminals and redirects,
-`--no-worlds` to drop the hidden-set tally, `--fork` for the Phase-2 engine.
+`--no-worlds` to drop the hidden-set tally, `--fork` for the Phase-2 engine, and
+`--min-move-time` (default 8s) to pace the game for watching — the search answers in ~2s,
+faster than Showdown animates the turn that just resolved, so the move is held back until
+the turn has taken that long. `--min-move-time 0` sends as soon as the search returns.
+Pacing is analysis-only; `ladder.py` never waits.
 
 Other entry points:
 

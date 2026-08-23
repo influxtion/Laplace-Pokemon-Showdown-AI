@@ -28,6 +28,7 @@ game. Renderer failures are counted and reported in summary() instead of dying q
 Consumer: analyze_battle.py.
 """
 
+import asyncio
 import re
 import shutil
 import sys
@@ -204,7 +205,7 @@ class LiveAnalyzer:
         self.hax = {"for": 0, "against": 0, "detail": {}}
         self.dealt = 0.0                 # their HP fractions removed by our direct moves
         self.taken = 0.0
-        self.players = {}                # 'p1'/'p2' -> (username, rating or None)
+        self.players = {}                # 'p1'/'p2' -> username (NO rating: see _ev_player)
         self.tera = {}                   # 'us'/'opp' -> (turn, species, tera type)
 
         # --- protocol parser state ---
@@ -360,7 +361,10 @@ class LiveAnalyzer:
         score = getattr(best, "total_score", None) if best else None
         self._worlds.append({
             "visits": res.total_visits,
-            "eval": (score / best.visits) if score and best.visits else None,
+            # `score is not None`, not `score`: a total_score of exactly 0.0 is a real
+            # reading -- every rollout of the best root move lost -- and testing it for
+            # truth dropped the eval on precisely the turns worth looking at.
+            "eval": (score / best.visits) if score is not None and best.visits else None,
             "winner": best.move_choice if best else None,
             "reply": reply.move_choice if reply else None,
             "reply_share": (reply.visits / res.total_visits)
@@ -530,8 +534,8 @@ class LiveAnalyzer:
         for _state, res in list(getattr(self.agent, "_worlds", []) or []):
             for opt in res.side_one:
                 score = getattr(opt, "total_score", None)
-                if not score or not opt.visits:
-                    continue
+                if score is None or not opt.visits:
+                    continue    # 0.0 is a score, not a missing one -- see _on_world
                 num[opt.move_choice] = num.get(opt.move_choice, 0.0) + score
                 den[opt.move_choice] = den.get(opt.move_choice, 0) + opt.visits
         return {k: num[k] / den[k] for k in num if den.get(k)}
@@ -647,7 +651,10 @@ class LiveAnalyzer:
     def _ev_player(self, p):
         if len(p) < 4 or not p[3]:
             return
-        self.players[p[2]] = (p[3], p[5] if len(p) > 5 and p[5] else None)
+        # p[5] is the player's ladder rating. Deliberately dropped rather than stored:
+        # the transcript never reports Elo -- ours or theirs -- so there is nothing to
+        # keep it for, and an unstored value cannot leak into a later render.
+        self.players[p[2]] = p[3]
         if to_id_str(p[3]) == self.username:
             self.me = p[2]
 
@@ -765,6 +772,17 @@ class LiveAnalyzer:
                   + self.c("warn", f"TERASTALLIZED {ttype}"))
 
     def _ev_field(self, p):
+        if p[1] == "-weather":
+            # Showdown re-sends the standing weather every turn as '|-weather|Sun|[upkeep]',
+            # which rendered as a bare 'sunnyday' line on every single turn of a weather
+            # game; and the line that ENDS weather is '|-weather|none', which rendered as
+            # the word 'none'. Only real changes are worth a line.
+            if any(str(x) == "[upkeep]" for x in p[3:]):
+                return
+            self._flush()
+            what = "weather ended" if to_id_str(p[2]) == "none" else p[2]
+            self.line(f"   {self._stamp()} {' ' * 4}" + self.c("dim", what))
+            return
         self._flush()
         what = (p[3] if p[1] == "-sidestart" and len(p) > 3 else p[2]).replace("move: ", "")
         where = ""
@@ -838,8 +856,8 @@ class LiveAnalyzer:
         verdict = {"won": self.c("good", "WON"), "lost": self.c("bad", "LOST"),
                    "tie": self.c("warn", "TIE")}.get(result, result or "unfinished")
         who = "  vs  ".join(
-            f"{'us' if side == self.me else 'opp'} {name}" + (f" ({rating})" if rating else "")
-            for side, (name, rating) in sorted(self.players.items()))
+            f"{'us' if side == self.me else 'opp'} {name}"
+            for side, name in sorted(self.players.items()))
         self.line(f"  result      {verdict} in {turns} turns  ·  {who}")
 
         search_s = sum(self.think_ms) / 1000.0
@@ -875,8 +893,12 @@ class LiveAnalyzer:
             detail = ", ".join(f"{k} {v}" for k, v in sorted(self.hax["detail"].items()))
             self.line(f"  luck        {f} for / {a} against  (net {f - a:+d})  "
                       + self.c("dim", detail))
-        self.line(f"  damage      dealt {self.dealt:.0%} of their team  ·  "
-                  f"taken {self.taken:.0%} of ours")
+        # A SUM of per-Pokemon HP fractions, so its natural unit is "Pokemon-worth of HP"
+        # and it is not bounded by the size of a team -- anything healed has to be chewed
+        # through twice. Printed as a percentage under the label "of their team" it read
+        # 'dealt 577% of their team', which is not a thing.
+        self.line(f"  damage      dealt {self.dealt:.2f} Pokemon-worth of their HP  ·  "
+                  f"taken {self.taken:.2f} of ours")
         for who_, (turn, species, ttype) in sorted(self.tera.items()):
             self.line(f"  tera        {who_}: {_species_name(species)} -> {ttype} on T{turn}")
 
@@ -907,10 +929,16 @@ class LiveAnalyzer:
 
     def _swings(self, n=2, floor=0.12):
         """The decisions where the search's own estimate moved most -- where to look first
-        in the replay. Descriptive: a swing is as often their good play as our bad one."""
+        in the replay. Descriptive: a swing is as often their good play as our bad one.
+
+        Ranked by MAGNITUDE. Sorting the signed delta ascending, which is what this did,
+        returns the most negative two -- and in a game whose qualifying swings all happen to
+        be upward it returns the two SMALLEST of them, i.e. the opposite of what the label
+        promises."""
         deltas = [(self.evals[i][0], self.evals[i][1] - self.evals[i - 1][1])
                   for i in range(1, len(self.evals))]
-        return sorted((d for d in deltas if abs(d[1]) >= floor), key=lambda td: td[1])[:n]
+        return sorted((d for d in deltas if abs(d[1]) >= floor),
+                      key=lambda td: -abs(td[1]))[:n]
 
     def save(self, path):
         """Write the transcript (colour codes stripped) next to the replay."""
@@ -926,11 +954,47 @@ class AnalyzedPlayer(EnginePlayer):
     what happened" above "here is what I decided next". Parsing the raw lines instead of the
     updated battle object is what makes that ordering possible."""
 
-    def __init__(self, *args, analyzer=None, **kwargs):
+    def __init__(self, *args, analyzer=None, min_move_s=0.0, **kwargs):
         super().__init__(*args, observer=analyzer, **kwargs)
         self.analyzer = analyzer
+        self.min_move_s = max(0.0, float(min_move_s or 0.0))
         if analyzer is not None:
             analyzer.attach(self)
+
+    def choose_move(self, battle):
+        """Decide, then hold the move back until the turn has taken min_move_s.
+
+        The search answers in ~2s, which is faster than Showdown animates the turn that
+        just resolved -- so the analysis for turn N+1 lands on top of the animation for
+        turn N and there is no time to read it. A floor makes the transcript watchable.
+
+        poke-env accepts an Awaitable from choose_move (player.py: `if isinstance(choice,
+        Awaitable): choice = await choice`) and awaits it on its own POKE_LOOP, so this is
+        an asyncio.sleep on that loop, NOT a blocking one: the websocket keeps answering
+        pings and the timer keeps ticking down normally. A time.sleep here would stall the
+        connection instead.
+
+        The pause is AFTER the decision, so the analysis prints immediately and you read it
+        while the pad runs. The '[2.0s]' in the transcript and the post-game search-cost
+        block stay the real think time -- padding those would make the analysis lie.
+
+        Off (0.0) unless an entry point asks for it, so this costs nothing to the players
+        that subclass AnalyzedPlayer without wanting the pacing."""
+        t0 = time.perf_counter()
+        order = super().choose_move(battle)
+        remaining = self.min_move_s - (time.perf_counter() - t0)
+        if remaining <= 0:
+            return order
+        if self.analyzer is not None:
+            self.analyzer.line("  " + self.analyzer.c(
+                "dim", f"pacing   +{remaining:.1f}s idle to the "
+                       f"{self.min_move_s:g}s per-move floor"))
+
+        async def _paced():
+            await asyncio.sleep(remaining)
+            return order
+
+        return _paced()
 
     async def _handle_battle_message(self, split_messages):
         if self.analyzer is not None:

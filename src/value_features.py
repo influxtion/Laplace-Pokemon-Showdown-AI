@@ -150,7 +150,14 @@ def _active_damage_fracs(state, case_fix=True):
         try:
             r1, r2 = calculate_damage(state, m1[min(i, len(m1) - 1)],
                                       m2[min(i, len(m2) - 1)], True)
-        except Exception:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            # BaseException: poke-engine is a Rust extension and an inconsistent state makes
+            # it panic, which pyo3 raises as PanicException -- a BaseException, not an
+            # Exception. featurize() runs inside the value rerank on every decision, so a
+            # panic escaping here would take the whole turn down. See engine_search's
+            # module-level note.
             continue
         if r1:
             best1 = max(best1, (sum(r1) / len(r1)) / max(a2.maxhp, 1))

@@ -22,6 +22,7 @@ ONE game, on purpose. This is for watching and understanding; ladder.py plays a 
     python -u src\analyze_battle.py                     # one rated game, narrated
     python -u src\analyze_battle.py --upload            # + a public shareable replay
     python -u src\analyze_battle.py --ascii --no-color  # dumb terminals / redirects
+    python -u src\analyze_battle.py --min-move-time 0   # no pacing floor, send as soon as decided
     python -u src\analyze_battle.py --mode challenge --opponent SomeUser
 
 Credentials as in ladder.py. The game is rated and archived like any other; the transcript
@@ -30,6 +31,8 @@ goes next to the replay as <result>-<tag>.analysis.txt unless --no-save-log.
 
 import argparse
 import asyncio
+import contextlib
+import io
 import logging
 import os
 import sys
@@ -74,6 +77,9 @@ def print_header(agent, analyzer, args, fork):
     a.line(f"  search     {agent.N_DETERMINIZATIONS} determinized worlds x "
            f"{agent.SEARCH_TIME_MS}ms x {agent.THREADS} threads"
            f"   value net {'on' if agent._value_model is not None else 'off'}")
+    if getattr(agent, "min_move_s", 0) > 0:
+        a.line(f"  pacing     {agent.min_move_s:g}s minimum per move -- idles out "
+               f"whatever the search doesn't spend")
     root = "plain share averaging" if not agent.robust_vote else "robust world vote"
     mix = f"mixed strategy in a {agent.mix_frac:.2f} window" if agent.mix_root \
         else "deterministic argmax"
@@ -117,6 +123,12 @@ async def main():
     ap.add_argument("--no-save-log", action="store_true",
                     help="don't write the transcript next to the replay")
     ap.add_argument("--width", type=int, default=None, help="transcript width in columns")
+    ap.add_argument("--min-move-time", type=float, default=8.0, metavar="SECONDS",
+                    help="floor on the time spent per move (default 8.0). The search "
+                         "answers in ~2s, faster than Showdown animates the turn that "
+                         "just resolved, so the remainder is spent idle to keep the "
+                         "transcript readable. 0 sends as soon as the search returns. "
+                         "Analysis only -- ladder.py is not affected.")
     ap.add_argument("--fork", action="store_true",
                     help="run the Phase-2 fork engine (net-at-leaf, 600ms/world); handled at "
                          "import time by ladder.py, this flag just documents it")
@@ -144,7 +156,7 @@ async def main():
         extra["server_configuration"] = LocalhostServerConfiguration
     agent = ladder.build_agent(AccountConfiguration(args.username, args.password),
                                fork=ladder.FORK_MODE, cls=AnalyzedPlayer, analyzer=analyzer,
-                               **extra)
+                               min_move_s=args.min_move_time, **extra)
     print_header(agent, analyzer, args, ladder.FORK_MODE)
 
     if args.mode == "ladder":
@@ -181,19 +193,30 @@ async def main():
             print("\nNo game was played.", flush=True)
         else:
             result = ladder.result_label(battle)
-            path = None
-            if ladder.save_battle(agent, tag, battle, saved, warned):
-                path = os.path.join(ladder.REPLAY_DIR, f"{result}-{tag}.html")
+            stem = os.path.join(ladder.REPLAY_DIR, f"{result}-{tag}")
+            # path stays None if the replay didn't get written, so summary() doesn't claim
+            # a file that isn't there. The TRANSCRIPT is written off `stem` either way: it
+            # only exists in this process's memory, so tying it to the replay's success
+            # meant one bad .html write also threw away the analysis.
+            path = stem + ".html" if ladder.save_battle(
+                agent, tag, battle, saved, warned) else None
             # This game is rated like any other, so it can set the peak-Elo record too --
             # without this a record set here would be missed. stop_on_record=False: there is
             # no next game to stop, ladder.py's early stop is meaningless for one battle.
+            #
+            # Its stdout is swallowed ON PURPOSE. The analysis never reports a rating --
+            # ours or the opponent's -- and this is the only call in the run that would
+            # print one ('NEW ELO HIGH', the elo-stamped archive path, or a warning naming
+            # the rating it failed to read). The BOOKKEEPING is unaffected: the record still
+            # moves on disk and the replay is still archived under ELO_DIR, silently.
             if battle.finished and not args.local:
-                ladder.check_elo_record(agent, tag, battle,
-                                        ladder.Run(1, stop_on_record=False))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ladder.check_elo_record(agent, tag, battle,
+                                            ladder.Run(1, stop_on_record=False))
             analyzer.summary(battle=battle, result=result, replay_path=path,
                              diag=dict(agent.diag))
-            if not args.no_save_log and path:
-                log_path = path[: -len(".html")] + ".analysis.txt"
+            if not args.no_save_log:
+                log_path = stem + ".analysis.txt"
                 try:
                     analyzer.save(log_path)
                     print(f"  transcript  {log_path}", flush=True)
