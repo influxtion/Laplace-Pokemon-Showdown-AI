@@ -35,9 +35,10 @@ from poke_env.data import to_id_str
 
 from poke_engine import monte_carlo_tree_search, generate_instructions
 
-from knowledge import (estimate_damage_fraction, get_move, move_nullified,
-                       priority_ability_possible, safe_priority, _estimate_stat)
-from poke_engine_adapter import build_state
+from laplace.agent.knowledge import (estimate_damage_fraction, get_move, move_nullified,
+                                     priority_ability_possible, safe_priority,
+                                     _estimate_stat)
+from laplace.agent.poke_engine_adapter import build_state
 
 
 def _spe_mult(boost):
@@ -269,7 +270,7 @@ class EnginePlayer(Player):
 
     def _load_value_model(self, path):
         import torch
-        from train_value import ValueNet
+        from laplace.value.net import ValueNet
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         net = ValueNet(ckpt["n_in"], hidden=tuple(ckpt.get("hidden", (256, 128))),
                        dropout=ckpt.get("dropout", 0.1))
@@ -854,7 +855,7 @@ class EnginePlayer(Player):
         tied = tied[:5 if free_switch else 3]
         try:
             feats, owners, weights = [], [], []
-            from value_features import featurize
+            from laplace.value.value_features import featurize
             for state, res in self._worlds[:self.value_worlds]:
                 opp = sorted(res.side_two, key=lambda o: -o.visits)[:self.value_opp_moves]
                 opp = [o for o in opp if o.visits > 0]
@@ -1264,7 +1265,7 @@ class EnginePlayer(Player):
 
         def their_value(state, our_choice, opp_choice):
             """Opponent's mean value-net score of the one-ply successor (1 = they win)."""
-            from value_features import featurize
+            from laplace.value.value_features import featurize
             import numpy as _np
             import torch
             branches = generate_instructions(

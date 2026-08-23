@@ -10,8 +10,8 @@ contaminated and early stopping overfits into a great-looking number that means 
 Model: small torch MLP, CPU-friendly at inference -- the bot scores a handful of one-ply
 rollout states per decision, so the latency budget is sub-millisecond per batch.
 
-    python -u src\train_value.py                  # -> models/value_net.pt
-    python -u src\train_value.py --epochs 40
+    python -m laplace.cli.train_value                  # -> models/value_net.pt
+    python -m laplace.cli.train_value --epochs 40
 """
 
 import argparse
@@ -22,24 +22,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_GLOB = os.path.join(ROOT, "data_value2", "chunk_*.npz")   # v2 features (368)
-MODEL_PATH = os.path.join(ROOT, "models", "value_net.pt")
+from laplace import paths
+from laplace.value.net import ValueNet
 
-
-class ValueNet(nn.Module):
-    def __init__(self, n_in, hidden=(256, 128), dropout=0.1):
-        super().__init__()
-        layers = []
-        prev = n_in
-        for h in hidden:
-            layers += [nn.Linear(prev, h), nn.ReLU(), nn.Dropout(dropout)]
-            prev = h
-        layers.append(nn.Linear(prev, 1))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.net(x).squeeze(-1)     # logits; sigmoid at inference
+DATA_GLOB = os.path.join(paths.VALUE_DATA_DIR, "chunk_*.npz")   # v2 features (368)
+MODEL_PATH = paths.VALUE_NET
 
 
 def load_split(val_frac=0.1, seed=7):

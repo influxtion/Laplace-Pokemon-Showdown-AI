@@ -25,7 +25,8 @@ import random
 
 from poke_env.data import to_id_str, GenData
 
-from knowledge import _estimate_stat
+from laplace import paths
+from laplace.agent.knowledge import _estimate_stat
 
 from poke_engine import (
     State, Side, SideConditions, VolatileStatusDurations, Pokemon as PEPokemon, Move as PEMove,
@@ -34,10 +35,7 @@ from poke_engine import (
 GEN = 9
 _POKEDEX = GenData.from_gen(GEN).pokedex
 
-_SETS_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "server", "data", "random-battles", "gen9", "sets.json",
-)
+_SETS_PATH = paths.RANDBATS_SETS
 
 # --- status / weather / terrain name maps (poke-env -> poke-engine strings) ---------------
 
@@ -178,8 +176,7 @@ SETS = _SetSheet()
 # marginals lose, and matches the true generator distribution. Validated need: at
 # compute-matched settings we lost 1-11 to Foul Play, and this was its only relevant
 # structural edge.
-_JOINT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "data", "joint_sets_gen9.json")
+_JOINT_PATH = paths.JOINT_SETS
 
 
 class _JointSets:
@@ -244,8 +241,7 @@ JOINT = _JointSets()
 # Per-role item/ability/tera probabilities from the pkmn randbats stats feed. The set sheet
 # has no items at all, so we used to guess -> under-estimated Choice/Life Orb/weather damage
 # and stayed in fatal matchups. Cached locally; refresh from the feed when it drifts.
-_STATS_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "data", "randbats_stats_gen9.json")
+_STATS_PATH = paths.RANDBATS_STATS
 
 
 def _weighted(dist):

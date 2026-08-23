@@ -22,6 +22,8 @@ from functools import lru_cache
 from poke_env.battle import Move
 from poke_env.data import to_id_str
 
+from laplace import paths
+
 GEN = 9
 
 # Role vocabulary from gen9 randbats. Order is FIXED -- feature indices depend on it.
@@ -38,10 +40,7 @@ TYPE_NAMES = [
 HAZARD_CONDS = {"STEALTH_ROCK", "SPIKES", "TOXIC_SPIKES", "STICKY_WEB"}
 PIVOT_MOVES = {"uturn", "voltswitch", "flipturn", "partingshot", "teleport", "chillyreception"}
 
-_SETS_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "server", "data", "random-battles", "gen9", "sets.json",
-)
+_SETS_PATH = paths.RANDBATS_SETS
 
 N_THREAT_FLAGS = 6  # priority, recovery, hazard, setup, status, pivot
 

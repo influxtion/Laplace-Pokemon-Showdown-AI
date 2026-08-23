@@ -27,6 +27,8 @@ import json
 import os
 import re
 
+from laplace import paths
+
 LOG_RE = re.compile(r'<script type="text/plain" class="battle-log-data">(.*?)</script>', re.S)
 
 
@@ -973,7 +975,7 @@ def report(agg, baseline=None):
 
 def main():
     ap = argparse.ArgumentParser(description="Mine replays for blunder signatures.")
-    ap.add_argument("--dir", default=os.path.join("replays", "ladder"))
+    ap.add_argument("--dir", default=paths.LADDER_REPLAY_DIR)
     ap.add_argument("--include-file", action="append", default=[],
                     help="extra replay html(s) to mine (counted as losses)")
     ap.add_argument("--username", default=BOT_USERNAME,

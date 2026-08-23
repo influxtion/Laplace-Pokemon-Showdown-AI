@@ -1,7 +1,7 @@
 # Legacy — the pre-poke-engine era
 
 This folder is an **archive** of everything the project built *before* it became a search bot.
-None of it is on the live path (the shipped bot is in [`../src/`](../src/)); it's kept because
+None of it is on the live path (the shipped bot is in [`../src/laplace/`](../src/laplace/)); it's kept because
 it's the story of how [Laplace](../README.md) got here, and because the lessons are the
 interesting part of the project.
 
@@ -9,8 +9,9 @@ The trained PPO weight files (`ppo_*.zip`) are **not committed** — they're lar
 artifacts, regenerable from these scripts, and covered by `.gitignore`. The scripts and the
 results table below are what preserve this chapter.
 
-> These scripts originally lived in `src/` and assumed that working directory (sibling imports,
-> `models/` paths). They are archived as-is for reference, not maintained to run from here.
+> These scripts originally lived in `src/` as flat modules and assumed that working directory
+> (sibling imports, `models/` paths). They are archived as-is for reference, not maintained
+> to run from here.
 
 ## Rule-based vs. learned
 

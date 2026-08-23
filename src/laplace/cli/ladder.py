@@ -11,10 +11,10 @@ Setup (once):
          SHOWDOWN_PASSWORD=your-password
 
 From the project root:
-    python -u src\ladder.py                       # 10 ranked games
-    python -u src\ladder.py --battles 25
-    python -u src\ladder.py --mode accept         # wait for a challenge
-    python -u src\ladder.py --mode challenge --opponent SomeUser
+    python -m laplace.cli.ladder                       # 10 ranked games
+    python -m laplace.cli.ladder --battles 25
+    python -m laplace.cli.ladder --mode accept         # wait for a challenge
+    python -m laplace.cli.ladder --mode challenge --opponent SomeUser
 
 Ladder games are rated, so GXE/Elo shows on the account profile -- the honest test the
 offline benchmarks can't give. Follow Showdown's rules for automated play: keep the account
@@ -27,8 +27,8 @@ the process exits, so anything unwritten is lost.
 Those are local and always written. Hosted, shareable replays on
 replay.pokemonshowdown.com are OFF by default and opt-in per run:
 
-    python -u src\ladder.py --upload-first        # first 5 games, PUBLIC links
-    python -u src\ladder.py --upload-first 20     # first 20
+    python -m laplace.cli.ladder --upload-first        # first 5 games, PUBLIC links
+    python -m laplace.cli.ladder --upload-first 20     # first 20
 
 A dropped websocket does NOT end the run: the connection watchdog notices, the segment is
 torn down (replays swept, ratings logged) and the remaining games are played on a fresh
@@ -50,7 +50,7 @@ import re
 import sys
 from datetime import datetime
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from laplace import paths
 
 # --fork: Phase-2 engine build -- value net AT THE MCTS LEAF (blend 0.5 with the stock
 # eval, UCT c2=0.1) at 600ms/world. Cross-engine validated 43/60 = 71.7% vs the stock 120ms
@@ -63,9 +63,8 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # override wins.
 FORK_MODE = "--fork" in sys.argv
 if FORK_MODE:
-    sys.path.insert(0, os.path.join(_ROOT, "poke-engine-fork", "py"))
-    os.environ.setdefault("LAPLACE_VALUE_NET",
-                          os.path.join(_ROOT, "poke-engine-fork", "value_net_v5.bin"))
+    sys.path.insert(0, paths.FORK_WHEEL)
+    os.environ.setdefault("LAPLACE_VALUE_NET", paths.FORK_VALUE_NET)
     os.environ.setdefault("LAPLACE_VALUE_NET_BLEND", "0.5")
     os.environ.setdefault("LAPLACE_UCT_C2", "0.1")
 
@@ -75,7 +74,7 @@ from poke_env import AccountConfiguration, ShowdownServerConfiguration
 from poke_env.concurrency import handle_threaded_coroutines
 from poke_env.data import to_id_str
 
-from engine_search import EnginePlayer
+from laplace.agent.engine_search import EnginePlayer
 
 # Checks if fork actually loaded
 if FORK_MODE:
@@ -89,9 +88,9 @@ if FORK_MODE:
 BATTLE_FORMAT = "gen9randombattle"
 SPECTATE_URL = "https://play.pokemonshowdown.com/"   # + battle room id = watchable link
 
-# Anchored to the project root, NOT cwd, so `python path\to\src\ladder.py` from anywhere
-# still writes to the one replay archive.
-REPLAY_DIR = os.path.join(_ROOT, "replays", "ladder")
+# Anchored to the project root, NOT cwd (laplace/paths.py resolves it from __file__), so
+# running from any directory still writes to the one replay archive.
+REPLAY_DIR = paths.LADDER_REPLAY_DIR
 RATING_LOG = os.path.join(REPLAY_DIR, "ratings.csv")
 
 # Showdown-hosted (shareable) replays, uploaded via /savereplay. See request_upload().
@@ -120,8 +119,8 @@ ELO_DIR = os.path.join(REPLAY_DIR, "records")
 ELO_HIGH_FILE = os.path.join(REPLAY_DIR, "elo_high.json")
 ELO_HIGH_SEED = 2231
 
-# .env lives in the project root, one level up from src/.
-_ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+# .env lives in the project root; paths.py anchors it there, not to cwd.
+_ENV_PATH = paths.ENV_FILE
 
 
 def load_dotenv(path=_ENV_PATH):
@@ -148,8 +147,7 @@ def build_agent(account, fork=False, cls=EnginePlayer, **extra):
     # game at a time, so we spend a generous per-turn budget: more determinizations and
     # threads than the throughput-tuned benchmark default, ~1-2s/turn, well inside the move
     # timer. record=True keeps per-turn traces, dumped next to the replay for mining.
-    value_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                              "models", "value_net.pt")
+    value_path = paths.VALUE_NET
     # Settings that were all decided the hard way:
     #
     # value_boost_margin OFF (was 26). Cohort-2 mining (11W-19L, 2018 -> 1848): with the
@@ -774,9 +772,14 @@ async def main():
             print(f"    {tag}", flush=True)
 
 
-if __name__ == "__main__":
+def run():
+    """Sync entry point: the `laplace-ladder` console script, and `python -m`."""
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         # main()'s finally already swept the replays out; no traceback needed.
         print("\nInterrupted.", flush=True)
+
+
+if __name__ == "__main__":
+    run()

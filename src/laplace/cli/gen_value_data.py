@@ -12,7 +12,7 @@ generate_instructions / apply_instructions at decision time.
 Sharded across worker processes (poke-engine holds the GIL). Each worker writes an .npz
 chunk to data_value2/; chunks accumulate across runs and train_value.py globs them all.
 
-    python -u src\gen_value_data.py --battles 250 --workers 10
+    python -m laplace.cli.gen_value_data --battles 250 --workers 10
 """
 
 import argparse
@@ -22,20 +22,20 @@ import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
 
+from laplace import paths
+
 BATTLE_FORMAT = "gen9randombattle"
 # v2: 368-feature featurizer (ability/recovery/speed-race flags), 2 worlds per decision.
-DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                        "data_value2")
+DATA_DIR = paths.VALUE_DATA_DIR
 WORLDS_PER_DECISION = 2
 
 
 def _play_share(n, det, time_ms, idx, stamp, out_dir=None):
     import numpy as np
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from poke_env import AccountConfiguration
-    from engine_search import EnginePlayer
-    from poke_engine_adapter import build_state
-    from value_features import featurize, N_VALUE_FEATURES
+    from laplace.agent.engine_search import EnginePlayer
+    from laplace.agent.poke_engine_adapter import build_state
+    from laplace.value.value_features import featurize, N_VALUE_FEATURES
 
     class DataPlayer(EnginePlayer):
         """EnginePlayer that snapshots determinized world features per decision."""

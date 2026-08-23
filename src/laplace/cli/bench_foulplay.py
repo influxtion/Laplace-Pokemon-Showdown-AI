@@ -25,10 +25,11 @@ import os
 
 from poke_env import AccountConfiguration, LocalhostServerConfiguration
 
-from engine_search import EnginePlayer
+from laplace import paths
+from laplace.agent.engine_search import EnginePlayer
 
 BATTLE_FORMAT = "gen9randombattle"
-OUT_DIR = os.path.join("replays", "foulplay")
+OUT_DIR = paths.FOULPLAY_REPLAY_DIR
 
 
 async def main():
@@ -52,9 +53,7 @@ async def main():
                     help="value_boost_margin (0 = ladder config; 26 = the pre-cohort-2 arm)")
     args = ap.parse_args()
 
-    value_path = args.net or os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "models", "value_net.pt")
+    value_path = args.net or paths.VALUE_NET
     agent = EnginePlayer(
         account_configuration=AccountConfiguration(args.username, None),
         server_configuration=LocalhostServerConfiguration,

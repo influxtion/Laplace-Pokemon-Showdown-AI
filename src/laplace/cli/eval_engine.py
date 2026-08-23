@@ -13,9 +13,9 @@ This yardstick is SATURATED at ~92% -- it's a regression check, not a strength t
 real one is bench_foulplay.py.
 
 From the project root, with the local server running:
-    python -u src\eval_engine.py
-    python -u src\eval_engine.py --battles 100 --workers 10
-    python -u src\eval_engine.py --determinizations 8 --time-ms 150 --threads 2
+    python -m laplace.cli.eval_engine
+    python -m laplace.cli.eval_engine --battles 100 --workers 10
+    python -m laplace.cli.eval_engine --determinizations 8 --time-ms 150 --threads 2
 """
 
 import argparse
@@ -29,12 +29,9 @@ BATTLE_FORMAT = "gen9randombattle"
 
 def _play_share(n, det, time_ms, threads, idx):
     """Worker process: play `n` battles, return wins. Top-level so it pickles on Windows."""
-    import sys
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
     from poke_env import AccountConfiguration
     from poke_env.player import SimpleHeuristicsPlayer
-    from engine_search import EnginePlayer
+    from laplace.agent.engine_search import EnginePlayer
 
     async def run():
         engine = EnginePlayer(

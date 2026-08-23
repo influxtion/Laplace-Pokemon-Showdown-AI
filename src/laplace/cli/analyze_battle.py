@@ -1,6 +1,6 @@
 r"""Play ONE ladder game and narrate it live in the terminal.
 
-Same bot, same shipped ladder config -- it imports build_agent from ladder.py, so the
+Same bot, same shipped ladder config -- it imports build_agent from laplace.cli.ladder, so the
 settings can't drift. The difference is that the terminal becomes a live analysis board
 instead of a progress log. Per turn:
 
@@ -17,15 +17,16 @@ instead of a progress log. Per turn:
 Then a post-game block: search cost, MCTS volume, guard activity, how often the search
 called the opponent's move, the luck ledger, and the eval curve with its biggest swings.
 
-ONE game, on purpose. This is for watching and understanding; ladder.py plays a cohort.
+ONE game, on purpose. This is for watching and understanding; laplace.cli.ladder plays
+a cohort.
 
-    python -u src\analyze_battle.py                     # one rated game, narrated
-    python -u src\analyze_battle.py --upload            # + a public shareable replay
-    python -u src\analyze_battle.py --ascii --no-color  # dumb terminals / redirects
-    python -u src\analyze_battle.py --min-move-time 0   # no pacing floor, send as soon as decided
-    python -u src\analyze_battle.py --mode challenge --opponent SomeUser
+    python -m laplace.cli.analyze_battle                     # one rated game, narrated
+    python -m laplace.cli.analyze_battle --upload            # + a public shareable replay
+    python -m laplace.cli.analyze_battle --ascii --no-color  # dumb terminals / redirects
+    python -m laplace.cli.analyze_battle --min-move-time 0   # no pacing floor, send as soon as decided
+    python -m laplace.cli.analyze_battle --mode challenge --opponent SomeUser
 
-Credentials as in ladder.py. The game is rated and archived like any other; the transcript
+Credentials as in laplace.cli.ladder. The game is rated and archived like any other; the transcript
 goes next to the replay as <result>-<tag>.analysis.txt unless --no-save-log.
 """
 
@@ -39,8 +40,8 @@ import sys
 
 # ladder FIRST: its module-level --fork block has to run before poke_engine is imported
 # anywhere. Importing it is also what keeps the shipped config in one place.
-import ladder
-from live_analysis import AnalyzedPlayer, LiveAnalyzer, enable_ansi
+from laplace.cli import ladder
+from laplace.analysis.live_analysis import AnalyzedPlayer, LiveAnalyzer, enable_ansi
 
 from poke_env import AccountConfiguration
 
@@ -224,9 +225,14 @@ async def main():
                     print(f"  WARNING: could not write the transcript: {exc!r}", flush=True)
 
 
-if __name__ == "__main__":
+def run():
+    """Sync entry point: the `laplace-analyze` console script, and `python -m`."""
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         # main()'s finally already saved the replay and printed the summary.
         print("\nInterrupted.", flush=True)
+
+
+if __name__ == "__main__":
+    run()

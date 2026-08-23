@@ -25,7 +25,7 @@ raise into the client loop either -- EnginePlayer._emit swallows observer errors
 protocol feed is wrapped the same way, because a broken renderer must never cost a rated
 game. Renderer failures are counted and reported in summary() instead of dying quietly.
 
-Consumer: analyze_battle.py.
+Consumer: laplace.cli.analyze_battle.
 """
 
 import asyncio
@@ -36,8 +36,8 @@ import time
 
 from poke_env.data import GenData, to_id_str
 
-from engine_search import EnginePlayer
-from knowledge import get_move
+from laplace.agent.engine_search import EnginePlayer
+from laplace.agent.knowledge import get_move
 
 _DEX = GenData.from_gen(9).pokedex
 
