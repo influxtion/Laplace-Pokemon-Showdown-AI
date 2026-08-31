@@ -78,10 +78,10 @@ def _estimate_stat(mon, key):
     return point + 5
 
 
-def _max_hp(mon):
+def _max_hp(mon, knowledge=None):
     if getattr(mon, "max_hp", 0):
         return mon.max_hp
-    return _estimate_stat(mon, "hp")
+    return (knowledge or KNOWLEDGE).estimate_stat(mon, "hp")
 
 
 # Abilities that nullify a whole attacking type (immunity or absorb-heal). damage_multiplier
@@ -118,7 +118,7 @@ _PRIORITY_ABILITIES = {
 }
 
 
-def priority_ability_possible(mon, move):
+def priority_ability_possible(mon, move, knowledge=None):
     """True if `mon` might be moving out of `move`'s printed priority bracket by ability.
 
     POSSIBILITY, not certainty, on purpose -- the opposite standard from _ability_absorbs.
@@ -133,17 +133,22 @@ def priority_ability_possible(mon, move):
     if mon.ability:
         test = _PRIORITY_ABILITIES.get(to_id_str(mon.ability))
         return bool(test and test(move))
-    for ability, p in KNOWLEDGE.predicted_abilities(mon).items():
+    for ability, p in (knowledge or KNOWLEDGE).predicted_abilities(mon).items():
         test = _PRIORITY_ABILITIES.get(ability)
         if p > 0 and test and test(move):
             return True
     return False
 
 
-def _ability_absorbs(attacker, move, defender):
-    """True iff the defender's ability CERTAINLY nullifies this move: revealed, or every
-    still-possible randbats set runs an absorbing ability for the move's type. Any
-    uncertainty -> False. Never veto on a guess."""
+def _ability_absorbs(attacker, move, defender, knowledge=None):
+    """True iff the defender's ability CERTAINLY nullifies this move: revealed, or the set
+    prior puts >= 0.99 on an ability that absorbs the move's type. Any uncertainty -> False.
+    Never veto on a guess.
+
+    What "certain" means is the PRIOR's job, and the two priors reach it differently: Random
+    Battle can say so once every still-possible generated set agrees, because the generator
+    is ground truth, while OU only has usage statistics and reserves certainty for a species
+    with a single legal ability. See laplace.agent.metagame for the contract."""
     if move.id in _ABSORB_CHECK_SKIP or move.type is None:
         return False
     if attacker is not None and to_id_str(attacker.ability or "") in _ABILITY_IGNORING:
@@ -151,12 +156,12 @@ def _ability_absorbs(attacker, move, defender):
     mtype = move.type.name
     if defender.ability:
         return _ABSORB_ABILITY_TYPE.get(to_id_str(defender.ability)) == mtype
-    probs = KNOWLEDGE.predicted_abilities(defender)
+    probs = (knowledge or KNOWLEDGE).predicted_abilities(defender)
     absorbed = sum(p for a, p in probs.items() if _ABSORB_ABILITY_TYPE.get(a) == mtype)
     return absorbed >= 0.99
 
 
-def move_nullified(attacker, move, defender):
+def move_nullified(attacker, move, defender, knowledge=None):
     """True iff an attacking move is CERTAIN to deal zero: type-chart immunity on the
     revealed typing, or an absorb ability per _ability_absorbs. Deterministic hard
     knowledge only, which is what makes it safe for a guard to demote on."""
@@ -167,12 +172,12 @@ def move_nullified(attacker, move, defender):
             return False
         if defender.damage_multiplier(move) == 0:
             return True
-        return _ability_absorbs(attacker, move, defender)
+        return _ability_absorbs(attacker, move, defender, knowledge)
     except Exception:
         return False
 
 
-def estimate_damage_fraction(attacker, move, defender):
+def estimate_damage_fraction(attacker, move, defender, knowledge=None):
     """Estimated damage as a fraction of the defender's max HP. 0 for status / immune /
     certainly-absorbed, clamped to 1.5 for overkill.
 
@@ -180,19 +185,20 @@ def estimate_damage_fraction(attacker, move, defender):
     shouldn't crash a multi-hour run, and a missed estimate just reads 0.
     """
     try:
-        if _ability_absorbs(attacker, move, defender):
+        if _ability_absorbs(attacker, move, defender, knowledge):
             return 0.0
-        return _estimate_damage_fraction(attacker, move, defender)
+        return _estimate_damage_fraction(attacker, move, defender, knowledge)
     except Exception:
         return 0.0
 
 
-def _estimate_damage_fraction(attacker, move, defender):
+def _estimate_damage_fraction(attacker, move, defender, knowledge=None):
     if attacker is None or defender is None or move is None or move.base_power <= 0:
         return 0.0
+    kb = knowledge or KNOWLEDGE
     physical = move.category.name == "PHYSICAL"
-    a = _estimate_stat(attacker, "atk" if physical else "spa")
-    d = _estimate_stat(defender, "def" if physical else "spd")
+    a = kb.estimate_stat(attacker, "atk" if physical else "spa")
+    d = kb.estimate_stat(defender, "def" if physical else "spd")
     if d <= 0:
         return 0.0
     lvl = attacker.level or 100
@@ -206,7 +212,7 @@ def _estimate_damage_fraction(attacker, move, defender):
     if physical and attacker.status is not None and attacker.status.name == "BRN":
         dmg *= 0.5
 
-    maxhp = _max_hp(defender)
+    maxhp = _max_hp(defender, kb)
     return min(dmg / maxhp, 1.5) if maxhp else 0.0
 
 
@@ -229,6 +235,25 @@ class RandbatsKnowledge:
                 self._sets[to_id_str(species)] = parsed
         except (OSError, ValueError) as e:
             print(f"[knowledge] could not load randbats sets ({e}); predictions disabled.")
+
+    # --- the Knowledge protocol (see laplace.agent.metagame) ------------------
+
+    @staticmethod
+    def estimate_stat(mon, key):
+        """One stat: real if we know it, else the randbats convention (85 EVs / 31 IVs /
+        neutral). Public name for _estimate_stat, which the rest of this file and the
+        adapter still call directly."""
+        return _estimate_stat(mon, key)
+
+    @staticmethod
+    def speed_bounds(mon):
+        """(slowest, fastest) unboosted Speed -- a single point in Random Battle.
+
+        Every generated set runs the same spread, so 'could it have outsped without a Choice
+        Scarf?' has one answer and the bound is degenerate. It exists so the Scarf inference
+        can be written once and stay correct in a format where spreads are chosen."""
+        spe = int(_estimate_stat(mon, "spe"))
+        return spe, spe
 
     # --- prediction -----------------------------------------------------------
 

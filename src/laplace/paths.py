@@ -40,3 +40,15 @@ VALUE_DATA_DIR = os.path.join(ROOT, "data_value2")   # v2 features (368)
 
 # --- local secrets ------------------------------------------------------------
 ENV_FILE = os.path.join(ROOT, ".env")
+
+# --- Gen 9 OU -----------------------------------------------------------------
+# Built by `python -m laplace.cli.fetch_ou_data`, committed like the randbats data.
+OU_DATA_DIR = os.path.join(DATA_DIR, "ou")
+OU_USAGE = os.path.join(OU_DATA_DIR, "usage_gen9ou.json")
+OU_SETS = os.path.join(OU_DATA_DIR, "sets_gen9ou.json")
+
+# Our own OU teams: Showdown-export .txt files, one team per file. Committed --
+# unlike Random Battle, the team IS part of the bot.
+TEAMS_DIR = os.path.join(ROOT, "teams")
+
+OU_REPLAY_DIR = os.path.join(REPLAYS_DIR, "ladder_ou")

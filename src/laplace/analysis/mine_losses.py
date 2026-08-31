@@ -627,7 +627,12 @@ def classify_loss(sig, hax_net, first_behind, recovered, game_len, correlated, s
 _ANTI_SETUP = {"haze", "clearsmog", "roar", "whirlwind", "dragontail", "circlethrow",
                "taunt", "encore", "spectralthief", "coreenforcer"}
 _HAZARD_SET = {"stealthrock", "spikes", "toxicspikes", "stickyweb"}
-_HAZARD_CLEAR = {"rapidspin", "defog", "mortalspin", "tidyup"}
+# courtchange is hazard control even though it removes nothing: it hands our side's hazards
+# to the opponent and takes theirs, which is the same job with a better result. Left out
+# originally because Cinderace rarely carries it in Random Battle; it is the PRIMARY removal
+# on standard OU balance, so without it the hazard_clear counter reads zero on exactly the
+# teams that control hazards best.
+_HAZARD_CLEAR = {"rapidspin", "defog", "mortalspin", "tidyup", "courtchange"}
 
 # A pooled top1-top2 gap under this is a policy that did not separate its candidates: the
 # vote is determinization noise and whatever ranks first is close to arbitrary. Same scale

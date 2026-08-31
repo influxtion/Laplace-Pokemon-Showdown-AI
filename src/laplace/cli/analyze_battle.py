@@ -25,6 +25,7 @@ a cohort.
     python -m laplace.cli.analyze_battle --ascii --no-color  # dumb terminals / redirects
     python -m laplace.cli.analyze_battle --min-move-time 0   # no pacing floor, send as soon as decided
     python -m laplace.cli.analyze_battle --mode challenge --opponent SomeUser
+    python -m laplace.cli.analyze_battle --format gen9ou --team balance
 
 Credentials as in laplace.cli.ladder. The game is rated and archived like any other; the transcript
 goes next to the replay as <result>-<tag>.analysis.txt unless --no-save-log.
@@ -66,7 +67,7 @@ async def announce(agent, analyzer, waiting, upload, local=False, poll=0.4):
         await asyncio.sleep(poll)
 
 
-def print_header(agent, analyzer, args, fork):
+def print_header(agent, analyzer, args, fork, profile):
     """One block describing exactly what's about to play, read off the live agent so it
     can't drift from build_agent()."""
     a = analyzer
@@ -74,6 +75,8 @@ def print_header(agent, analyzer, args, fork):
     engine = "poke-engine MCTS" + (" [FORK: value net at the leaf]" if fork else "")
     where = "localhost:8000" if args.local else "official Showdown server"
     a.line(f"  account    {args.username} @ {where}")
+    a.line(f"  format     {profile.name}"
+           + (f"   team {profile.team_name}" if profile.team_name else ""))
     a.line(f"  engine     {engine}")
     a.line(f"  search     {agent.N_DETERMINIZATIONS} determinized worlds x "
            f"{agent.SEARCH_TIME_MS}ms x {agent.THREADS} threads"
@@ -104,6 +107,13 @@ async def main():
     ladder.load_dotenv()      # SHOWDOWN_* before argparse reads them as defaults
     ap = argparse.ArgumentParser(
         description="Play one ladder game with live search analysis in the terminal.")
+    ap.add_argument("--format", default=ladder.DEFAULT_FORMAT, choices=sorted(ladder.FORMATS),
+                    help=f"which ladder to play (default {ladder.DEFAULT_FORMAT})")
+    ap.add_argument("--team", default=None, metavar="NAME",
+                    help="team to bring, for formats that need one (the stem of a Showdown "
+                         "export in teams/)")
+    ap.add_argument("--lead", type=int, default=None, metavar="N",
+                    help="always lead with team slot N at team preview")
     ap.add_argument("--mode", choices=("ladder", "accept", "challenge"), default="ladder",
                     help="ladder = one rated game (default); accept = wait for a challenge; "
                          "challenge = challenge --opponent")
@@ -134,6 +144,7 @@ async def main():
                     help="run the Phase-2 fork engine (net-at-leaf, 600ms/world); handled at "
                          "import time by ladder.py, this flag just documents it")
     args = ap.parse_args()
+    profile = ladder.configure(args.format, team=args.team, lead=args.lead)
 
     if not args.username:
         ap.error("no username: set SHOWDOWN_USERNAME in .env or pass --username "
@@ -158,7 +169,7 @@ async def main():
     agent = ladder.build_agent(AccountConfiguration(args.username, args.password),
                                fork=ladder.FORK_MODE, cls=AnalyzedPlayer, analyzer=analyzer,
                                min_move_s=args.min_move_time, **extra)
-    print_header(agent, analyzer, args, ladder.FORK_MODE)
+    print_header(agent, analyzer, args, ladder.FORK_MODE, profile)
 
     if args.mode == "ladder":
         play, waiting = agent.ladder(1), "queued on the ladder, waiting for an opponent..."

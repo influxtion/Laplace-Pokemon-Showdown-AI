@@ -26,6 +26,8 @@ train = ["stable-baselines3==2.8.0", "sb3-contrib==2.8.0", "tensorboard"]
 
 [project.scripts]
 laplace-ladder = "laplace.cli.ladder:run"
+laplace-ou = "laplace.cli.ladder_ou:run"
+laplace-fetch-ou = "laplace.cli.fetch_ou_data:main"
 laplace-analyze = "laplace.cli.analyze_battle:run"
 laplace-mine = "laplace.analysis.mine_losses:main"
 laplace-train-value = "laplace.cli.train_value:main"

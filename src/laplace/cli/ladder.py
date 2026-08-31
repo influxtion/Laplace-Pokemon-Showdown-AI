@@ -16,6 +16,15 @@ From the project root:
     python -m laplace.cli.ladder --mode accept         # wait for a challenge
     python -m laplace.cli.ladder --mode challenge --opponent SomeUser
 
+This harness is format-agnostic -- everything below (reconnects, replay archiving, the Elo
+record, the rating log) is about RUNNING games, not about playing them -- so a second format
+is a --format away, and gets its own replay directory and its own Elo record:
+
+    python -m laplace.cli.ladder --format gen9ou --team balance
+
+Which is what laplace.cli.ladder_ou is: this file with the OU defaults filled in. See
+FORMATS / configure() for what a format actually has to supply.
+
 Ladder games are rated, so GXE/Elo shows on the account profile -- the honest test the
 offline benchmarks can't give. Follow Showdown's rules for automated play: keep the account
 present, don't flood the ladder, don't farm a specific person.
@@ -97,13 +106,7 @@ if FORK_MODE:
     if not FORK_BASELINE and not os.path.exists(os.environ["LAPLACE_VALUE_NET"]):
         sys.exit(f"--fork: weight file missing: {os.environ['LAPLACE_VALUE_NET']}")
 
-BATTLE_FORMAT = "gen9randombattle"
 SPECTATE_URL = "https://play.pokemonshowdown.com/"   # + battle room id = watchable link
-
-# Anchored to the project root, NOT cwd (laplace/paths.py resolves it from __file__), so
-# running from any directory still writes to the one replay archive.
-REPLAY_DIR = paths.LADDER_REPLAY_DIR
-RATING_LOG = os.path.join(REPLAY_DIR, "ratings.csv")
 
 # Showdown-hosted (shareable) replays, uploaded via /savereplay. See request_upload().
 # OFF unless --upload-first is passed: the links are public, so publishing is a deliberate
@@ -121,15 +124,124 @@ MAX_RECONNECTS = 5
 RECONNECT_WAIT = 15.0
 CANCEL_GRACE = 5.0          # after /cancelsearch, how long a match already made can still land
 
-# Peak-Elo tracking (see final_rating / check_elo_record). Every game that ends above the
-# standing record archives a second copy of its replay here and moves the record on.
-# ELO_HIGH_FILE is the running one and wins once written; ELO_HIGH_SEED is only the floor
-# for the very first run -- the account's peak as of 2026-08-18, and the same number the
-# README reports. replays/ is gitignored, so ELO_HIGH_FILE is machine-local: this constant
-# is the only committed record of the peak, and is worth bumping when one is set.
-ELO_DIR = os.path.join(REPLAY_DIR, "records")
-ELO_HIGH_FILE = os.path.join(REPLAY_DIR, "elo_high.json")
-ELO_HIGH_SEED = 2231
+# --- formats ------------------------------------------------------------------------------
+#
+# A format supplies four things: what to tell Showdown, how the bot thinks (a Metagame --
+# see laplace.agent.metagame), where its games are archived, and what its Elo record starts
+# at. Everything else in this file is shared.
+#
+# Peak-Elo tracking (see final_rating / check_elo_record): every game that ends above the
+# standing record archives a second copy of its replay under records/ and moves the record
+# on. elo_high.json is the running one and wins once written; `elo_seed` is only the floor
+# for the very first run. replays/ is gitignored, so elo_high.json is machine-local, which
+# makes these seeds the only committed record of a peak -- worth bumping when one is set.
+
+
+class FormatProfile:
+    """One playable format, and where its runs are kept."""
+
+    def __init__(self, name, replay_dir, elo_seed, metagame=None, needs_team=False,
+                 use_value_net=True, stop_on_record=True):
+        self.name = name
+        self.replay_dir = replay_dir
+        self.elo_seed = elo_seed
+        self.metagame = metagame          # None = the shipped Random Battle default
+        self.needs_team = needs_team
+        # The shipped value net was trained on Random Battle self-play states. It is a
+        # tie-breaker over a distribution, and OU is a different distribution, so it stays
+        # off there until an OU-trained one exists: an out-of-distribution reranker holding
+        # authority over near-ties is worse than no reranker at all.
+        self.use_value_net = use_value_net
+        # A new record ends the run by default rather than handing a fresh peak straight
+        # back to the next opponent. That ritual only makes sense once there IS a peak worth
+        # protecting; a format starting from scratch would stop after its first win.
+        self.stop_on_record = stop_on_record
+        self.team_text = None             # filled by configure() for team formats
+        self.team_name = None
+        self.team_members = ()
+
+    @property
+    def rating_log(self):
+        return os.path.join(self.replay_dir, "ratings.csv")
+
+    @property
+    def elo_dir(self):
+        return os.path.join(self.replay_dir, "records")
+
+    @property
+    def elo_high_file(self):
+        return os.path.join(self.replay_dir, "elo_high.json")
+
+
+FORMATS = {
+    # The shipped bot. elo_seed is the account's peak as of 2026-08-18, the same number the
+    # README reports.
+    "gen9randombattle": lambda: FormatProfile(
+        "gen9randombattle", paths.LADDER_REPLAY_DIR, elo_seed=2231),
+    "gen9ou": lambda: FormatProfile(
+        "gen9ou", paths.OU_REPLAY_DIR, elo_seed=0, needs_team=True,
+        use_value_net=False, stop_on_record=False),
+}
+
+DEFAULT_FORMAT = "gen9randombattle"
+
+PROFILE = FORMATS[DEFAULT_FORMAT]()
+
+# Module-level aliases, kept because half this file and analyze_battle read them directly.
+# configure() rebinds them; until it runs they hold the shipped Random Battle values, so a
+# caller that never mentions a format sees exactly what it always saw.
+BATTLE_FORMAT = PROFILE.name
+# Anchored to the project root, NOT cwd (laplace/paths.py resolves it from __file__), so
+# running from any directory still writes to the one replay archive.
+REPLAY_DIR = PROFILE.replay_dir
+RATING_LOG = PROFILE.rating_log
+ELO_DIR = PROFILE.elo_dir
+ELO_HIGH_FILE = PROFILE.elo_high_file
+ELO_HIGH_SEED = PROFILE.elo_seed
+
+
+def configure(fmt, team=None, lead=None):
+    """Select the format for this process. Returns the profile; also rebinds the aliases.
+
+    Called once, before any agent is built. Rebinding module globals is not elegant, but the
+    alternative is threading a profile through two dozen functions that only ever want one
+    of them -- and analyze_battle imports these names to print them, so they would have to
+    be right there too. The FORK_MODE flag above is resolved the same way, for the same
+    reason.
+
+    A team format loads and VALIDATES its team here, so a malformed export fails at startup
+    rather than at match time, several minutes into a run."""
+    global PROFILE, BATTLE_FORMAT, REPLAY_DIR, RATING_LOG, ELO_DIR, ELO_HIGH_FILE
+    global ELO_HIGH_SEED
+    if fmt not in FORMATS:
+        raise SystemExit(f"unknown --format {fmt!r}; have: {', '.join(sorted(FORMATS))}")
+    profile = FORMATS[fmt]()
+    if fmt == "gen9ou":
+        # Imported here, not at module scope: the Random Battle path must not pay to load
+        # the OU priors, and a missing OU data file must not stop it from running at all.
+        from laplace.ou.metagame import OUMetagame
+        profile.metagame = OUMetagame(fixed_lead=lead)
+    if profile.needs_team:
+        from laplace.ou import teams as ou_teams
+        if not team:
+            known = ou_teams.available()
+            raise SystemExit(
+                f"--format {fmt} needs --team NAME. Put a Showdown export in "
+                f"{ou_teams.team_dir()} as <name>.txt"
+                + (f"; have: {', '.join(known)}" if known else " (none there yet)"))
+        try:
+            profile.team_text, profile.team_members = ou_teams.load(team)
+        except ou_teams.TeamError as exc:
+            raise SystemExit(str(exc)) from exc
+        profile.team_name = team
+    PROFILE = profile
+    BATTLE_FORMAT = profile.name
+    REPLAY_DIR = profile.replay_dir
+    RATING_LOG = profile.rating_log
+    ELO_DIR = profile.elo_dir
+    ELO_HIGH_FILE = profile.elo_high_file
+    ELO_HIGH_SEED = profile.elo_seed
+    return profile
 
 # .env lives in the project root; paths.py anchors it there, not to cwd.
 _ENV_PATH = paths.ENV_FILE
@@ -154,7 +266,12 @@ def build_agent(account, fork=False, cls=EnginePlayer, **extra):
     THE single source of truth for ladder settings. `cls`/`extra` exist so another entry
     point can run the SHIPPED config with a different Player subclass or one extra kwarg
     (analyze_battle passes the live-analysis player) without forking this function -- a copy
-    would silently drift."""
+    would silently drift.
+
+    Everything format-dependent comes from the profile configure() selected, so the search
+    settings below are stated once and apply to every format. That is deliberate: the
+    determinization count, the time budget and the root policy were all decided by
+    head-to-head tests, and none of those tests was about Random Battle specifically."""
     # poke-engine needs no trained model; it searches the position directly. Ladder is one
     # game at a time, so we spend a generous per-turn budget: more determinizations and
     # threads than the throughput-tuned benchmark default, ~1-2s/turn, well inside the move
@@ -172,16 +289,20 @@ def build_agent(account, fork=False, cls=EnginePlayer, **extra):
     # where the stock eval provably can't (budget falsified twice for stock; fork600 vs
     # stock120 = 71.7%/60). ~5s/turn at det8 sequential -- inside the timer, but with less
     # bank cushion in very long games.
+    use_net = PROFILE.use_value_net and os.path.exists(value_path)
     kwargs = dict(
         account_configuration=account,
         server_configuration=ShowdownServerConfiguration,
         battle_format=BATTLE_FORMAT,
         start_timer_on_battle_start=True,   # an AFK opponent can't stall us out
         n_determinizations=8, search_time_ms=600 if fork else 150, threads=8, record=True,
-        value_model_path=value_path if os.path.exists(value_path) else None,
+        value_model_path=value_path if use_net else None,
         value_boost_margin=0,
         robust_vote=False, mix_root=True, mix_frac=0.9,
+        metagame=PROFILE.metagame,
     )
+    if PROFILE.team_text:
+        kwargs["team"] = PROFILE.team_text
     kwargs.update(extra)
     return cls(**kwargs)
 
@@ -201,13 +322,28 @@ def replay_url(battle_tag):
 
 
 class PopupWatcher(logging.Handler):
-    """Print the upload confirmation Showdown sends back after /savereplay.
+    """Print the popups Showdown answers with, which poke_env otherwise only logs.
 
-    The server answers with a popup -- link or error -- and poke_env only logs it ('Popup
-    message received'). Rather than patch poke_env's message loop we tap its logger. Worst
-    case we miss a confirmation; the local .html archive is unaffected."""
+    Two of them matter. The /savereplay confirmation (a link, or a refusal), and -- for any
+    format where we bring our own team -- a TEAM REJECTION.
+
+    The rejection is the important one, because its failure mode is silence. Showdown
+    validates the team when the match is made, not when the client connects, and poke_env
+    has no handler for the popup it sends back: the search never starts, no |request| ever
+    arrives, the websocket stays up so the reconnect watchdog never fires, and the run just
+    sits there. That is eight minutes of staring at 'Searching for the next opponent...'
+    with nothing wrong except one illegal move on one Pokemon. Reprinting the popup turns it
+    into the one-line error it should always have been.
+
+    Tapping the logger rather than patching poke_env's message loop keeps this advisory:
+    worst case we miss a message, and nothing else is affected."""
 
     _URL = re.compile(r"https?://replay\.pokemonshowdown\.com/[^\s\"'<>]+")
+    # Substrings of the validator's own wording. Showdown phrases these as
+    # "Your team was rejected for the following reasons:" followed by the specific problem
+    # ("X's move Y is banned", "X is banned", "Your team is illegal"...).
+    _REJECTED = ("was rejected", "is banned", "is not legal", "team is illegal",
+                 "cannot be used in this format")
 
     def __init__(self):
         super().__init__()
@@ -225,6 +361,13 @@ class PopupWatcher(logging.Handler):
                     print(f"    uploaded -> {url}", flush=True)
             if "could not be saved" in msg:
                 print(f"    WARNING: Showdown refused the replay upload: {msg}", flush=True)
+            if any(s in msg for s in self._REJECTED) and msg not in self.seen:
+                self.seen.add(msg)
+                print(f"\n  TEAM REJECTED BY SHOWDOWN -- no game will start:\n    "
+                      f"{msg.strip()}\n  Fix the export in teams/ and run again. To check a "
+                      f"team offline, with the local server checked out:\n    node "
+                      f"pokemon-showdown validate-team {BATTLE_FORMAT} < packed-team.txt\n",
+                      flush=True)
         except Exception:       # a logging handler must never break the client loop
             pass
 
@@ -653,9 +796,19 @@ async def play_segment(agent, run, play):
             pool.shutdown(wait=False, cancel_futures=True)
 
 
-async def main():
+async def main(default_format=DEFAULT_FORMAT):
     load_dotenv()  # populate SHOWDOWN_* before argparse reads them as defaults
     parser = argparse.ArgumentParser(description="Play the bot on the real Showdown ladder.")
+    parser.add_argument("--format", default=default_format, choices=sorted(FORMATS),
+                        help=f"which ladder to play (default {default_format}). Each format "
+                             f"keeps its own replays and its own Elo record.")
+    parser.add_argument("--team", default=None, metavar="NAME",
+                        help="team to bring, for formats that need one: the stem of a "
+                             "Showdown export in teams/ (or a path to one). Ignored by "
+                             "Random Battle.")
+    parser.add_argument("--lead", type=int, default=None, metavar="N",
+                        help="always lead with team slot N at team preview instead of "
+                             "scoring the matchup each game")
     parser.add_argument("--mode", choices=("ladder", "accept", "challenge"), default="ladder",
                         help="ladder = ranked games; accept = wait for a challenge; "
                              "challenge = challenge --opponent")
@@ -678,14 +831,22 @@ async def main():
                              "engine=fork-base. Use this to give the fork build a ladder "
                              "baseline before changing anything inside it.")
     parser.add_argument("--no-stop-on-record", action="store_true",
-                        help="keep laddering after a new Elo record. By default a record "
-                             "ends the run immediately -- the queue is cancelled rather "
-                             "than putting the fresh peak straight back at risk.")
+                        help="keep laddering after a new Elo record. Random Battle stops by "
+                             "default -- the queue is cancelled rather than putting the "
+                             "fresh peak straight back at risk.")
+    parser.add_argument("--stop-on-record", action="store_true",
+                        help="the other direction: stop on a new record in a format that "
+                             "does not by default (one with no established peak yet).")
     parser.add_argument("--reconnects", type=int, default=MAX_RECONNECTS, metavar="N",
                         help=f"after a dropped websocket, resume the remaining games on a "
                              f"fresh connection, up to N consecutive failures "
                              f"(default {MAX_RECONNECTS}; 0 = stop at the first drop)")
     args = parser.parse_args()
+    if args.no_stop_on_record and args.stop_on_record:
+        parser.error("--stop-on-record and --no-stop-on-record contradict each other.")
+
+    # Before anything builds an agent or touches a replay directory.
+    profile = configure(args.format, team=args.team, lead=args.lead)
 
     if not args.username:
         parser.error("no username: set SHOWDOWN_USERNAME or pass --username "
@@ -708,6 +869,18 @@ async def main():
     else:
         print(f"Playing as '{args.username}' (Laplace: poke-engine MCTS).", flush=True)
 
+    print(f"  format {profile.name}", flush=True)
+    if profile.team_name:
+        from laplace.ou import teams as ou_teams
+        print(f"  team   {profile.team_name}: "
+              f"{ou_teams.describe(profile.team_members)}", flush=True)
+    # Whether the format's priors are actually on disk. The loaders degrade to "no prior"
+    # rather than raising, which plays but plays badly, and a silent strength drop is the
+    # kind of thing that gets misdiagnosed as a bug in the search.
+    ready = getattr(profile.metagame, "ready", None)
+    if ready is not None:
+        ok, message = ready()
+        print(f"  {'' if ok else 'WARNING: '}{message}", flush=True)
     print(f"Replays -> {REPLAY_DIR}", flush=True)
     if args.upload_first > 0:
         print(f"  first {args.upload_first} game(s) ALSO published as public replays on "
@@ -716,8 +889,12 @@ async def main():
     # One agent per connection. A drop retires the agent (poke_env can't reconnect one) and
     # the loop builds another for whatever is left to play, so a 20-game run isn't ended by
     # a 2-second network hiccup at game 6.
-    run = Run(args.battles, args.upload_first,
-              stop_on_record=not args.no_stop_on_record)
+    stop_on_record = profile.stop_on_record
+    if args.no_stop_on_record:
+        stop_on_record = False
+    elif args.stop_on_record:
+        stop_on_record = True
+    run = Run(args.battles, args.upload_first, stop_on_record=stop_on_record)
     start_high = run.elo_high
     print(f"  Elo record to beat: {start_high}"
           f"{f' (set in {run.elo_high_tag})' if run.elo_high_tag else ''}  "
@@ -728,10 +905,14 @@ async def main():
     while run.done < run.total:
         remaining = run.total - run.done
         agent = build_agent(account, fork=FORK_MODE and not FORK_BASELINE)
-        if args.upload_first > 0:
-            # The popup is the only confirmation Showdown sends, and poke_env logs it at
-            # WARNING. If something raised the client's level above that we'd never see it,
-            # so lower it back. No-op at poke_env's default, which leaves the level unset.
+        # Popups are the only channel for two things we cannot afford to miss: the replay
+        # upload confirmation, and a team rejection (see PopupWatcher). The second applies
+        # to every team format whether or not anything is being uploaded, because without it
+        # an illegal team is indistinguishable from an empty ladder queue.
+        if args.upload_first > 0 or profile.needs_team:
+            # poke_env logs popups at WARNING. If something raised the client's level above
+            # that we'd never see them, so lower it back. No-op at poke_env's default, which
+            # leaves the level unset.
             if agent.ps_client.logger.getEffectiveLevel() > logging.WARNING:
                 agent.ps_client.logger.setLevel(logging.WARNING)
             agent.ps_client.logger.addHandler(PopupWatcher())
