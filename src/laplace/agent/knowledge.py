@@ -62,65 +62,6 @@ def safe_priority(move):
         return 0
 
 
-# Setup moves whose stat change lives in Showdown's move CODE rather than its data, so
-# poke-env reports `Move.boosts is None` for them. Verified against GenData.from_gen(9):
-# these are the complete gen-9 set of moves that raise the user's stages invisibly.
-#
-# This is the same blind spot mine_losses._fold_boost documents from the other end -- Belly
-# Drum reports its +6 only as `-setboost`, so a Belly Drum sweep scored as peak boost ZERO
-# until that was special-cased there. Every consumer asking "does this move boost the user"
-# needs the same treatment, and three were silently getting it wrong: the team-preview lead
-# penalty, the futility guard's boost run, and the `setup` threat flag feeding the value net.
-#
-# Power Trick is deliberately absent: it SWAPS raw Attack and Defense and touches no stat
-# stage, so it is not setup by any definition these callers use.
-_HIDDEN_SELF_BOOST = {
-    "bellydrum": {"atk": 6},        # -setboost to +6 Attack, at half the user's max HP
-    "curse": {"atk": 1, "def": 1},  # non-Ghost users only -- see self_boosts()
-    "acupressure": {"atk": 2},      # +2 to one RANDOM stat; atk stands in for "some stat"
-}
-
-
-# Moves that restore the user's HP. `Move.heal` misses the weather-scaled heals
-# (Synthesis/Moonlight/Morning Sun) and the drain-style ones, so callers that ask "can this
-# thing heal itself" need the id set as well -- see the futility guard, which learned this
-# from a Synthesis x5 loop that lost a rated game.
-#
-# NOT to be unified with value_features._RECOVERY_MOVES, which differs deliberately: that
-# one is a TRAINED feature definition, and widening it would make inference features
-# disagree with the ones the net was fitted on (the same train/inference split that
-# `value_case_fix` exists to document).
-RECOVERY_MOVES = frozenset((
-    "recover", "roost", "softboiled", "slackoff", "milkdrink", "synthesis", "moonlight",
-    "morningsun", "shoreup", "strengthsap", "lifedew", "junglehealing", "healorder",
-    "rest", "swallow", "painsplit", "purify", "floralhealing",
-))
-
-
-def self_boosts(move, user=None):
-    """The stat stages `move` raises on its own user, as {stat: stages}.
-
-    Wraps Move.boosts / Move.self_boost and folds in _HIDDEN_SELF_BOOST. Prefer this over
-    reading `move.boosts` directly anywhere the question is "is this a setup move", because
-    the two most explosive setup moves in the game are exactly the ones the data omits.
-
-    `user` matters only for Curse, which boosts a non-Ghost user but is a HP-cost hex when a
-    Ghost clicks it. With no user we assume the boosting reading: over-calling Curse costs a
-    lead penalty, under-calling it misses a sweep, and the second error is the expensive one.
-    """
-    boosts = dict(getattr(move, "boosts", None) or {})
-    boosts.update(getattr(move, "self_boost", None) or {})
-    hidden = _HIDDEN_SELF_BOOST.get(getattr(move, "id", None) or "")
-    if hidden is None:
-        return boosts
-    if getattr(move, "id", None) == "curse" and user is not None:
-        types = getattr(user, "types", None) or ()
-        if any(getattr(t, "name", "") == "GHOST" for t in types):
-            return boosts
-    boosts.update(hidden)
-    return boosts
-
-
 def _estimate_stat(mon, key):
     """Real value if known (our mons), else estimated from base + level.
 
@@ -137,10 +78,10 @@ def _estimate_stat(mon, key):
     return point + 5
 
 
-def _max_hp(mon, knowledge=None):
+def _max_hp(mon):
     if getattr(mon, "max_hp", 0):
         return mon.max_hp
-    return (knowledge or KNOWLEDGE).estimate_stat(mon, "hp")
+    return _estimate_stat(mon, "hp")
 
 
 # Abilities that nullify a whole attacking type (immunity or absorb-heal). damage_multiplier
@@ -177,7 +118,7 @@ _PRIORITY_ABILITIES = {
 }
 
 
-def priority_ability_possible(mon, move, knowledge=None):
+def priority_ability_possible(mon, move):
     """True if `mon` might be moving out of `move`'s printed priority bracket by ability.
 
     POSSIBILITY, not certainty, on purpose -- the opposite standard from _ability_absorbs.
@@ -192,22 +133,17 @@ def priority_ability_possible(mon, move, knowledge=None):
     if mon.ability:
         test = _PRIORITY_ABILITIES.get(to_id_str(mon.ability))
         return bool(test and test(move))
-    for ability, p in (knowledge or KNOWLEDGE).predicted_abilities(mon).items():
+    for ability, p in KNOWLEDGE.predicted_abilities(mon).items():
         test = _PRIORITY_ABILITIES.get(ability)
         if p > 0 and test and test(move):
             return True
     return False
 
 
-def _ability_absorbs(attacker, move, defender, knowledge=None):
-    """True iff the defender's ability CERTAINLY nullifies this move: revealed, or the set
-    prior puts >= 0.99 on an ability that absorbs the move's type. Any uncertainty -> False.
-    Never veto on a guess.
-
-    What "certain" means is the PRIOR's job, and the two priors reach it differently: Random
-    Battle can say so once every still-possible generated set agrees, because the generator
-    is ground truth, while OU only has usage statistics and reserves certainty for a species
-    with a single legal ability. See laplace.agent.metagame for the contract."""
+def _ability_absorbs(attacker, move, defender):
+    """True iff the defender's ability CERTAINLY nullifies this move: revealed, or every
+    still-possible randbats set runs an absorbing ability for the move's type. Any
+    uncertainty -> False. Never veto on a guess."""
     if move.id in _ABSORB_CHECK_SKIP or move.type is None:
         return False
     if attacker is not None and to_id_str(attacker.ability or "") in _ABILITY_IGNORING:
@@ -215,12 +151,12 @@ def _ability_absorbs(attacker, move, defender, knowledge=None):
     mtype = move.type.name
     if defender.ability:
         return _ABSORB_ABILITY_TYPE.get(to_id_str(defender.ability)) == mtype
-    probs = (knowledge or KNOWLEDGE).predicted_abilities(defender)
+    probs = KNOWLEDGE.predicted_abilities(defender)
     absorbed = sum(p for a, p in probs.items() if _ABSORB_ABILITY_TYPE.get(a) == mtype)
     return absorbed >= 0.99
 
 
-def move_nullified(attacker, move, defender, knowledge=None):
+def move_nullified(attacker, move, defender):
     """True iff an attacking move is CERTAIN to deal zero: type-chart immunity on the
     revealed typing, or an absorb ability per _ability_absorbs. Deterministic hard
     knowledge only, which is what makes it safe for a guard to demote on."""
@@ -231,12 +167,12 @@ def move_nullified(attacker, move, defender, knowledge=None):
             return False
         if defender.damage_multiplier(move) == 0:
             return True
-        return _ability_absorbs(attacker, move, defender, knowledge)
+        return _ability_absorbs(attacker, move, defender)
     except Exception:
         return False
 
 
-def estimate_damage_fraction(attacker, move, defender, knowledge=None):
+def estimate_damage_fraction(attacker, move, defender):
     """Estimated damage as a fraction of the defender's max HP. 0 for status / immune /
     certainly-absorbed, clamped to 1.5 for overkill.
 
@@ -244,20 +180,19 @@ def estimate_damage_fraction(attacker, move, defender, knowledge=None):
     shouldn't crash a multi-hour run, and a missed estimate just reads 0.
     """
     try:
-        if _ability_absorbs(attacker, move, defender, knowledge):
+        if _ability_absorbs(attacker, move, defender):
             return 0.0
-        return _estimate_damage_fraction(attacker, move, defender, knowledge)
+        return _estimate_damage_fraction(attacker, move, defender)
     except Exception:
         return 0.0
 
 
-def _estimate_damage_fraction(attacker, move, defender, knowledge=None):
+def _estimate_damage_fraction(attacker, move, defender):
     if attacker is None or defender is None or move is None or move.base_power <= 0:
         return 0.0
-    kb = knowledge or KNOWLEDGE
     physical = move.category.name == "PHYSICAL"
-    a = kb.estimate_stat(attacker, "atk" if physical else "spa")
-    d = kb.estimate_stat(defender, "def" if physical else "spd")
+    a = _estimate_stat(attacker, "atk" if physical else "spa")
+    d = _estimate_stat(defender, "def" if physical else "spd")
     if d <= 0:
         return 0.0
     lvl = attacker.level or 100
@@ -271,7 +206,7 @@ def _estimate_damage_fraction(attacker, move, defender, knowledge=None):
     if physical and attacker.status is not None and attacker.status.name == "BRN":
         dmg *= 0.5
 
-    maxhp = _max_hp(defender, kb)
+    maxhp = _max_hp(defender)
     return min(dmg / maxhp, 1.5) if maxhp else 0.0
 
 
@@ -294,25 +229,6 @@ class RandbatsKnowledge:
                 self._sets[to_id_str(species)] = parsed
         except (OSError, ValueError) as e:
             print(f"[knowledge] could not load randbats sets ({e}); predictions disabled.")
-
-    # --- the Knowledge protocol (see laplace.agent.metagame) ------------------
-
-    @staticmethod
-    def estimate_stat(mon, key):
-        """One stat: real if we know it, else the randbats convention (85 EVs / 31 IVs /
-        neutral). Public name for _estimate_stat, which the rest of this file and the
-        adapter still call directly."""
-        return _estimate_stat(mon, key)
-
-    @staticmethod
-    def speed_bounds(mon):
-        """(slowest, fastest) unboosted Speed -- a single point in Random Battle.
-
-        Every generated set runs the same spread, so 'could it have outsped without a Choice
-        Scarf?' has one answer and the bound is degenerate. It exists so the Scarf inference
-        can be written once and stay correct in a format where spreads are chosen."""
-        spe = int(_estimate_stat(mon, "spe"))
-        return spe, spe
 
     # --- prediction -----------------------------------------------------------
 
@@ -434,7 +350,7 @@ class RandbatsKnowledge:
                 recov = True
             if mv.side_condition is not None and mv.side_condition.name in HAZARD_CONDS:
                 hazard = True
-            if any(v > 0 for v in self_boosts(mv).values()):
+            if mv.boosts and any(v > 0 for v in mv.boosts.values()):
                 setup = True
             if mv.status is not None:
                 status = True

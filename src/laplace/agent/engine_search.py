@@ -1,12 +1,8 @@
 ﻿r"""EnginePlayer -- determinized MCTS over poke-engine. This is the bot.
 
-Nothing here knows which format is being played. Determinizing a position, the set prior the
-guards consult, and the team-preview order all come from a `metagame` (see
-laplace.agent.metagame), which defaults to Gen 9 Random Battle.
-
 Per turn:
   1. sample N_DETERMINIZATIONS concrete opponent teams consistent with what's revealed
-     (metagame.build_state),
+     (poke_engine_adapter.build_state),
   2. MCTS each for SEARCH_TIME_MS,
   3. pool the root policies,
   4. run the guard/rerank pipeline over the pooled ranking,
@@ -40,9 +36,9 @@ from poke_env.data import to_id_str
 from poke_engine import monte_carlo_tree_search, generate_instructions
 
 from laplace.agent.knowledge import (estimate_damage_fraction, get_move, move_nullified,
-                                     priority_ability_possible, safe_priority, self_boosts,
-                                     RECOVERY_MOVES)
-from laplace.agent.metagame import RANDBATS
+                                     priority_ability_possible, safe_priority,
+                                     _estimate_stat)
+from laplace.agent.poke_engine_adapter import build_state
 
 
 def _spe_mult(boost):
@@ -86,8 +82,11 @@ def _board_only(state_str):
 # weather/terrain-scaled one -- Synthesis, Moonlight, Morning Sun, Shore Up all come back
 # 0.0. Synthesis is the move that produced the 5-click full-HP loop this guard exists to
 # catch, so the id set is not optional. Union'd with mv.heal > 0 at the call site.
-# Canonical list lives in knowledge.py now -- team preview needs the same one.
-_RECOVERY_MOVES = RECOVERY_MOVES
+_RECOVERY_MOVES = frozenset((
+    "recover", "roost", "softboiled", "slackoff", "milkdrink", "synthesis", "moonlight",
+    "morningsun", "shoreup", "strengthsap", "lifedew", "junglehealing", "healorder",
+    "rest", "swallow", "painsplit", "purify", "floralhealing",
+))
 
 
 def _search_world(state_str, time_ms, threads):
@@ -140,16 +139,10 @@ class EnginePlayer(Player):
                  value_margin=11.0, value_on_force_switch=False, value_boost_margin=0.0,
                  value_case_fix=True,
                  tera_min_wins=1, parallel_worlds=False, use_joint_sets=True,
-                 metagame=None,
                  mix_root=False, mix_frac=0.75, mix_collapse_eps=0.03, robust_vote=True,
                  absorb_guard=True, futility_guard=True, gamble_guard=False,
                  observer=None, **kwargs):
         super().__init__(*args, **kwargs)
-        # The format the search is playing: how to determinize a position, what the set
-        # prior says, and what to do at team preview. Defaults to Gen 9 Random Battle, so
-        # every existing caller is unaffected. See laplace.agent.metagame.
-        self.metagame = metagame or RANDBATS
-        self.knowledge = self.metagame.knowledge
         if n_determinizations is not None:
             self.N_DETERMINIZATIONS = n_determinizations
         if search_time_ms is not None:
@@ -240,7 +233,6 @@ class EnginePlayer(Player):
         self.futility_guard = futility_guard
         self.gamble_guard = gamble_guard
         self._vetoed = set()     # demoted by a guard this turn; never eligible for the mix
-        self._noop_kind = None   # which _noop_demote mode fired this turn, for the trace
         # robust_vote=False reverts to FP-style plain averaging of visit shares. Joint
         # sampling draws worlds by count, so the uniform average IS the likelihood-weighted
         # one. The robust vote was built when marginal sampling over-represented incoherent
@@ -289,38 +281,7 @@ class EnginePlayer(Player):
 
     # --- speed inference from turn order ---------------------------------------
 
-    # `|noinit|rename|<roomid>|<title>` says the room we joined is really a different id:
-    # private battle rooms carry a secret suffix, and a join by the short id is answered
-    # with a rename instead of the room. poke-env handles no `noinit` subtype at all -- it
-    # is absent from Player.MESSAGES_TO_IGNORE too -- so the line falls through to
-    # AbstractBattle.parse_message and raises NotImplementedError. That kills the message
-    # task and hangs the run on a battle queue that never drains. The websocket stays up,
-    # so ladder.py's reconnect path never fires either. Hit once in 32 games, 2026-08-31.
-    #
-    # TODO: THIS IS THE MINIMAL GUARD AND IT IS NOT THE FIX. It stops one bad redirect from
-    # taking a whole run down; the affected battle is still LOST. We keep playing under the
-    # stale tag while the live room is the renamed one, so every /choose lands in a room we
-    # are not in and the game forfeits on the timer. The real fix is to FOLLOW the rename:
-    # re-key self._battles and battle._battle_tag to the new id, and carry the per-battle
-    # state across with it -- traces, _opp_tracker, _opp_speed, _opp_item, _opp_hazards,
-    # _pending, _futility_hist, seven dicts all keyed by battle_tag. That touches the agent
-    # both formats share, including the rated Random Battle account, so it wants its own
-    # change and its own verification rather than being bolted on here.
     async def _handle_battle_message(self, split_messages):
-        redirect = next((m for m in split_messages[1:]
-                         if len(m) > 1 and m[1] == "noinit"), None)
-        if redirect is not None:
-            self.diag["room_redirect"] = self.diag.get("room_redirect", 0) + 1
-            print(f"    WARNING: room redirect on {split_messages[0][0]} -- "
-                  f"{'|'.join(redirect[1:])}; that battle is forfeit, the run continues",
-                  flush=True)
-            split_messages = [split_messages[0]] + [
-                m for m in split_messages[1:] if not (len(m) > 1 and m[1] == "noinit")]
-            # Nothing left but the room header: do NOT call super(). _get_battle waits on
-            # _battle_start_condition forever for a tag that was never created, which would
-            # hang the run in a quieter way than the crash did.
-            if len(split_messages) == 1:
-                return
         await super()._handle_battle_message(split_messages)
         try:
             tag = split_messages[0][0].replace(">", "").strip()
@@ -498,8 +459,7 @@ class EnginePlayer(Player):
                     wish_side = msg[2][:2]
                     healer = battle.active_pokemon if wish_side == battle.player_role \
                         else battle.opponent_active_pokemon
-                    pend["_wish_amt"] = (int(self.knowledge.estimate_stat(healer, "hp")) // 2
-                                         if healer else 0)
+                    pend["_wish_amt"] = int(_estimate_stat(healer, "hp")) // 2 if healer else 0
                 if any(str(x).startswith("[from]") for x in msg[4:]):
                     # A CALLED move (Sleep Talk, Dancer, Magic Bounce): not an action of its
                     # own, so it must not occupy a slot in the turn-order pair. Observed
@@ -536,11 +496,10 @@ class EnginePlayer(Player):
         # sampler then handed it a Scarf in every world for the rest of the game (observed
         # in the ladder archive, twice, both later contradicted by a revealed Leftovers).
         our_mv, their_mv = (mv1, mv2) if s1 == role else (mv2, mv1)
-        if (priority_ability_possible(me, our_mv, self.knowledge)
-                or priority_ability_possible(opp, their_mv, self.knowledge)):
+        if priority_ability_possible(me, our_mv) or priority_ability_possible(opp, their_mv):
             return
 
-        our = float((me.stats or {}).get("spe") or self.knowledge.estimate_stat(me, "spe"))
+        our = float((me.stats or {}).get("spe") or _estimate_stat(me, "spe"))
         our *= _spe_mult(me.boosts.get("spe", 0))
         if me.status is not None and me.status.name == "PAR":
             our *= 0.5
@@ -549,13 +508,7 @@ class EnginePlayer(Player):
         if any(c.name == "TAILWIND" for c in battle.side_conditions):
             our *= 2
 
-        # A RANGE, not a point. Random Battle spreads are fixed so the two bounds coincide
-        # and this reads exactly as it always did; in a format where the opponent chooses
-        # its EVs they do not, and each verdict has to be tested against the bound that
-        # could refute it. 'It outsped me' is only Scarf evidence if even its FASTEST legal
-        # spread is slower than us; 'it did not outspeed me' only rules a Scarf out if even
-        # its SLOWEST legal spread would have been fast enough with one.
-        their_slow, their_fast = (float(v) for v in self.knowledge.speed_bounds(opp))
+        their_raw = float(_estimate_stat(opp, "spe"))
         their_mult = _spe_mult(opp.boosts.get("spe", 0))
         if opp.status is not None and opp.status.name == "PAR":
             their_mult *= 0.5
@@ -565,10 +518,10 @@ class EnginePlayer(Player):
         species = to_id_str(opp.species)
         hints = self._opp_speed.setdefault(battle.battle_tag, {})
         opp_first = s1 != role
-        if opp_first and their_fast * their_mult < our * 0.95:
+        if opp_first and their_raw * their_mult < our * 0.95:
             hints[species] = "scarf"
             self.diag["scarf_inferred"] = self.diag.get("scarf_inferred", 0) + 1
-        elif not opp_first and their_slow * their_mult * 1.5 > our * 1.05:
+        elif not opp_first and their_raw * their_mult * 1.5 > our * 1.05:
             if hints.get(species) != "scarf":
                 hints[species] = "noscarf"
                 self.diag["noscarf_inferred"] = self.diag.get("noscarf_inferred", 0) + 1
@@ -616,8 +569,7 @@ class EnginePlayer(Player):
             jobs = []
             for j in range(n):
                 try:
-                    state = self.metagame.build_state(
-                                        battle, use_stats=self.use_stats,
+                    state = build_state(battle, use_stats=self.use_stats,
                                         opp_used_since_switch=opp_used,
                                         opp_speed_hints=speed_hints,
                                         opp_item_hints=item_hints,
@@ -651,8 +603,7 @@ class EnginePlayer(Player):
             for i in range(n):
                 t0 = time.perf_counter()
                 try:
-                    state = self.metagame.build_state(
-                                        battle, use_stats=self.use_stats,
+                    state = build_state(battle, use_stats=self.use_stats,
                                         opp_used_since_switch=opp_used,
                                         opp_speed_hints=speed_hints,
                                         opp_item_hints=item_hints,
@@ -725,28 +676,6 @@ class EnginePlayer(Player):
 
     # --- decision ------------------------------------------------------------
 
-    def teampreview(self, battle):
-        """The '/team ...' order, delegated to the metagame.
-
-        Random Battle never reaches this method -- there is no preview -- so the base
-        Metagame returns None and poke-env's random order stands, which is also the right
-        answer for any format we have not thought about. A format that DOES have a preview
-        (OU) makes a real decision here, and it is the only decision in a game that is taken
-        without a search: nothing is on the field yet, so there is no position to roll.
-
-        Errors fall back rather than propagate. This runs inside poke-env's message handler
-        exactly like choose_move does, and the same hole applies: an exception escaping here
-        sends no order at all, and the game sits on its timer."""
-        try:
-            order = self.metagame.teampreview(battle, self)
-            if order:
-                return order
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except BaseException:
-            self.diag["teampreview_err"] = self.diag.get("teampreview_err", 0) + 1
-        return super().teampreview(battle)
-
     def choose_move(self, battle):
         try:
             if not battle.available_moves and not battle.available_switches:
@@ -786,11 +715,7 @@ class EnginePlayer(Player):
             ranked = _stage("value", self._value_rerank(ranked, battle))
             if self.gamble_guard:
                 ranked = _stage("gamble", self._gamble_veto(battle, ranked))
-            # Two steps on purpose: _noop_demote sets self._noop_kind as a side effect and
-            # argument evaluation would read the stale value if this were one expression.
-            self._noop_kind = None
-            _noop_ranked = self._noop_demote(ranked)
-            ranked = _stage(self._noop_kind or "noop", _noop_ranked)
+            ranked = _stage("noop", self._noop_demote(ranked))
             ranked = _stage("deadlock", self._dead_lock_guard(battle, ranked))
             ranked, mixed = self._mix_sample(ranked)
             for choice, _share in ranked:
@@ -1079,12 +1004,6 @@ class EnginePlayer(Player):
         moves = [c for c in winners if not c.startswith("switch ")]
         key = "noop_blanket" if moves and all(c in noops for c in moves) else "noop_selective"
         self.diag[key] = self.diag.get(key, 0) + 1
-        # Also surface it on the TRACE, not just the aggregate diag. These two modes are
-        # different rules wearing one name -- selective is the wasted-turn call the docstring
-        # describes, blanket is really "the modal reply is lethal, so switch" -- and a cohort
-        # that records both as "noop" cannot price them apart afterwards, which is exactly
-        # why the last mining pass could only report a single pooled rate.
-        self._noop_kind = key
         demoted = [c for c in winners if c not in keep]
         noops = set(demoted)
         self._vetoed |= noops
@@ -1157,7 +1076,7 @@ class EnginePlayer(Player):
             move_id = choice[:-5] if choice.endswith("-tera") else choice
             for mv in battle.available_moves:
                 if mv.id == move_id:
-                    return move_nullified(me, mv, opp, self.knowledge)
+                    return move_nullified(me, mv, opp)
             return False
 
         dead = {c for c, _s in ranked if nullified(c)}
@@ -1255,11 +1174,9 @@ class EnginePlayer(Player):
                 # Anchors at least FUTILE_CHIP_RUN clicks back (run is most-recent-first).
                 anchors = [rec["opp_hp"] for rec in run[self.FUTILE_CHIP_RUN - 1:]]
                 return opp.current_hp_fraction >= min(anchors) - self.FUTILE_HP_EPS
-            # self_boosts, not mv.boosts: Curse and Belly Drum report no boosts in the
-            # data, so a Curse loop used to fall straight past this branch into the
-            # recovery check and come back False -- the guard could not see the most
-            # common boost run on our own OU team.
-            if any(v > 0 for v in self_boosts(mv, me).values()):
+            boosts = dict(mv.boosts or {})
+            boosts.update(mv.self_boost or {})
+            if any(v > 0 for v in boosts.values()):
                 my_now = sum(v for v in (me.boosts or {}).values() if v > 0)
                 return (len(run) >= self.FUTILE_BOOST_RUN
                         and my_now <= run[-1]["my_boosts"])
@@ -1440,8 +1357,7 @@ class EnginePlayer(Player):
             for mv in battle.available_moves:
                 if mv.id == move_id:
                     try:
-                        return float(estimate_damage_fraction(me, mv, opp,
-                                                             self.knowledge))
+                        return float(estimate_damage_fraction(me, mv, opp))
                     except Exception:
                         return 0.0
             return -1.0
