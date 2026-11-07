@@ -1,0 +1,50 @@
+name: CI
+on:
+  push:
+    branches: [main, OU]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    name: Python 3.12 / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Select Rust
+        run: rustup default stable
+      - name: Install and test with the documented command
+        run: python scripts/setup.py
+      - name: CLI smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          .venv/bin/python -m laplace.cli.ladder --help
+          .venv/bin/python -m laplace.cli.analyze_battle --help
+      - name: CLI smoke test (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          .venv/Scripts/python -m laplace.cli.ladder --help
+          .venv/Scripts/python -m laplace.cli.analyze_battle --help
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan Git history with redacted output
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.30.0 git /repo --log-opts="--all" --redact=100 --no-banner

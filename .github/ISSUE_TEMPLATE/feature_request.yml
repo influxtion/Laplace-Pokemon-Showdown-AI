@@ -1,0 +1,22 @@
+name: Feature request
+description: Propose a concrete improvement to Laplace.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Include the target branch (main or OU) and alternatives you considered.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence or validation plan
+      description: For playing-strength changes, describe how you would compare against the current bot.

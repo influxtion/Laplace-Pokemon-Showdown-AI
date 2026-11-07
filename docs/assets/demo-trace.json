@@ -1,0 +1,86 @@
+{
+  "source": "https://www.trylaplaceai.com/replays/won-battle-gen9randombattle-2644166378.html",
+  "description": "Recorded decision trace; search shares are not win probabilities.",
+  "turns": [
+    {
+      "turn": 1,
+      "me": "ampharos 100%",
+      "opp": "giratina 100%",
+      "top": [
+        [
+          "dazzlinggleam",
+          0.37
+        ],
+        [
+          "voltswitch",
+          0.34
+        ],
+        [
+          "thunderbolt",
+          0.2
+        ]
+      ],
+      "choice": "voltswitch"
+    },
+    {
+      "turn": 2,
+      "me": "ampharos 100%",
+      "opp": "tinglu 100%",
+      "top": [
+        [
+          "switch baxcalibur",
+          0.57
+        ],
+        [
+          "switch greattusk",
+          0.34
+        ],
+        [
+          "switch landorus",
+          0.03
+        ]
+      ],
+      "choice": "switch baxcalibur"
+    },
+    {
+      "turn": 3,
+      "me": "baxcalibur 100%",
+      "opp": "tinglu 100%",
+      "top": [
+        [
+          "iciclespear",
+          0.35
+        ],
+        [
+          "swordsdance",
+          0.29
+        ],
+        [
+          "switch greattusk",
+          0.13
+        ]
+      ],
+      "choice": "iciclespear"
+    },
+    {
+      "turn": 4,
+      "me": "baxcalibur 100%",
+      "opp": "regirock 71%",
+      "top": [
+        [
+          "switch ampharos",
+          0.45
+        ],
+        [
+          "switch greattusk",
+          0.37
+        ],
+        [
+          "switch landorus",
+          0.04
+        ]
+      ],
+      "choice": "switch ampharos"
+    }
+  ]
+}

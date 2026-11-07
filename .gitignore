@@ -32,5 +32,7 @@ backup_old/
 # --- Local / secret -----------------------------------------------------------
 # Showdown ladder credentials (never commit)
 .env
+.env.*
+!.env.example
 # Claude Code local settings (personal, machine-specific)
 .claude/settings.local.json
