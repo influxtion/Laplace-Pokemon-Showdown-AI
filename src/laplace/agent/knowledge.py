@@ -62,6 +62,65 @@ def safe_priority(move):
         return 0
 
 
+# Setup moves whose stat change lives in Showdown's move CODE rather than its data, so
+# poke-env reports `Move.boosts is None` for them. Verified against GenData.from_gen(9):
+# these are the complete gen-9 set of moves that raise the user's stages invisibly.
+#
+# This is the same blind spot mine_losses._fold_boost documents from the other end -- Belly
+# Drum reports its +6 only as `-setboost`, so a Belly Drum sweep scored as peak boost ZERO
+# until that was special-cased there. Every consumer asking "does this move boost the user"
+# needs the same treatment, and three were silently getting it wrong: the team-preview lead
+# penalty, the futility guard's boost run, and the `setup` threat flag feeding the value net.
+#
+# Power Trick is deliberately absent: it SWAPS raw Attack and Defense and touches no stat
+# stage, so it is not setup by any definition these callers use.
+_HIDDEN_SELF_BOOST = {
+    "bellydrum": {"atk": 6},        # -setboost to +6 Attack, at half the user's max HP
+    "curse": {"atk": 1, "def": 1},  # non-Ghost users only -- see self_boosts()
+    "acupressure": {"atk": 2},      # +2 to one RANDOM stat; atk stands in for "some stat"
+}
+
+
+# Moves that restore the user's HP. `Move.heal` misses the weather-scaled heals
+# (Synthesis/Moonlight/Morning Sun) and the drain-style ones, so callers that ask "can this
+# thing heal itself" need the id set as well -- see the futility guard, which learned this
+# from a Synthesis x5 loop that lost a rated game.
+#
+# NOT to be unified with value_features._RECOVERY_MOVES, which differs deliberately: that
+# one is a TRAINED feature definition, and widening it would make inference features
+# disagree with the ones the net was fitted on (the same train/inference split that
+# `value_case_fix` exists to document).
+RECOVERY_MOVES = frozenset((
+    "recover", "roost", "softboiled", "slackoff", "milkdrink", "synthesis", "moonlight",
+    "morningsun", "shoreup", "strengthsap", "lifedew", "junglehealing", "healorder",
+    "rest", "swallow", "painsplit", "purify", "floralhealing",
+))
+
+
+def self_boosts(move, user=None):
+    """The stat stages `move` raises on its own user, as {stat: stages}.
+
+    Wraps Move.boosts / Move.self_boost and folds in _HIDDEN_SELF_BOOST. Prefer this over
+    reading `move.boosts` directly anywhere the question is "is this a setup move", because
+    the two most explosive setup moves in the game are exactly the ones the data omits.
+
+    `user` matters only for Curse, which boosts a non-Ghost user but is a HP-cost hex when a
+    Ghost clicks it. With no user we assume the boosting reading: over-calling Curse costs a
+    lead penalty, under-calling it misses a sweep, and the second error is the expensive one.
+    """
+    boosts = dict(getattr(move, "boosts", None) or {})
+    boosts.update(getattr(move, "self_boost", None) or {})
+    hidden = _HIDDEN_SELF_BOOST.get(getattr(move, "id", None) or "")
+    if hidden is None:
+        return boosts
+    if getattr(move, "id", None) == "curse" and user is not None:
+        types = getattr(user, "types", None) or ()
+        if any(getattr(t, "name", "") == "GHOST" for t in types):
+            return boosts
+    boosts.update(hidden)
+    return boosts
+
+
 def _estimate_stat(mon, key):
     """Real value if known (our mons), else estimated from base + level.
 
@@ -375,7 +434,7 @@ class RandbatsKnowledge:
                 recov = True
             if mv.side_condition is not None and mv.side_condition.name in HAZARD_CONDS:
                 hazard = True
-            if mv.boosts and any(v > 0 for v in mv.boosts.values()):
+            if any(v > 0 for v in self_boosts(mv).values()):
                 setup = True
             if mv.status is not None:
                 status = True

@@ -26,7 +26,8 @@ evaluation is already flat.
 
 from poke_env.data import to_id_str
 
-from laplace.agent.knowledge import estimate_damage_fraction, get_move
+from laplace.agent.knowledge import (RECOVERY_MOVES, estimate_damage_fraction, get_move,
+                                     self_boosts)
 from laplace.ou.knowledge import KNOWLEDGE
 from laplace.ou.usage import USAGE
 
@@ -48,6 +49,15 @@ W_LEAD_MOVE = 0.12
 # lead even when its raw matchup numbers are good, because it has to survive a turn it has
 # not earned yet.
 W_SETUP_ONLY = -0.10
+# The same argument one step further. A dedicated wall -- recovery move, no real offence, no
+# turn-1 job -- is not a lead either, and for a reason the damage table actively hides: it
+# scores WELL on `take`, because taking little is the whole point of it. Ting-Lu led 4W-6L
+# in the first OU cohort against 22W-4L for Corviknight at identical opponent Elo, and the
+# decomposition says why -- Ting-Lu owns the best deal-take on the team (+0.156 vs +0.102)
+# purely by being hard to hurt, then spends turn 1 clicking a neutral attack into a switch.
+# A wall earns its keep by coming in on a threat you have already SEEN; leading it spends
+# that for nothing. Sized to match W_SETUP_ONLY: same idea, same magnitude.
+W_WALL_ONLY = -0.10
 
 # How many of their moves to price. The usage marginals are steep, so the top four are the
 # set the overwhelming majority of the time, and going deeper mostly prices tech moves that
@@ -81,24 +91,42 @@ def _best_damage(attacker, moves, defender):
 
 
 def _role_bonus(mon):
-    """Turn-1 usefulness of our own Pokemon's moveset."""
+    """Turn-1 usefulness of our own Pokemon's moveset.
+
+    Three tiers, in precedence order: a mon with a turn-1 job leads, a mon whose plan needs
+    a free turn first (setup) or a later free switch (wall) does not, and everything else is
+    judged on its matchup numbers alone. The two penalties are the same size because they
+    are the same mistake pointing in opposite directions."""
     move_ids = set(mon.moves or {})
     if move_ids & _LEAD_MOVES:
         return W_LEAD_MOVE
     setup = 0
     attacking = 0
+    recovery = bool(move_ids & RECOVERY_MOVES)
     for mid in move_ids:
         mv = get_move(mid)
         if mv is None:
             continue
         if mv.base_power > 0:
             attacking += 1
-        boosts = dict(mv.boosts or {})
-        boosts.update(mv.self_boost or {})
-        if any(v > 0 for v in boosts.values()):
+        # self_boosts, not mv.boosts: Curse and Belly Drum carry their boost in Showdown's
+        # move code rather than its data, so reading mv.boosts scored the two most
+        # explosive setup moves in the game as no setup at all -- Dondozo (Curse) was
+        # collecting 0.00 here when the whole point of W_SETUP_ONLY is to catch it.
+        if any(v > 0 for v in self_boosts(mv, mon).values()):
             setup += 1
+        if mid in RECOVERY_MOVES or (getattr(mv, "heal", 0) or 0) > 0:
+            recovery = True
     # "Setup only" means it has a boosting move and barely anything else to do turn 1.
-    return W_SETUP_ONLY if setup and attacking <= 2 else 0.0
+    if setup and attacking <= 2:
+        return W_SETUP_ONLY
+    # "Wall only" is the same test with recovery in place of setup: it can heal, it cannot
+    # meaningfully attack, and it has no job -- so its value is all in switching IN later.
+    # The `attacking <= 2` bar is deliberately the same one; a wall that actually threatens
+    # three moves' worth of damage is a bulky attacker and leads fine.
+    if recovery and attacking <= 2:
+        return W_WALL_ONLY
+    return 0.0
 
 
 def score_lead(mon, opponents):

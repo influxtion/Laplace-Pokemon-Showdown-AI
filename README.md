@@ -1,5 +1,9 @@
 # Laplace, a Pokémon Showdown battle AI
 
+This is the **OU** development branch, containing the Gen 9 OU bot and its shared
+Random Battle engine. For the standalone Random Battle bot, use
+[`main`](https://github.com/influxtion/Laplace-Pokemon-Showdown-AI/tree/main).
+
 Laplace plays [Pokémon Showdown](https://pokemonshowdown.com/) Gen 9 Random Battle. It peaked at
 **2231 Elo / ~83.3 GXE** on the live ladder, top 1% of ranked players and #135 in the world, well
 past the point where the opponents are strong humans rather than other bots. It garnered over 200k views on social media.

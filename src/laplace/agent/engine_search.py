@@ -40,7 +40,8 @@ from poke_env.data import to_id_str
 from poke_engine import monte_carlo_tree_search, generate_instructions
 
 from laplace.agent.knowledge import (estimate_damage_fraction, get_move, move_nullified,
-                                     priority_ability_possible, safe_priority)
+                                     priority_ability_possible, safe_priority, self_boosts,
+                                     RECOVERY_MOVES)
 from laplace.agent.metagame import RANDBATS
 
 
@@ -85,11 +86,8 @@ def _board_only(state_str):
 # weather/terrain-scaled one -- Synthesis, Moonlight, Morning Sun, Shore Up all come back
 # 0.0. Synthesis is the move that produced the 5-click full-HP loop this guard exists to
 # catch, so the id set is not optional. Union'd with mv.heal > 0 at the call site.
-_RECOVERY_MOVES = frozenset((
-    "recover", "roost", "softboiled", "slackoff", "milkdrink", "synthesis", "moonlight",
-    "morningsun", "shoreup", "strengthsap", "lifedew", "junglehealing", "healorder",
-    "rest", "swallow", "painsplit", "purify", "floralhealing",
-))
+# Canonical list lives in knowledge.py now -- team preview needs the same one.
+_RECOVERY_MOVES = RECOVERY_MOVES
 
 
 def _search_world(state_str, time_ms, threads):
@@ -242,6 +240,7 @@ class EnginePlayer(Player):
         self.futility_guard = futility_guard
         self.gamble_guard = gamble_guard
         self._vetoed = set()     # demoted by a guard this turn; never eligible for the mix
+        self._noop_kind = None   # which _noop_demote mode fired this turn, for the trace
         # robust_vote=False reverts to FP-style plain averaging of visit shares. Joint
         # sampling draws worlds by count, so the uniform average IS the likelihood-weighted
         # one. The robust vote was built when marginal sampling over-represented incoherent
@@ -787,7 +786,11 @@ class EnginePlayer(Player):
             ranked = _stage("value", self._value_rerank(ranked, battle))
             if self.gamble_guard:
                 ranked = _stage("gamble", self._gamble_veto(battle, ranked))
-            ranked = _stage("noop", self._noop_demote(ranked))
+            # Two steps on purpose: _noop_demote sets self._noop_kind as a side effect and
+            # argument evaluation would read the stale value if this were one expression.
+            self._noop_kind = None
+            _noop_ranked = self._noop_demote(ranked)
+            ranked = _stage(self._noop_kind or "noop", _noop_ranked)
             ranked = _stage("deadlock", self._dead_lock_guard(battle, ranked))
             ranked, mixed = self._mix_sample(ranked)
             for choice, _share in ranked:
@@ -1076,6 +1079,12 @@ class EnginePlayer(Player):
         moves = [c for c in winners if not c.startswith("switch ")]
         key = "noop_blanket" if moves and all(c in noops for c in moves) else "noop_selective"
         self.diag[key] = self.diag.get(key, 0) + 1
+        # Also surface it on the TRACE, not just the aggregate diag. These two modes are
+        # different rules wearing one name -- selective is the wasted-turn call the docstring
+        # describes, blanket is really "the modal reply is lethal, so switch" -- and a cohort
+        # that records both as "noop" cannot price them apart afterwards, which is exactly
+        # why the last mining pass could only report a single pooled rate.
+        self._noop_kind = key
         demoted = [c for c in winners if c not in keep]
         noops = set(demoted)
         self._vetoed |= noops
@@ -1246,9 +1255,11 @@ class EnginePlayer(Player):
                 # Anchors at least FUTILE_CHIP_RUN clicks back (run is most-recent-first).
                 anchors = [rec["opp_hp"] for rec in run[self.FUTILE_CHIP_RUN - 1:]]
                 return opp.current_hp_fraction >= min(anchors) - self.FUTILE_HP_EPS
-            boosts = dict(mv.boosts or {})
-            boosts.update(mv.self_boost or {})
-            if any(v > 0 for v in boosts.values()):
+            # self_boosts, not mv.boosts: Curse and Belly Drum report no boosts in the
+            # data, so a Curse loop used to fall straight past this branch into the
+            # recovery check and come back False -- the guard could not see the most
+            # common boost run on our own OU team.
+            if any(v > 0 for v in self_boosts(mv, me).values()):
                 my_now = sum(v for v in (me.boosts or {}).values() if v > 0)
                 return (len(run) >= self.FUTILE_BOOST_RUN
                         and my_now <= run[-1]["my_boosts"])
