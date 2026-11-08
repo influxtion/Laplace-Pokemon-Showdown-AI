@@ -1,4 +1,6 @@
-![Recorded Laplace decisions: candidate moves, search shares, and selected actions](docs/assets/demo.gif)
+<p align="center">
+  <img src="docs/assets/lapras.gif" alt="Animated pixel-art Lapras, the Laplace mascot" width="136" height="144">
+</p>
 
 # Laplace
 
@@ -12,9 +14,7 @@
 [Quick start](#setup) · [Contribute](CONTRIBUTING.md) ·
 [Discussions](https://github.com/influxtion/Laplace-Pokemon-Showdown-AI/discussions)
 
-The GIF visualizes recorded decisions from a real ladder game, including search
-shares (not win probabilities). The website offers watchable replays; a hosted
-bot you can challenge is still in development.
+The website offers watchable replays; a hosted bot you can challenge is still in development.
 
 This is the **main** branch, containing the standalone Gen 9 Random Battle bot.
 The Gen 9 OU bot, team exports, and OU usage data are maintained on the
